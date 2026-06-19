@@ -1,0 +1,24 @@
+name: reticulum
+description: >-
+  Pure-Dart Reticulum network stack with NOSTR identity/notes, LXMF messaging,
+  a distributed social relay, DHT and content-addressed file sharing — the shared
+  user + network protocol layer behind geogram apps (Aurora and others).
+version: 0.1.0
+repository: https://github.com/geograms/reticulum-dart
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  crypto: ^3.0.3            # SHA-256 / SHA-1
+  pointycastle: ^3.9.1      # secp256k1 / BIP-340 Schnorr (NOSTR + RNS)
+  cryptography: ^2.7.0      # X25519 / Ed25519 / AEAD (RNS link + folders)
+  bech32: ^0.2.2            # npub / nsec encoding
+  hex: ^0.2.0               # hex <-> bytes
+  sqlite3: ^2.4.0           # event store / media archive (Dart VM)
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0
+  sqlite3_flutter_libs: ^0.5.24

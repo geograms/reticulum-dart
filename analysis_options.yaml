@@ -1,8 +1,6 @@
-include: package:lints/recommended.yaml
+include: package:flutter_lints/flutter.yaml
 analyzer:
   errors:
-    # Vendored protocol code; keep signal high on real errors only.
-    avoid_print: ignore
     constant_identifier_names: ignore
 linter:
   rules:

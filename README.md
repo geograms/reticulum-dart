@@ -1,15 +1,19 @@
 # reticulum-dart
 
-A **pure-Dart** implementation of the [Reticulum](https://reticulum.network/)
-network stack, bundled with the **user and social protocols** that geogram apps
-(Aurora and others) run on top of it: NOSTR identity & notes, LXMF messaging, a
-distributed NOSTR-style relay, a DHT, and content-addressed file sharing.
+The shared **user + network protocol stack** for geogram apps (Aurora and
+others): a Dart implementation of the [Reticulum](https://reticulum.network/)
+network, plus NOSTR identity & notes, LXMF messaging, a distributed NOSTR-style
+relay, a DHT, content-addressed file sharing, the APRX signature scheme, and
+BLE transport primitives.
 
-The goal is a single, reusable library so **different apps can speak the same
-user and network protocols** — share identities, exchange messages, replicate
-notes, and move files — without re-implementing any of it.
+The goal is a single, reusable library so **different apps speak the same user
+and network protocols** — share one identity, exchange messages, replicate
+notes, move files, and reach peers over TCP/UDP/BLE — without re-implementing
+any of it.
 
-No Flutter dependency. Runs on the Dart VM (mobile, desktop, server, CLI).
+Shipped as a **Flutter package** (BLE needs platform plugins). The whole core —
+Reticulum, NOSTR, LXMF, relay, DHT, files, APRX — is plain Dart with no UI; only
+the BLE transport pulls in Flutter, so the rest stays portable.
 
 ---
 
@@ -24,6 +28,8 @@ No Flutter dependency. Runs on the Dart VM (mobile, desktop, server, CLI).
 | **Social relay** | `RelayNode`, `RelayEventStore`, `RelayProtocol`, `RelayRole`/`RelayDirectory`, `FollowSet`, retention tiers, spam policy, store-and-forward | A distributed, NOSTR-style relay over Reticulum: an FTS-searchable event store, role/capacity announcements, follow sets, tiered retention and a deposit mailbox. |
 | **DHT** | `DhtNode`, `DhtCore`, `RoutingTable`, `ProviderRecord` | Kademlia-style provider records so peers can find who holds a given hash. |
 | **File sharing** | `FileNode`, `FileTransfer`, `FileManifest`, `MediaArchive`, `FileSource`/`CompositeFileSource`, serve quota/stats | Content-addressed (`file:<sha256>`) sharing: a local archive, a serve budget, and transfer over Reticulum Resources. |
+| **APRX signatures** | `aprx_sign` | Compact (48-byte) secp256k1 Schnorr signatures over the same npub key — small enough to ride a single APRS line. |
+| **BLE transport** (Flutter) | `RnsBleInterface`, `Ble5Radio`/bus, GATT client/server, parcel + reassembler | Reticulum over Bluetooth LE: connectionless BLE5 broadcast for short frames and GATT for larger transfers. The app provides its own BLE service that drives these. |
 
 A single barrel exports everything:
 
@@ -46,9 +52,10 @@ dependencies:
   #   git: { url: https://github.com/geograms/reticulum-dart.git }
 ```
 
-`MediaArchive`, `RelayEventStore`, etc. use the `sqlite3` package — provide a
-native SQLite library at runtime (e.g. `sqlite3_flutter_libs` on Flutter, or the
-system `libsqlite3` on desktop/server).
+Then `flutter pub get`. `MediaArchive`, `RelayEventStore`, etc. use the
+`sqlite3` package — add `sqlite3_flutter_libs` to your app for the native
+library. BLE uses `bluetooth_low_energy` + `ble_peripheral`; declare the usual
+Bluetooth/location permissions in your app.
 
 ---
 
@@ -110,14 +117,17 @@ capacity-gated hosting, BLE interface, etc.).
 
 ## Status
 
-Extracted from the Aurora app, where it is device-validated across phones, Linux
-and an ESP32-S3 BLE5 node. The transport, NOSTR, LXMF and relay layers are in
-active use; treat the API as **pre-1.0** (it may still move as the extraction
-settles). `analyze` is clean and the smoke tests pass (`dart test`).
+Extracted from the Aurora app, which now consumes this package as its single
+source of truth (device-validated across phones, Linux and an ESP32-S3 BLE5
+node). The transport, NOSTR, LXMF and relay layers are in active use; treat the
+API as **pre-1.0** (it may still move as the extraction settles). `flutter
+analyze` is clean and the smoke tests pass (`flutter test`).
 
 The host application is expected to provide: persistence paths, a power/network
-capacity policy (to gate hosting), and any radio interfaces (e.g. BLE) via the
-`RnsInterface` abstraction.
+capacity policy (to gate hosting), its own NOSTR profile/identity storage, and a
+BLE service that drives the BLE transport primitives. The APRS protocol itself
+lives in the geogram APRS wapp (C/WASM); only its Dart signing (`aprx_sign`) is
+here.
 
 ## License
 

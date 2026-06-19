@@ -3,7 +3,7 @@
 /// Reticulum transport/identity/links, NOSTR identity & notes, LXMF
 /// messaging, a distributed social relay, a DHT and content-addressed file
 /// sharing. See README.md for an overview.
-library reticulum;
+library;
 
 // ── Reticulum transport / protocol ──────────────────────────────────────
 export 'src/services/reticulum/rns_crypto.dart';
@@ -64,3 +64,16 @@ export 'src/services/files/media_file_source.dart';
 export 'src/services/files/provider_connection.dart';
 export 'src/services/files/serve_quota.dart';
 export 'src/services/files/serve_stats.dart';
+
+// ── APRX signatures (compact secp256k1 Schnorr) ─────────────────────────
+export 'src/util/aprx_sign.dart';
+
+// ── BLE transport primitives (Flutter) ──────────────────────────────────
+export 'src/services/reticulum/rns_ble_interface.dart';
+export 'src/connections/bluetooth/ble5_bus.dart';
+export 'src/connections/bluetooth/ble5_radio.dart';
+export 'src/connections/bluetooth/ble_gatt_client.dart';
+export 'src/connections/bluetooth/ble_gatt_server.dart';
+export 'src/connections/bluetooth/ble_parcel.dart';
+export 'src/connections/bluetooth/ble_queue_service.dart';
+export 'src/connections/bluetooth/ble_reassembler.dart';

@@ -133,5 +133,7 @@ class MediaRef {
     'flac': MediaKind.audio,
     'wav': MediaKind.audio,
     'opus': MediaKind.audio,
+    'm4a': MediaKind.audio,
+    'weba': MediaKind.audio,
   };
 }

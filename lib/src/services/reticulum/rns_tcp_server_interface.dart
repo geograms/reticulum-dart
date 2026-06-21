@@ -39,6 +39,10 @@ class RnsTcpServerInterface {
   final void Function(Uint8List packetRaw, String via) onPacket;
   final void Function(String msg)? log;
 
+  /// When false, the port is bound exclusively so a second listener fails
+  /// (surfacing conflicts) instead of silently co-binding via SO_REUSEPORT.
+  final bool shared;
+
   ServerSocket? _server;
   final List<_RnsTcpServerConn> _conns = [];
   int _seq = 0;
@@ -49,12 +53,13 @@ class RnsTcpServerInterface {
     required this.onPacket,
     this.bindHost = '0.0.0.0',
     this.log,
+    this.shared = true,
   });
 
   int get connectionCount => _conns.length;
 
   Future<void> bind() async {
-    final s = await ServerSocket.bind(bindHost, port, shared: true);
+    final s = await ServerSocket.bind(bindHost, port, shared: shared);
     _server = s;
     log?.call('TCP server listening on $bindHost:$port');
     s.listen(_onClient, onError: (e) => log?.call('server error: $e'));

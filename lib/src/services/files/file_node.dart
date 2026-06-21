@@ -99,6 +99,9 @@ class FileTransferNode {
   static const int _maxDhtServeLinks = 128;
   // Outbound provider connections (multi-source fetch), keyed by link_id hex.
   final Map<String, ProviderConnection> _provConns = {};
+  // Live download progress for the UI: file sha hex -> (received, total) bytes,
+  // updated as chunks land in multiSourceFetch and cleared when it ends.
+  final Map<String, ({int received, int total})> _fetchProgress = {};
   // Files we advertise, for periodic republish (TTL refresh).
   final Map<String, _Provided> _provided = {};
   // Arbitrary DHT keys we advertise regardless of the file serve-quota (used for
@@ -284,6 +287,13 @@ class FileTransferNode {
     for (final out in f.onPacket(p)) {
       send(out.pack());
     }
+    // Surface single-source (direct-from-sender) progress to the UI too — the
+    // same map multiSourceFetch updates — so a chat media download shows
+    // received/total instead of an indefinite "Downloading…".
+    if (f.totalBytes > 0) {
+      _fetchProgress[_hex(e.fileHash)] =
+          (received: f.receivedBytes, total: f.totalBytes);
+    }
     if (f.state == FileFetchState.done) {
       _finishFetch(e, f.result, null);
     } else if (f.state == FileFetchState.failed) {
@@ -293,6 +303,7 @@ class FileTransferNode {
 
   void _finishFetch(_FetchEntry e, Uint8List? result, String? err) {
     if (err != null) log?.call('files: fetch failed: $err');
+    _fetchProgress.remove(_hex(e.fileHash));
     if (!e.done.isCompleted) e.done.complete(result);
   }
 
@@ -363,6 +374,11 @@ class FileTransferNode {
   // ── DHT over Reticulum links ───────────────────────────────────────────────
   /// Resolve providers for [sha256] via the DHT, then fetch the file from
   /// several of them in parallel (multi-source). Returns the verified bytes.
+  /// Live download progress (received, total bytes) for an in-flight
+  /// content-addressed fetch of [sha256], or null when nothing is downloading.
+  ({int received, int total})? fetchProgress(Uint8List sha256) =>
+      _fetchProgress[_hex(sha256)];
+
   Future<Uint8List?> resolveAndFetch(
     Uint8List sha256, {
     Duration timeout = const Duration(seconds: 60),
@@ -421,6 +437,10 @@ class FileTransferNode {
     final queue = Queue<int>()..addAll(List.generate(n, (i) => i));
     final attempts = <int, int>{};
 
+    final progressKey = _hex(sha256);
+    var received = 0;
+    _fetchProgress[progressKey] = (received: 0, total: m.size);
+
     Future<void> worker(ProviderConnection c) async {
       while (queue.isNotEmpty) {
         int? idx;
@@ -435,6 +455,8 @@ class FileTransferNode {
         final bytes = await c.getChunk(sha256, idx);
         if (bytes != null && _sha(bytes) == _hex(m.chunkHashes[idx])) {
           chunks[idx] = bytes;
+          received += m.chunkLength(idx);
+          _fetchProgress[progressKey] = (received: received, total: m.size);
         } else {
           final t = (attempts[idx] ?? 0) + 1;
           attempts[idx] = t;
@@ -449,6 +471,7 @@ class FileTransferNode {
     for (final c in ready) {
       closeProvider(c);
     }
+    _fetchProgress.remove(progressKey);
     if (chunks.any((c) => c == null)) return null;
     final out = BytesBuilder();
     for (final c in chunks) {

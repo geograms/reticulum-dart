@@ -78,6 +78,12 @@ class RelayNode {
   final Map<String, _Pending> _out = {}; // initiator requests by link-id hex
   int _subSeq = 0;
 
+  /// Our own NOSTR pubkey (hex). When [serve] is false (a phone/leaf that won't
+  /// host the whole network) the node still answers queries for ITS OWN posts —
+  /// this returns that pubkey so the responder can scope a leaf's REQ to
+  /// self-authored events. Null disables even self-serving.
+  String? Function()? selfPubHex;
+
   RelayNode({
     required this.identity,
     required this.store,
@@ -89,13 +95,25 @@ class RelayNode {
     this.serve = true,
     this.tierOfPub,
     this.admitEvent,
+    this.selfPubHex,
   });
 
   /// Feed an inbound packet; true if it belonged to the relay.
+  /// True when this node will answer at least its OWN posts to a querier — i.e.
+  /// it serves the whole network ([serve]) OR it can scope to self-authored
+  /// events (a leaf with a known self pubkey). Lets a phone share what it
+  /// posted without hosting the network ("ask the poster for its posts").
+  bool get _answersQueries => serve || (selfPubHex?.call() != null);
+
   Future<bool> handlePacket(RnsPacket p) async {
-    if (serve &&
-        p.packetType == RnsPacketType.linkRequest &&
-        RnsCrypto.constantTimeEquals(p.destHash, relayDestHash)) {
+    // Order matters: the cheap packet-type + dest-hash checks gate the call to
+    // [_answersQueries], which may do real work (resolving our pubkey). Putting
+    // them first keeps this O(1) for the flood of unrelated packets on a busy
+    // hub — evaluating _answersQueries per packet pegged the CPU and hung the
+    // app.
+    if (p.packetType == RnsPacketType.linkRequest &&
+        RnsCrypto.constantTimeEquals(p.destHash, relayDestHash) &&
+        _answersQueries) {
       await _accept(p);
       return true;
     }
@@ -241,6 +259,12 @@ class RelayNode {
     try {
       switch (f.op) {
         case RelayOp.event:
+          // A leaf (serve=false) accepts query links so it can share its own
+          // posts, but it does NOT store other people's events pushed at it.
+          if (!serve) {
+            rl.sendMessage(RelayProtocol.stored(false, 'not a host'));
+            break;
+          }
           final ev = f.event;
           if (ev == null) {
             rl.sendMessage(RelayProtocol.stored(false, 'no event'));
@@ -265,7 +289,30 @@ class RelayNode {
           rl.sendMessage(RelayProtocol.stored(ok, ok ? null : 'rejected'));
           break;
         case RelayOp.req:
-          final events = store.query(f.filter!);
+          // Full hosts answer the whole query; a leaf scopes it to its OWN
+          // posts (cheap + safe) so a joiner can still pull what this device
+          // published, decentralised, without anyone hosting the network.
+          var filter = f.filter!;
+          if (!serve) {
+            final self = selfPubHex?.call();
+            if (self == null) {
+              rl.sendMessage(RelayProtocol.result(f.subId ?? '', const [], true));
+              break;
+            }
+            // Scope to our own posts: keep the querier's kinds/tags/since/limit
+            // but force authors to just us.
+            filter = NostrFilter(
+              authors: [self.toLowerCase()],
+              kinds: filter.kinds,
+              tags: filter.tags,
+              since: filter.since,
+              until: filter.until,
+              limit: filter.limit,
+            );
+          }
+          final events = store.query(filter);
+          log?.call('relay: answered REQ -> ${events.length} event(s)'
+              '${serve ? '' : ' (self-scoped)'}');
           rl.sendMessage(RelayProtocol.result(f.subId ?? '', events, true));
           break;
         case RelayOp.count:

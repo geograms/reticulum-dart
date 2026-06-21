@@ -311,6 +311,20 @@ class FileFetchSession {
 
   FileFetchSession(this.link, this.wantHash);
 
+  /// Bytes received so far (sum of the chunks we hold), for a progress display.
+  int get receivedBytes {
+    final m = manifest;
+    if (m == null) return 0;
+    var n = 0;
+    for (var i = 0; i < _chunks.length; i++) {
+      if (_chunks[i] != null) n += m.chunkLength(i);
+    }
+    return n;
+  }
+
+  /// Total file size from the manifest (0 until the manifest arrives).
+  int get totalBytes => manifest?.size ?? 0;
+
   /// Begin: returns the GET_MANIFEST packet to send.
   RnsPacket start() {
     state = FileFetchState.manifest;

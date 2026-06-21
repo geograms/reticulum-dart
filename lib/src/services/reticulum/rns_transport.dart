@@ -82,6 +82,25 @@ class RnsTransport {
   static const int _annBudgetPerSec = 20;
   int _annWindowStart = 0;
   int _annCount = 0;
+  // Announce name_hashes (10-byte, hex) that must NEVER be shed by the budget —
+  // our OWN overlay's destinations (e.g. Aurora chat/files/dht/relay). They're
+  // rare in the public-hub flood but essential for peer discovery; the host
+  // fills this with RnsDestination.nameHash(app, aspects) for each. The name
+  // hash is a constant per app+aspects, so one cheap lookup identifies them
+  // without verifying the signature.
+  final Set<String> priorityAnnounceNames = {};
+  // Offset of the 10-byte name_hash in announce data: after the 64-byte pubkey.
+  static const int _annPubkeyLen = 64;
+  static const int _annNameHashLen = 10;
+
+  bool _isPriorityAnnounce(RnsPacket p) {
+    if (priorityAnnounceNames.isEmpty) return false;
+    final d = p.data;
+    if (d.length < _annPubkeyLen + _annNameHashLen) return false;
+    final nh = _hex(Uint8List.sublistView(
+        d, _annPubkeyLen, _annPubkeyLen + _annNameHashLen));
+    return priorityAnnounceNames.contains(nh);
+  }
   final Set<String> _seenPackets = {};
   // Link table for transport forwarding: link_id hex -> the two interfaces the
   // link bridges (created when we forward a LINKREQUEST). Lets us route every
@@ -150,7 +169,10 @@ class RnsTransport {
     // announce costs nothing — that destination re-announces periodically and
     // outbound traffic reaches the hub regardless.
     final destKey = _hex(p.destHash);
-    if (!_paths.containsKey(destKey)) {
+    // Exempt our own overlay's announces from the flood budget — otherwise the
+    // rare Aurora announces get shed amid hundreds of foreign ones a second and
+    // nodes never learn each other's routes (no media fetch, no FEED backfill).
+    if (!_paths.containsKey(destKey) && !_isPriorityAnnounce(p)) {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (nowMs - _annWindowStart >= 1000) {
         _annWindowStart = nowMs;

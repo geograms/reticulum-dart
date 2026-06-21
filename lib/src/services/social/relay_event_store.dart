@@ -277,6 +277,10 @@ class RelayEventStore {
     _db.execute('DELETE FROM events WHERE id = ?', [id]);
   }
 
+  /// Moderator hard-delete of any single event by id, regardless of author.
+  /// Intended for the relay operator (admin) to remove abusive content.
+  void deleteById(String id) => _deleteById(id);
+
   /// NIP-09: a kind-5 event deletes the events it references (#e) that belong to
   /// the same author. We tombstone rather than hard-delete so a replay of the
   /// deleted event won't resurrect it.

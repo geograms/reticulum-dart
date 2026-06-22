@@ -51,4 +51,13 @@ class RoutingTable {
   }
 
   int get size => _buckets.fold(0, (s, b) => s + b.length);
+
+  /// All known contacts (debug/introspection).
+  List<DhtContact> get contacts {
+    final all = <DhtContact>[];
+    for (final b in _buckets) {
+      all.addAll(b);
+    }
+    return all;
+  }
 }

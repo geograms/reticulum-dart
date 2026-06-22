@@ -44,6 +44,10 @@ class RelayNode {
   final RelayEventStore store;
   final void Function(Uint8List raw) send;
   final Uint8List? Function(RnsIdentity peer)? nextHopFor;
+  /// Pull a transport path to a peer we know by identity but have no cached route
+  /// to (its announce was never flooded to us on busy hubs), so a relay query
+  /// link is routable. See FileTransferNode.requestPath.
+  final void Function(Uint8List destHash)? requestPath;
   final void Function(String msg)? log;
 
   /// Optional anti-spam acceptance policy applied to inbound EVENTs (PoW / rate
@@ -89,6 +93,7 @@ class RelayNode {
     required this.store,
     required this.send,
     this.nextHopFor,
+    this.requestPath,
     this.spam,
     this.onEvent,
     this.log,
@@ -204,10 +209,25 @@ class RelayNode {
     return store.sfCount(destHex) > 0;
   }
 
+  /// Next hop to [relay]'s relay destination, pulling a path first if we have
+  /// none (we may know the peer's identity without a cached route). Mirrors
+  /// FileTransferNode._ensurePath / LxmfRouter.
+  Future<Uint8List?> _ensurePath(RnsIdentity relay) async {
+    var hop = nextHopFor?.call(relay);
+    if (hop == null && requestPath != null) {
+      requestPath!(RnsDestination.hash(relay, kRelayApp, kRelayAspects));
+      for (var i = 0; i < 10 && hop == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        hop = nextHopFor?.call(relay);
+      }
+    }
+    return hop;
+  }
+
   Future<RelayFrame?> _request(RnsIdentity relay, Uint8List reqBytes,
       {required Duration timeout}) async {
     final link = await RnsLink.initiator(relay, kRelayApp, kRelayAspects);
-    link.nextHop = nextHopFor?.call(relay);
+    link.nextHop = await _ensurePath(relay);
     final reqPkt = link.buildRequest();
     final done = Completer<RelayFrame?>();
     final rl = _RelayLink(link, send, (msg) {

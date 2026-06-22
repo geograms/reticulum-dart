@@ -120,6 +120,14 @@ class FileTransferNode {
   /// rnsd forwards them — this is what makes fetch work across the internet.
   final Uint8List? Function(RnsIdentity peer)? nextHopFor;
 
+  /// Pull a transport path to [destHash] (a PATH_REQUEST). Supplied by the host
+  /// (RnsTransport.requestPath). Needed because we often know a peer's IDENTITY
+  /// (e.g. a DHT contact learned from an incoming STORE) without having a cached
+  /// path to it — its announce was never passively flooded to us on busy/
+  /// asymmetric public hubs. A path request is a PULL the peer's attached hub
+  /// answers on our direct link, so the DHT/file links below become routable.
+  final void Function(Uint8List destHash)? requestPath;
+
   /// Called when we serve a file's manifest to another node (one download by a
   /// peer), with the 32-byte file hash. Drives the per-file download metric.
   final void Function(Uint8List fileHash)? onServed;
@@ -141,6 +149,7 @@ class FileTransferNode {
     bool enableDht = false,
     ServeQuota? serveQuota,
     this.nextHopFor,
+    this.requestPath,
     this.onServed,
     this.onDepositOffer,
     this.onDepositStore,
@@ -150,9 +159,38 @@ class FileTransferNode {
     }
   }
 
+  /// Resolve the next hop to [peer]'s (app, aspects) destination, pulling a path
+  /// first if we don't have one. We may know the peer's identity (a DHT contact)
+  /// without a cached path because its announce was never flooded to us on busy
+  /// hubs; a PATH_REQUEST is answered by the hub the peer is attached to. Mirrors
+  /// LxmfRouter's request-then-wait. Returns the hop (may still be null).
+  Future<Uint8List?> _ensurePath(
+      RnsIdentity peer, String app, List<String> aspects) async {
+    var hop = nextHopFor?.call(peer);
+    if (hop == null && requestPath != null) {
+      requestPath!(RnsDestination.hash(peer, app, aspects));
+      for (var i = 0; i < 10 && hop == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        hop = nextHopFor?.call(peer);
+      }
+    }
+    return hop;
+  }
+
   /// Learn a peer (from its announce) as a DHT contact.
   void addPeerFromAnnounce(RnsIdentity peer) =>
       dht?.routing.add(DhtContact.ofIdentity(peer));
+
+  /// Number of confirmed Aurora DHT peers in the routing table (overlay
+  /// membership). 0 means we've heard no other node's geogram/dht announce, so
+  /// publish/resolve can only act locally — useful for diagnosing discovery.
+  int get dhtRoutingSize => dht?.routing.size ?? 0;
+
+  /// Identity hashes of the DHT peers in the routing table (debug: lets us see
+  /// WHICH Aurora nodes are in the overlay, to diagnose discovery convergence).
+  List<String> get dhtPeerHexes =>
+      dht?.routing.contacts.map((c) => c.identity.hexHash).toList() ??
+      const <String>[];
 
   /// Feed an inbound packet. Returns true if it was a file/link packet we
   /// consumed (so the caller can skip announce handling). Safe to call for every
@@ -248,7 +286,8 @@ class FileTransferNode {
   }) async {
     final link =
         await RnsLink.initiator(providerPublicIdentity, kFilesApp, kFilesAspects);
-    link.nextHop = nextHopFor?.call(providerPublicIdentity);
+    link.nextHop =
+        await _ensurePath(providerPublicIdentity, kFilesApp, kFilesAspects);
     final req = link.buildRequest();
     final entry = _FetchEntry(link, fileHash, Completer<Uint8List?>());
     final id = _hex(link.linkId!);
@@ -325,7 +364,8 @@ class FileTransferNode {
   }) async {
     final link =
         await RnsLink.initiator(hostPublicIdentity, kFilesApp, kFilesAspects);
-    link.nextHop = nextHopFor?.call(hostPublicIdentity);
+    link.nextHop =
+        await _ensurePath(hostPublicIdentity, kFilesApp, kFilesAspects);
     final req = link.buildRequest();
     final entry = _DepositEntry(link, sha, bytes, ext, pub, sig, Completer<bool>());
     final id = _hex(link.linkId!);
@@ -486,7 +526,7 @@ class FileTransferNode {
   /// Open a (registered) provider connection to [provider]'s files destination.
   Future<ProviderConnection> openProvider(RnsIdentity provider) async {
     final link = await RnsLink.initiator(provider, kFilesApp, kFilesAspects);
-    link.nextHop = nextHopFor?.call(provider);
+    link.nextHop = await _ensurePath(provider, kFilesApp, kFilesAspects);
     final reqPkt = link.buildRequest(); // sets link.linkId
     final conn = ProviderConnection(link, send);
     _provConns[_hex(link.linkId!)] = conn;
@@ -588,7 +628,7 @@ class FileTransferNode {
 
   Future<Uint8List?> _dhtRpcRaw(RnsIdentity peer, Uint8List reqBytes) async {
     final link = await RnsLink.initiator(peer, kDhtApp, kDhtAspects);
-    link.nextHop = nextHopFor?.call(peer);
+    link.nextHop = await _ensurePath(peer, kDhtApp, kDhtAspects);
     final reqPkt = link.buildRequest();
     final id = _hex(link.linkId!);
     final e = _DhtRpcEntry(link, reqBytes);

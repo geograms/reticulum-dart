@@ -242,13 +242,33 @@ class RnsTransport {
   /// Resource transfer from being multiplied across every hub uplink.
   void sendLinkAware(Uint8List raw) {
     final p = RnsPacket.parse(raw);
-    if (p != null && p.destType == RnsDestType.link) {
-      final label = _linkIface[_hex(p.destHash)];
-      if (label != null) {
-        final iface = _ifaceByLabel(label);
-        if (iface != null) {
-          iface.send(raw);
-          return;
+    if (p != null) {
+      // Established link traffic: stick to the interface that link flows on.
+      if (p.destType == RnsDestType.link) {
+        final label = _linkIface[_hex(p.destHash)];
+        if (label != null) {
+          final iface = _ifaceByLabel(label);
+          if (iface != null) {
+            iface.send(raw);
+            return;
+          }
+        }
+      }
+      // Transport-addressed (HEADER_2) traffic — e.g. a LINKREQUEST to a remote
+      // destination — must go out ONLY on the interface where that dest's path
+      // was learned, exactly like reference RNS (Transport.outbound sends on
+      // path.receiving_interface). Broadcasting it on every hub emits duplicate
+      // copies with the same packet hash; RNS's dedup at intermediate nodes can
+      // then drop the copy travelling the good route before it reaches the
+      // holder, so the link never establishes even with a valid path.
+      if (p.headerType == RnsHeaderType.header2) {
+        final path = pathFor(p.destHash);
+        if (path != null) {
+          final iface = _ifaceByLabel(path.via);
+          if (iface != null) {
+            iface.send(raw);
+            return;
+          }
         }
       }
     }

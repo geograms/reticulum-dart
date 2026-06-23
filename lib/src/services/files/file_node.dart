@@ -157,7 +157,14 @@ class FileTransferNode {
     this.onDepositStore,
   }) : serveQuota = serveQuota ?? ServeQuota() {
     if (enableDht) {
-      dht = DhtNode(identity: identity, sendRpc: _dhtSendRpc, log: log);
+      // k=24 (vs the Kademlia default 8): a geogram overlay is small (tens of
+      // nodes), so a wider fanout makes resolve()/publish() query/replicate to
+      // (nearly) ALL peers — crucially including the actual holder, which keeps
+      // its own record locally. With k=8 a resolver only asked the 8 closest to
+      // the key, which can exclude the holder once the overlay grows past 8, so a
+      // freshly-published file resolved 0 providers even though its holder was
+      // meshed. k=24 closes that gap on the small networks we actually run.
+      dht = DhtNode(identity: identity, k: 24, sendRpc: _dhtSendRpc, log: log);
     }
   }
 

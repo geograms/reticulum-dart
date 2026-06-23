@@ -47,6 +47,8 @@ class _FetchEntry {
   final Completer<Uint8List?> done;
   FileFetchSession? fetch; // null until the link is active
   Timer? timeout;
+  Duration baseTimeout = const Duration(seconds: 30);
+  bool deadlineScaled = false; // extended once the manifest size is known
   _FetchEntry(this.link, this.fileHash, this.done);
 }
 
@@ -165,21 +167,42 @@ class FileTransferNode {
   /// hubs; a PATH_REQUEST is answered by the hub the peer is attached to. Mirrors
   /// LxmfRouter's request-then-wait. Returns the hop (may still be null).
   Future<Uint8List?> _ensurePath(
-      RnsIdentity peer, String app, List<String> aspects) async {
-    var hop = nextHopFor?.call(peer);
-    if (hop == null && requestPath != null) {
-      requestPath!(RnsDestination.hash(peer, app, aspects));
-      for (var i = 0; i < 10 && hop == null; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 300));
-        hop = nextHopFor?.call(peer);
-      }
-    }
-    return hop;
-  }
+          RnsIdentity peer, String app, List<String> aspects) =>
+      RnsLink.ensurePath(peer, app, aspects,
+          nextHopFor: nextHopFor, requestPath: requestPath);
 
   /// Learn a peer (from its announce) as a DHT contact.
   void addPeerFromAnnounce(RnsIdentity peer) =>
       dht?.routing.add(DhtContact.ofIdentity(peer));
+
+  /// Warm-start the DHT overlay from a cache of known peer public keys (64-byte
+  /// RNS public keys, e.g. from a persisted observed-node store). Seeds the
+  /// routing table so resolve/publish can act immediately on boot instead of
+  /// waiting for live announces to re-populate it. Returns how many were added.
+  int seedPeers(Iterable<Uint8List> publicKeys) {
+    final d = dht;
+    if (d == null) return 0;
+    var n = 0;
+    for (final pub in publicKeys) {
+      if (pub.length != 64) continue;
+      try {
+        d.routing.add(DhtContact.fromPublicKey(pub));
+        n++;
+      } catch (_) {/* skip a malformed key */}
+    }
+    return n;
+  }
+
+  /// Pull transport paths to [peer]'s DHT and files destinations (a cheap
+  /// PATH_REQUEST per dest, which the peer's attached hub answers on our direct
+  /// link) so the first resolve/fetch to it is routable WITHOUT waiting for a
+  /// live announce to be flooded to us. Used by warm-start against cached peers.
+  void requestPeerPaths(RnsIdentity peer) {
+    final rp = requestPath;
+    if (rp == null) return;
+    rp(RnsDestination.hash(peer, kDhtApp, kDhtAspects));
+    rp(RnsDestination.hash(peer, kFilesApp, kFilesAspects));
+  }
 
   /// Number of confirmed Aurora DHT peers in the routing table (overlay
   /// membership). 0 means we've heard no other node's geogram/dht announce, so
@@ -290,6 +313,7 @@ class FileTransferNode {
         await _ensurePath(providerPublicIdentity, kFilesApp, kFilesAspects);
     final req = link.buildRequest();
     final entry = _FetchEntry(link, fileHash, Completer<Uint8List?>());
+    entry.baseTimeout = timeout;
     final id = _hex(link.linkId!);
     _fetch[id] = entry;
     entry.timeout = Timer(timeout, () {
@@ -332,6 +356,22 @@ class FileTransferNode {
     if (f.totalBytes > 0) {
       _fetchProgress[_hex(e.fileHash)] =
           (received: f.receivedBytes, total: f.totalBytes);
+      // Once the manifest tells us the size, extend the deadline for a large
+      // file so a slow single source isn't cut off by the flat default.
+      if (!e.deadlineScaled && f.manifest != null) {
+        e.deadlineScaled = true;
+        final n = f.manifest!.chunkCount;
+        final scaled = Duration(seconds: 60 + (n ~/ 50));
+        if (scaled > e.baseTimeout) {
+          e.timeout?.cancel();
+          e.timeout = Timer(scaled, () {
+            if (!e.done.isCompleted) {
+              log?.call('files: fetch timeout ${_hex(e.fileHash)}');
+              e.done.complete(null);
+            }
+          });
+        }
+      }
     }
     if (f.state == FileFetchState.done) {
       _finishFetch(e, f.result, null);
@@ -461,7 +501,7 @@ class FileTransferNode {
 
     FileManifest? manifest;
     for (final c in ready) {
-      manifest = await c.getManifest(sha256);
+      manifest = await c.getManifestSegmented(sha256);
       if (manifest != null) break;
     }
     final m = manifest;
@@ -506,7 +546,13 @@ class FileTransferNode {
       }
     }
 
-    await Future.wait(ready.map(worker)).timeout(timeout, onTimeout: () => const []);
+    // Scale the budget with the file's chunk count so a large (multi-thousand
+    // chunk) transfer over a slow link isn't cut off by the flat default; never
+    // shorter than the caller's [timeout]. ~1s per 50 chunks (≈ +34s for 55 MB).
+    final scaled = Duration(seconds: 60 + (n ~/ 50));
+    final effective = scaled > timeout ? scaled : timeout;
+    await Future.wait(ready.map(worker))
+        .timeout(effective, onTimeout: () => const []);
     final sources = ready.length;
     for (final c in ready) {
       closeProvider(c);

@@ -212,17 +212,9 @@ class RelayNode {
   /// Next hop to [relay]'s relay destination, pulling a path first if we have
   /// none (we may know the peer's identity without a cached route). Mirrors
   /// FileTransferNode._ensurePath / LxmfRouter.
-  Future<Uint8List?> _ensurePath(RnsIdentity relay) async {
-    var hop = nextHopFor?.call(relay);
-    if (hop == null && requestPath != null) {
-      requestPath!(RnsDestination.hash(relay, kRelayApp, kRelayAspects));
-      for (var i = 0; i < 10 && hop == null; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 300));
-        hop = nextHopFor?.call(relay);
-      }
-    }
-    return hop;
-  }
+  Future<Uint8List?> _ensurePath(RnsIdentity relay) =>
+      RnsLink.ensurePath(relay, kRelayApp, kRelayAspects,
+          nextHopFor: nextHopFor, requestPath: requestPath);
 
   Future<RelayFrame?> _request(RnsIdentity relay, Uint8List reqBytes,
       {required Duration timeout}) async {

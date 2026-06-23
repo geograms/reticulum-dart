@@ -158,6 +158,62 @@ class RnsLink {
     return link;
   }
 
+  /// Resolve the next hop to [peer]'s (app, aspects) destination, pulling a path
+  /// first if we don't have one. We may know a peer's IDENTITY (e.g. a DHT
+  /// contact, or a relay learned out-of-band) without a cached path, because its
+  /// announce was never flooded to us on busy/asymmetric public hubs; a
+  /// PATH_REQUEST is a PULL the peer's attached hub answers on our direct link.
+  /// Returns the hop (may still be null if the peer is genuinely unreachable).
+  ///
+  /// This is the single source of truth for the request-then-poll pattern that
+  /// FileTransferNode and RelayNode both need before opening an initiator link.
+  /// (LxmfRouter interleaves its own variant with message resolution and is left
+  /// as-is to avoid destabilizing the working message path.)
+  static Future<Uint8List?> ensurePath(
+    RnsIdentity peer,
+    String appName,
+    List<String> aspects, {
+    Uint8List? Function(RnsIdentity peer)? nextHopFor,
+    void Function(Uint8List destHash)? requestPath,
+    Duration pollInterval = const Duration(milliseconds: 300),
+    int maxPolls = 10,
+  }) async {
+    var hop = nextHopFor?.call(peer);
+    if (hop == null && requestPath != null) {
+      requestPath(RnsDestination.hash(peer, appName, aspects));
+      for (var i = 0; i < maxPolls && hop == null; i++) {
+        await Future<void>.delayed(pollInterval);
+        hop = nextHopFor?.call(peer);
+      }
+    }
+    return hop;
+  }
+
+  /// Open an initiator link to [destinationIdentity]'s (app, aspects) destination
+  /// AND set its [nextHop] via [ensurePath] (pulling a path if needed) — the
+  /// routable equivalent of [initiator]. Call [buildRequest] on the result.
+  static Future<RnsLink> initiatorWithPath(
+    RnsIdentity destinationIdentity,
+    String appName,
+    List<String> aspects, {
+    Uint8List? Function(RnsIdentity peer)? nextHopFor,
+    void Function(Uint8List destHash)? requestPath,
+    Duration pollInterval = const Duration(milliseconds: 300),
+    int maxPolls = 10,
+  }) async {
+    final link = await initiator(destinationIdentity, appName, aspects);
+    link.nextHop = await ensurePath(
+      destinationIdentity,
+      appName,
+      aspects,
+      nextHopFor: nextHopFor,
+      requestPath: requestPath,
+      pollInterval: pollInterval,
+      maxPolls: maxPolls,
+    );
+    return link;
+  }
+
   /// Build the LINKREQUEST packet (sets [linkId]). Send its pack() on the wire.
   RnsPacket buildRequest() {
     final signalling = signallingBytes(mtu, mode);

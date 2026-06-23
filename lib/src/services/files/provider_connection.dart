@@ -36,7 +36,31 @@ class ProviderConnection {
 
   bool get isReady => _readyC.isCompleted;
 
-  /// Fetch + decode the manifest for [sha256] (null if the provider lacks it).
+  /// Fetch + decode the manifest for [sha256] via the segmented protocol: ask for
+  /// its byte length, then pull it in <=34 KB parts and reassemble. Handles
+  /// arbitrarily large manifests (large files). Null if the provider lacks it.
+  Future<FileManifest?> getManifestSegmented(Uint8List sha256) async {
+    final info = await _request(_cmd(kOpGetManifestInfo, sha256));
+    if (info == null || info.length < 1 + 32 + 4 || info[0] != kOpManifestInfo) {
+      return null;
+    }
+    final manifestLen =
+        ByteData.sublistView(info, 33, 37).getUint32(0, Endian.big);
+    if (manifestLen <= 0) return null;
+    final buf = BytesBuilder();
+    var idx = 0;
+    while (buf.length < manifestLen) {
+      final part = await _request(_manifestPartCmd(sha256, idx));
+      if (part == null) return null;
+      buf.add(part);
+      idx++;
+    }
+    if (buf.length != manifestLen) return null;
+    return FileManifest.decode(buf.toBytes());
+  }
+
+  /// Legacy single-Resource manifest fetch (small files only; kept for talking to
+  /// not-yet-updated providers). Prefer [getManifestSegmented].
   Future<FileManifest?> getManifest(Uint8List sha256) async {
     final bytes = await _request(_cmd(kOpGetManifest, sha256));
     return bytes == null ? null : FileManifest.decode(bytes);
@@ -71,7 +95,14 @@ class ProviderConnection {
     switch (p.context) {
       case RnsContext.none:
         final cmd = link.decrypt(p);
-        if (cmd.isNotEmpty && cmd[0] == kOpNotFound) _complete(null);
+        if (cmd.isEmpty) break;
+        if (cmd[0] == kOpNotFound) {
+          _complete(null);
+        } else if (cmd[0] == kOpManifestInfo) {
+          // The descriptor reply rides a context-none DATA packet, not a
+          // Resource — hand it straight to the pending request.
+          _complete(cmd);
+        }
         break;
       case RnsContext.resourceAdv:
         final rx = RnsResourceReceiver(link);
@@ -131,6 +162,15 @@ class ProviderConnection {
   RnsPacket _chunkCmd(Uint8List sha, int idx) {
     final b = BytesBuilder()
       ..addByte(kOpGetChunk)
+      ..add(sha);
+    final n = ByteData(4)..setUint32(0, idx, Endian.big);
+    b.add(n.buffer.asUint8List());
+    return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
+
+  RnsPacket _manifestPartCmd(Uint8List sha, int idx) {
+    final b = BytesBuilder()
+      ..addByte(kOpGetManifestPart)
       ..add(sha);
     final n = ByteData(4)..setUint32(0, idx, Endian.big);
     b.add(n.buffer.asUint8List());

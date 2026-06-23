@@ -76,6 +76,7 @@ class RelayAnnouncement {
   final List<String> topics; // interest topics (capped)
   final List<String> authorPrefixes; // 4-byte pubkey prefixes (hex, capped)
   final String? pubkey; // this node's own NOSTR pubkey (hex), for profile fetch
+  final int uptimeSeconds; // seconds since this node's RNS stack started (0=n/a)
 
   const RelayAnnouncement({
     this.version = 1,
@@ -86,6 +87,7 @@ class RelayAnnouncement {
     this.topics = const [],
     this.authorPrefixes = const [],
     this.pubkey,
+    this.uptimeSeconds = 0,
   });
 
   bool has(int cap) => caps & cap != 0;
@@ -136,16 +138,23 @@ class RelayAnnouncement {
     );
   }
 
-  Uint8List encode() => msgpackEncode({
-        'v': version,
-        'r': role.index,
-        'c': capacity,
-        'f': caps,
-        'w': wide,
-        't': topics,
-        'a': authorPrefixes,
-        if (pubkey != null && pubkey!.isNotEmpty) 'p': pubkey,
-      });
+  /// Encode for the relay announce app_data. [uptimeSeconds] overrides the field
+  /// when set (>0) — the sender stamps its LIVE uptime here on each announce
+  /// (uptime grows over time, so it isn't baked into the cached announcement).
+  Uint8List encode({int uptimeSeconds = 0}) {
+    final up = uptimeSeconds > 0 ? uptimeSeconds : this.uptimeSeconds;
+    return msgpackEncode({
+      'v': version,
+      'r': role.index,
+      'c': capacity,
+      'f': caps,
+      'w': wide,
+      't': topics,
+      'a': authorPrefixes,
+      if (pubkey != null && pubkey!.isNotEmpty) 'p': pubkey,
+      if (up > 0) 'u': up,
+    });
+  }
 
   /// Decode relay app_data, or null if it isn't a relay announcement.
   static RelayAnnouncement? decode(Uint8List? appData) {
@@ -167,6 +176,7 @@ class RelayAnnouncement {
         topics: strs(m['t']),
         authorPrefixes: strs(m['a']),
         pubkey: m['p'] is String ? m['p'] as String : null,
+        uptimeSeconds: m['u'] is int ? m['u'] as int : 0,
       );
     } catch (_) {
       return null;
@@ -312,12 +322,18 @@ class RelayRoleManager {
   /// our npub → our relay identity and fetch our profile directly.
   String? selfPubkey;
 
+  /// Live uptime (seconds since the RNS stack started), stamped into each
+  /// announce so peers can rank stable nodes (likely indexers) first when warm-
+  /// starting discovery. Set by the wiring layer; null/0 means "not advertised".
+  int Function()? uptimeProvider;
+
   RelayAnnouncement _current;
 
   RelayRoleManager({
     InterestSet? interests,
     CapacityProfile? initial,
     this.selfPubkey,
+    this.uptimeProvider,
     this.onChanged,
   })  : interests = interests ?? InterestSet(),
         _current = RelayAnnouncement.forCapacity(
@@ -331,7 +347,8 @@ class RelayRoleManager {
             pubkey: selfPubkey);
 
   RelayAnnouncement get current => _current;
-  Uint8List announcementAppData() => _current.encode();
+  Uint8List announcementAppData() =>
+      _current.encode(uptimeSeconds: uptimeProvider?.call() ?? 0);
 
   /// Apply a new capacity profile; re-derive the role and fire [onChanged] if it
   /// (or its capabilities/capacity) changed.

@@ -9,15 +9,30 @@
  * context=none.
  *
  * Wire commands (plaintext of a context-none link DATA):
- *   0x01 GET_MANIFEST  + fileHash(32)
- *   0x02 GET_CHUNK     + fileHash(32) + index(4 BE)
- *   0x81 NOT_FOUND     + fileHash(32)            (provider -> fetcher)
+ *   0x01 GET_MANIFEST       + fileHash(32)                  (legacy, small files)
+ *   0x02 GET_CHUNK          + fileHash(32) + index(4 BE)
+ *   0x04 GET_MANIFEST_INFO  + fileHash(32)                  (segmented manifest)
+ *   0x05 GET_MANIFEST_PART  + fileHash(32) + index(4 BE)
+ *   0x81 NOT_FOUND          + fileHash(32)                  (provider -> fetcher)
+ *   0x86 MANIFEST_INFO      + fileHash(32) + manifestLen(4 BE)  (provider reply)
  *
- * A reply that carries bytes is sent as a Resource: GET_MANIFEST is answered with
- * the encoded FileManifest, GET_CHUNK with the raw chunk bytes. The fetcher pulls
- * chunks sequentially over one link; parallelism across providers is achieved by
- * running several FileFetchSessions (one per provider link) against a shared
- * chunk-assembly state — that orchestration lives a layer above this file.
+ * A reply that carries bytes is sent as a Resource: GET_CHUNK with the raw chunk
+ * bytes; GET_MANIFEST_PART with a slice of the encoded manifest. The fetcher pulls
+ * sequentially over one link; parallelism across providers is achieved by running
+ * several connections (one per provider link) against a shared chunk-assembly
+ * state — that orchestration lives a layer above this file.
+ *
+ * Segmented manifest (the large-file fix): one RNS Resource is a single segment
+ * (<= ~34 KB), so the legacy GET_MANIFEST — which serves the whole encoded
+ * manifest as one Resource — caps a file at ~34 MB (a 55 MB apk's 57 KB manifest
+ * overflows one segment and is declined). GET_MANIFEST_INFO returns just the
+ * manifest's byte length; the fetcher then pulls the manifest in <=34 KB parts
+ * (exactly like chunks) and reassembles it. Now nothing exceeds one Resource —
+ * each chunk AND each manifest part fits — so file size is effectively unbounded.
+ * Integrity is unchanged: every chunk is verified against the (reassembled,
+ * decoded) manifest, and the assembled bytes' sha256 must equal the requested id.
+ * The legacy GET_MANIFEST is kept on the provider so not-yet-updated fetchers
+ * still work for small files; new fetchers always use the segmented path.
  */
 import 'dart:convert';
 import 'dart:typed_data';
@@ -33,7 +48,10 @@ import 'serve_quota.dart';
 
 const int kOpGetManifest = 0x01;
 const int kOpGetChunk = 0x02;
+const int kOpGetManifestInfo = 0x04; // segmented manifest: ask for its byte length
+const int kOpGetManifestPart = 0x05; // segmented manifest: ask for one part
 const int kOpNotFound = 0x81;
+const int kOpManifestInfo = 0x86; // reply to GET_MANIFEST_INFO: + fileHash + len
 // Store-and-forward deposit: a peer asks a host to KEEP a blob it doesn't hold.
 //   client -> host : 0x03 PUT_OFFER  sha(32) size(8 BE) extLen(1) ext pub(32) sig(64)
 //   host -> client : 0x84 PUT_ACCEPT sha(32)            (send the bytes now)
@@ -117,6 +135,11 @@ class FileServeSession {
       onDepositStore;
 
   RnsResourceSender? _sender; // current in-flight resource (serving)
+  // Per-link manifest cache: building a manifest hashes the whole file, so we
+  // compute it once and reuse it across the fetcher's GET_MANIFEST_INFO + every
+  // GET_MANIFEST_PART for the same file (a fetcher pulls one file's parts in a row).
+  Uint8List? _cachedManifest;
+  String? _cachedManifestFor; // hex of the file hash _cachedManifest describes
   RnsResourceReceiver? _rx; // current in-flight resource (deposit receive)
   Uint8List? _depSha;
   int _depTier = 2;
@@ -211,6 +234,35 @@ class FileServeSession {
       if (!_allow(fileHash, chunk.length)) return [_notFound(fileHash)];
       return _serveResource(chunk, fileHash);
     }
+    if (op == kOpGetManifestInfo && cmd.length >= 1 + 32) {
+      final fileHash = Uint8List.sublistView(cmd, 1, 33);
+      final manifest = _manifestBytes(fileHash);
+      if (manifest == null) return [_notFound(fileHash)];
+      if (!_allow(fileHash, manifest.length, manifest: true)) {
+        return [_notFound(fileHash)];
+      }
+      // A manifest-info request marks the start of one download by another node.
+      onServed?.call(Uint8List.fromList(fileHash));
+      return [_manifestInfo(fileHash, manifest.length)];
+    }
+    if (op == kOpGetManifestPart && cmd.length >= 1 + 32 + 4) {
+      final fileHash = Uint8List.sublistView(cmd, 1, 33);
+      final idx = ByteData.sublistView(cmd, 33, 37).getUint32(0, Endian.big);
+      final manifest = _manifestBytes(fileHash);
+      if (manifest == null) return [_notFound(fileHash)];
+      final off = idx * kFileChunkSize;
+      if (off >= manifest.length && manifest.isNotEmpty) {
+        return [_notFound(fileHash)];
+      }
+      final end = off + kFileChunkSize < manifest.length
+          ? off + kFileChunkSize
+          : manifest.length;
+      final part = Uint8List.fromList(manifest.sublist(off, end));
+      if (!_allow(fileHash, part.length, manifest: true)) {
+        return [_notFound(fileHash)];
+      }
+      return _serveResource(part, fileHash);
+    }
     if (op == kOpPutOffer && cmd.length >= 1 + 32 + 8 + 1) {
       // [0x03][sha32][size8][extLen1][ext][pub32][sig64]
       final sha = Uint8List.sublistView(cmd, 1, 33);
@@ -287,14 +339,40 @@ class FileServeSession {
       ..add(fileHash);
     return link.encrypt(b.toBytes(), context: RnsContext.none);
   }
+
+  /// The encoded manifest for [fileHash] (cached per link), or null if we don't
+  /// hold the file. Computing it hashes the whole file, so the cache spares us
+  /// re-hashing on every GET_MANIFEST_PART of the same download.
+  Uint8List? _manifestBytes(Uint8List fileHash) {
+    final hex = _hex(fileHash);
+    if (_cachedManifestFor == hex && _cachedManifest != null) {
+      return _cachedManifest;
+    }
+    final bytes = source.read(fileHash);
+    if (bytes == null) return null;
+    final m = FileManifest.ofBytes(bytes).encode();
+    _cachedManifest = m;
+    _cachedManifestFor = hex;
+    return m;
+  }
+
+  RnsPacket _manifestInfo(Uint8List fileHash, int manifestLen) {
+    final b = BytesBuilder()
+      ..addByte(kOpManifestInfo)
+      ..add(fileHash);
+    final n = ByteData(4)..setUint32(0, manifestLen, Endian.big);
+    b.add(n.buffer.asUint8List());
+    return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
 }
 
 // ── Fetcher side ───────────────────────────────────────────────────────────
 
-enum FileFetchState { idle, manifest, chunks, done, failed }
+enum FileFetchState { idle, manifestInfo, manifestParts, chunks, done, failed }
 
-/// Fetches one file (by id) from one provider over an active link. Pulls the
-/// manifest, then each chunk sequentially, verifying every chunk against the
+/// Fetches one file (by id) from one provider over an active link. Asks for the
+/// manifest's length, pulls the manifest in <=34 KB parts and reassembles it,
+/// then pulls each chunk sequentially — verifying every chunk against the
 /// manifest and the assembled bytes against the requested id.
 class FileFetchSession {
   final RnsLink link;
@@ -306,7 +384,12 @@ class FileFetchSession {
   Uint8List? result; // assembled, verified file bytes
 
   RnsResourceReceiver? _rx; // in-flight resource
-  int _expectIdx = -1; // -1 = manifest, else chunk index being fetched
+  // Segmented-manifest assembly (before the manifest is decoded).
+  int _manifestLen = 0; // total manifest bytes, from MANIFEST_INFO
+  int _manifestPartIdx = 0; // next manifest part to request
+  final BytesBuilder _manifestBuf = BytesBuilder();
+  // Chunk assembly (after the manifest is decoded).
+  int _expectIdx = 0; // chunk index being fetched
   List<Uint8List?> _chunks = [];
 
   FileFetchSession(this.link, this.wantHash);
@@ -325,11 +408,10 @@ class FileFetchSession {
   /// Total file size from the manifest (0 until the manifest arrives).
   int get totalBytes => manifest?.size ?? 0;
 
-  /// Begin: returns the GET_MANIFEST packet to send.
+  /// Begin: returns the GET_MANIFEST_INFO packet to send.
   RnsPacket start() {
-    state = FileFetchState.manifest;
-    _expectIdx = -1;
-    return _cmd(kOpGetManifest, wantHash);
+    state = FileFetchState.manifestInfo;
+    return _cmd(kOpGetManifestInfo, wantHash);
   }
 
   /// Process one inbound packet; returns packets to send back. When [state]
@@ -343,6 +425,16 @@ class FileFetchSession {
         final cmd = link.decrypt(p);
         if (cmd.isNotEmpty && cmd[0] == kOpNotFound) {
           return _fail('provider does not have the file');
+        }
+        if (state == FileFetchState.manifestInfo &&
+            cmd.length >= 1 + 32 + 4 &&
+            cmd[0] == kOpManifestInfo) {
+          _manifestLen =
+              ByteData.sublistView(cmd, 33, 37).getUint32(0, Endian.big);
+          if (_manifestLen <= 0) return _fail('manifest length invalid');
+          state = FileFetchState.manifestParts;
+          _manifestPartIdx = 0;
+          return [_manifestPartCmd(0)];
         }
         return const [];
       case RnsContext.resourceAdv:
@@ -370,9 +462,17 @@ class FileFetchSession {
 
   List<RnsPacket> _onResourceComplete(Uint8List payload) {
     _rx = null;
-    if (_expectIdx == -1) {
-      // The manifest arrived.
-      final m = FileManifest.decode(payload);
+    if (state == FileFetchState.manifestParts) {
+      // One manifest part arrived; append and pull the next, or decode.
+      _manifestBuf.add(payload);
+      if (_manifestBuf.length < _manifestLen) {
+        _manifestPartIdx++;
+        return [_manifestPartCmd(_manifestPartIdx)];
+      }
+      if (_manifestBuf.length != _manifestLen) {
+        return _fail('manifest reassembly length mismatch');
+      }
+      final m = FileManifest.decode(_manifestBuf.toBytes());
       if (m == null) return _fail('manifest decode failed');
       if (!_eq(m.fileHash, wantHash)) {
         return _fail('manifest file hash != requested id');
@@ -423,6 +523,15 @@ class FileFetchSession {
   RnsPacket _chunkCmd(int idx) {
     final b = BytesBuilder()
       ..addByte(kOpGetChunk)
+      ..add(wantHash);
+    final n = ByteData(4)..setUint32(0, idx, Endian.big);
+    b.add(n.buffer.asUint8List());
+    return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
+
+  RnsPacket _manifestPartCmd(int idx) {
+    final b = BytesBuilder()
+      ..addByte(kOpGetManifestPart)
       ..add(wantHash);
     final n = ByteData(4)..setUint32(0, idx, Endian.big);
     b.add(n.buffer.asUint8List());

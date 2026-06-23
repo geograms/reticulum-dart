@@ -169,7 +169,14 @@ class FileTransferNode {
   Future<Uint8List?> _ensurePath(
           RnsIdentity peer, String app, List<String> aspects) =>
       RnsLink.ensurePath(peer, app, aspects,
-          nextHopFor: nextHopFor, requestPath: requestPath);
+          nextHopFor: nextHopFor,
+          requestPath: requestPath,
+          // A path PULL to a provider we resolved via the DHT (whose announce we
+          // never heard) must cross to the hub it's attached to and back. 3s is
+          // too short on busy/asymmetric public hubs and makes the file link open
+          // unroutable (broadcast) → handshake timeout. Give it ~9s before
+          // falling back, well within the 12s provider-ready window.
+          maxPolls: 30);
 
   /// Learn a peer (from its announce) as a DHT contact.
   void addPeerFromAnnounce(RnsIdentity peer) =>

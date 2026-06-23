@@ -14,6 +14,9 @@ import 'rns_hdlc.dart';
 import 'rns_transport.dart';
 
 class RnsTcpInterface implements RnsInterface {
+  @override
+  bool get announceOnly => false;
+
   final String host;
   final int port;
   @override
@@ -21,15 +24,21 @@ class RnsTcpInterface implements RnsInterface {
   final void Function(Uint8List packetRaw) onPacket;
   final void Function(String msg)? log;
 
+  /// Fired once when the socket closes or errors, so the owner can tear the
+  /// dead uplink down and reconnect (e.g. after the device's network changes).
+  final void Function()? onDisconnect;
+
   Socket? _socket;
   final RnsHdlcDeframer _deframer = RnsHdlcDeframer();
   bool _connected = false;
+  bool _notifiedDown = false;
 
   RnsTcpInterface({
     required this.host,
     required this.port,
     required this.onPacket,
     this.log,
+    this.onDisconnect,
     String? label,
   }) : label = label ?? '$host:$port';
 
@@ -54,13 +63,21 @@ class RnsTcpInterface implements RnsInterface {
       onError: (e) {
         log?.call('TCP error: $e');
         _connected = false;
+        _notifyDown();
       },
       onDone: () {
         log?.call('TCP closed');
         _connected = false;
+        _notifyDown();
       },
       cancelOnError: true,
     );
+  }
+
+  void _notifyDown() {
+    if (_notifiedDown) return;
+    _notifiedDown = true;
+    onDisconnect?.call();
   }
 
   /// Send one RNS packet (raw, already-packed bytes), HDLC-framed.

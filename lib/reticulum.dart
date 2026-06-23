@@ -46,6 +46,22 @@ export 'src/services/social/retention_tier.dart';
 export 'src/services/social/spam.dart';
 export 'src/services/social/store_forward.dart';
 
+// ── Participation coin (Chaumian ecash + permissioned ATM ledger) ───────
+// WIP; the Aurora coin host bridges consume these directly.
+export 'src/services/coin/coin_ec.dart';
+export 'src/services/coin/coin_keyset.dart';
+export 'src/services/coin/bearer_token.dart';
+export 'src/services/coin/mint.dart';
+export 'src/services/coin/wallet.dart';
+export 'src/services/coin/authority_log.dart';
+export 'src/services/coin/atm_chain.dart';
+export 'src/services/coin/fraud.dart';
+export 'src/services/coin/node_policy.dart';
+export 'src/services/coin/postage.dart';
+export 'src/services/coin/postage_gate.dart';
+export 'src/services/coin/faucet.dart';
+export 'src/services/coin/coin_service.dart';
+
 // ── DHT ─────────────────────────────────────────────────────────────────
 export 'src/services/files/dht/dht_core.dart';
 export 'src/services/files/dht/dht_message.dart';
@@ -61,7 +77,7 @@ export 'src/services/files/file_manifest.dart';
 export 'src/services/files/file_node.dart';
 export 'src/services/files/file_transfer.dart';
 export 'src/services/files/media_file_source.dart';
-export 'src/services/files/provider_connection.dart';
+// provider_connection.dart removed — superseded by whole-file Resource transfer.
 export 'src/services/files/serve_quota.dart';
 export 'src/services/files/serve_stats.dart';
 

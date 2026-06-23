@@ -16,6 +16,8 @@ import 'rns_transport.dart';
 
 class RnsUdpInterface implements RnsInterface {
   @override
+  bool get announceOnly => false;
+  @override
   final String label;
   final String listenHost;
   final int listenPort;

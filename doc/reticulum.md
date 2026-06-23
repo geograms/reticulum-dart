@@ -5,6 +5,11 @@ Aurora ships a **wire‑compatible, pure‑Dart implementation of Reticulum 1.3.
 with a reference `rnsd` and with Sideband/NomadNet over the same hubs. All code
 lives in [`lib/services/reticulum/`](../lib/services/reticulum/).
 
+> **Getting two devices to actually find each other?** See
+> [peer-discovery.md](peer-discovery.md) — the checklist (mesh to all hubs, reconnect
+> on network change, data-capable path selection), the failure modes + their log
+> symptoms, and a diagnostic recipe. NAT is not the blocker; read it before debugging.
+
 Reticulum gives Aurora three things the internet alone doesn't:
 
 1. **Reachability across networks** — two phones behind carrier‑grade NAT can

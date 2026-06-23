@@ -136,6 +136,11 @@ hash.
 
 Exposed as `RnsService.dhtResolveFetch(fileHash)`.
 
+> **Overlay empty / `publish -> 0 holders` / can't find a peer's files?** The
+> usual cause is the two nodes landed on different hubs that don't bridge — see
+> [peer-discovery.md](peer-discovery.md) for the mesh/reconnect/path checklist and a
+> diagnostic recipe. It is (almost) never NAT.
+
 ## 8. Bootstrapping & membership — "which nodes run our DHT?"
 
 There is no dedicated bootstrap server, and there is no global registry of "Aurora

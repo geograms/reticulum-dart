@@ -44,6 +44,9 @@ abstract class RnsBleRadio {
 
 /// An [RnsInterface] that carries RNS over a broadcast-capable BLE radio.
 class RnsBleInterface implements RnsInterface {
+  @override
+  bool get announceOnly => false;
+
   final RnsBleRadio radio;
   @override
   final String label;

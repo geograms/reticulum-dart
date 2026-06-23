@@ -44,6 +44,10 @@ class RelayNode {
   final RelayEventStore store;
   final void Function(Uint8List raw) send;
   final Uint8List? Function(RnsIdentity peer)? nextHopFor;
+  /// Per-destination next-hop + path-exists (Reticulum routes per-destination;
+  /// see RnsLink.ensurePath). Prefer these over [nextHopFor].
+  final Uint8List? Function(Uint8List destHash)? nextHopForDest;
+  final bool Function(Uint8List destHash)? hasPathForDest;
   /// Pull a transport path to a peer we know by identity but have no cached route
   /// to (its announce was never flooded to us on busy hubs), so a relay query
   /// link is routable. See FileTransferNode.requestPath.
@@ -93,6 +97,8 @@ class RelayNode {
     required this.store,
     required this.send,
     this.nextHopFor,
+    this.nextHopForDest,
+    this.hasPathForDest,
     this.requestPath,
     this.spam,
     this.onEvent,
@@ -214,7 +220,10 @@ class RelayNode {
   /// FileTransferNode._ensurePath / LxmfRouter.
   Future<Uint8List?> _ensurePath(RnsIdentity relay) =>
       RnsLink.ensurePath(relay, kRelayApp, kRelayAspects,
-          nextHopFor: nextHopFor, requestPath: requestPath);
+          nextHopFor: nextHopFor,
+          nextHopForDest: nextHopForDest,
+          hasPathForDest: hasPathForDest,
+          requestPath: requestPath);
 
   Future<RelayFrame?> _request(RnsIdentity relay, Uint8List reqBytes,
       {required Duration timeout}) async {
@@ -401,29 +410,32 @@ class _RelayLink {
           }
         }
         break;
-      case RnsContext.resourcePrf: // peer proved receipt of our Resource
-        _tx?.validateProof(link.decrypt(p));
-        _tx = null;
+      case RnsContext.resourcePrf: // peer proved receipt of a segment
+        final tx = _tx;
+        // RNS resource proofs are UNENCRYPTED — validate raw p.data.
+        if (tx != null && tx.validateProof(p.data)) {
+          if (!tx.complete) {
+            send(tx.advertisementPacket().pack()); // next segment
+          } else {
+            _tx = null;
+          }
+        }
         break;
       case RnsContext.none: // a complete single-packet message
         onMessage(link.decrypt(p));
         break;
-      case RnsContext.resourceAdv: // start receiving an inbound Resource
-        final rx = RnsResourceReceiver(link);
-        _rx = rx;
-        if (rx.ingestAdvertisement(link.decrypt(p))) {
-          send(rx.buildRequest().pack());
+      case RnsContext.resourceAdv: // start/continue receiving an inbound Resource
+      case RnsContext.resourceHmu:
+      case RnsContext.resource:
+        final rx = _rx ??= RnsResourceReceiver(link);
+        for (final pkt in rx.handle(p)) {
+          send(pkt.pack());
         }
-        break;
-      case RnsContext.resource: // an inbound Resource part
-        final rx = _rx;
-        if (rx == null) break;
-        final done = rx.ingestPart(p.data);
-        if (done && rx.error == null) {
-          final prf = rx.proofPacket();
-          if (prf != null) send(prf.pack());
+        if (rx.complete) {
           _rx = null;
           onMessage(rx.payload!);
+        } else if (rx.error != null) {
+          _rx = null;
         }
         break;
       default:

@@ -14,10 +14,7 @@
  * optimization.
  */
 import 'dart:async';
-import 'dart:collection';
 import 'dart:typed_data';
-
-import 'package:crypto/crypto.dart' as crypto;
 
 import '../reticulum/rns_crypto.dart';
 import '../reticulum/rns_identity.dart';
@@ -27,9 +24,7 @@ import 'dht/dht_core.dart';
 import 'dht/dht_message.dart';
 import 'dht/dht_node.dart';
 import 'dht/provider_record.dart';
-import 'file_manifest.dart';
 import 'file_transfer.dart';
-import 'provider_connection.dart';
 import 'serve_quota.dart';
 
 const String kFilesApp = 'geogram';
@@ -47,8 +42,8 @@ class _FetchEntry {
   final Completer<Uint8List?> done;
   FileFetchSession? fetch; // null until the link is active
   Timer? timeout;
-  Duration baseTimeout = const Duration(seconds: 30);
-  bool deadlineScaled = false; // extended once the manifest size is known
+  Timer? retry; // periodic stall-recovery (re-request missing parts)
+  Duration baseTimeout = const Duration(minutes: 20);
   _FetchEntry(this.link, this.fileHash, this.done);
 }
 
@@ -99,10 +94,8 @@ class FileTransferNode {
   final List<String> _dhtServeOrder = [];
   final Map<String, _DhtRpcEntry> _dhtRpcByLink = {};
   static const int _maxDhtServeLinks = 128;
-  // Outbound provider connections (multi-source fetch), keyed by link_id hex.
-  final Map<String, ProviderConnection> _provConns = {};
   // Live download progress for the UI: file sha hex -> (received, total) bytes,
-  // updated as chunks land in multiSourceFetch and cleared when it ends.
+  // updated as a fetch advances and cleared when it ends (total 0 = indeterminate).
   final Map<String, ({int received, int total})> _fetchProgress = {};
   // Files we advertise, for periodic republish (TTL refresh).
   final Map<String, _Provided> _provided = {};
@@ -116,11 +109,20 @@ class FileTransferNode {
   /// Serving-side budget / anti-abuse guard applied to everything we serve.
   final ServeQuota serveQuota;
 
-  /// Resolves the next-hop transport for reaching a peer (null = direct
-  /// neighbour). Supplied by the host (its RnsTransport path table); when it
-  /// returns a transport id, our outbound links are transport-addressed so an
-  /// rnsd forwards them — this is what makes fetch work across the internet.
+  /// Legacy per-identity next-hop resolver (any of the identity's paths). Reticulum
+  /// routes per-DESTINATION, so prefer [nextHopForDest]/[hasPathForDest] below;
+  /// this stays only as a fallback.
   final Uint8List? Function(RnsIdentity peer)? nextHopFor;
+
+  /// Per-destination next-hop transport (null = direct neighbour). Supplied by the
+  /// host (RnsTransport.pathFor(destHash).nextHop). Routing is per-destination —
+  /// the same node's files/dht/chat dests can be reached via different hubs — so
+  /// the link request MUST be transport-addressed to the hub that has a route to
+  /// THIS specific destination, or the intermediate hub drops it.
+  final Uint8List? Function(Uint8List destHash)? nextHopForDest;
+
+  /// Whether the host has a path to [destHash] (RnsTransport.hasPath).
+  final bool Function(Uint8List destHash)? hasPathForDest;
 
   /// Pull a transport path to [destHash] (a PATH_REQUEST). Supplied by the host
   /// (RnsTransport.requestPath). Needed because we often know a peer's IDENTITY
@@ -151,6 +153,8 @@ class FileTransferNode {
     bool enableDht = false,
     ServeQuota? serveQuota,
     this.nextHopFor,
+    this.nextHopForDest,
+    this.hasPathForDest,
     this.requestPath,
     this.onServed,
     this.onDepositOffer,
@@ -177,6 +181,8 @@ class FileTransferNode {
           RnsIdentity peer, String app, List<String> aspects) =>
       RnsLink.ensurePath(peer, app, aspects,
           nextHopFor: nextHopFor,
+          nextHopForDest: nextHopForDest,
+          hasPathForDest: hasPathForDest,
           requestPath: requestPath,
           // A path PULL to a provider we resolved via the DHT (whose announce we
           // never heard) must cross to the hub it's attached to and back. 3s is
@@ -272,11 +278,6 @@ class FileTransferNode {
         await _onDhtRpcPacket(dr, p);
         return true;
       }
-      final pc = _provConns[id];
-      if (pc != null) {
-        await pc.onPacket(p);
-        return true;
-      }
     }
     return false;
   }
@@ -293,7 +294,8 @@ class FileTransferNode {
             requesterId: id,
             onServed: onServed,
             onDepositOffer: onDepositOffer,
-            onDepositStore: onDepositStore),
+            onDepositStore: onDepositStore,
+            log: log),
       );
       send((await link.buildProof()).pack());
       log?.call('files: accepted link $id');
@@ -319,7 +321,7 @@ class FileTransferNode {
   Future<Uint8List?> fetch(
     Uint8List fileHash,
     RnsIdentity providerPublicIdentity, {
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = const Duration(minutes: 20),
   }) async {
     final link =
         await RnsLink.initiator(providerPublicIdentity, kFilesApp, kFilesAspects);
@@ -330,15 +332,50 @@ class FileTransferNode {
     entry.baseTimeout = timeout;
     final id = _hex(link.linkId!);
     _fetch[id] = entry;
-    entry.timeout = Timer(timeout, () {
-      if (!entry.done.isCompleted) {
-        log?.call('files: fetch timeout ${_hex(fileHash)}');
-        entry.done.complete(null);
+    // Reference RNS aborts a Resource only after MAX_RETRIES *consecutive*
+    // no-progress retries (each shrinking the window) — never on a fixed
+    // wall-clock budget. That lets a healthy-but-slow transfer of ANY size ride
+    // out hub latency: as long as bytes keep arriving (at any rate) the stall
+    // counter resets. We mirror that here instead of the old "abort if no bytes
+    // in ~24s" + 20-min cap, which killed large/slow transfers.
+    const maxStalls = 16; // Resource.MAX_RETRIES
+    const tick = Duration(seconds: 4); // ~64s of dead air before giving up
+    var lastSeen = -1;
+    var stalls = 0;
+    entry.retry = Timer.periodic(tick, (_) {
+      final f = entry.fetch;
+      if (f == null) {
+        // Still in the link handshake: a link that never establishes must still
+        // abort eventually, so count idle ticks here too.
+        if (++stalls > maxStalls && !entry.done.isCompleted) {
+          log?.call('files: fetch handshake timeout ${_hex(fileHash)}');
+          entry.done.complete(null);
+        }
+        return;
+      }
+      final got = f.receivedBytes;
+      if (got != lastSeen) {
+        lastSeen = got; // progress (any rate) — keep going
+        stalls = 0;
+        return;
+      }
+      if (++stalls > maxStalls) {
+        if (!entry.done.isCompleted) {
+          log?.call('files: fetch stalled ($maxStalls dead ticks) '
+              '${_hex(fileHash)}');
+          entry.done.complete(null);
+        }
+        return;
+      }
+      // Re-request the still-missing parts (retry() also shrinks the window).
+      for (final out in f.retry()) {
+        send(out.pack());
       }
     });
     send(req.pack());
     final result = await entry.done.future;
     entry.timeout?.cancel();
+    entry.retry?.cancel();
     _fetch.remove(id);
     return result;
   }
@@ -364,28 +401,9 @@ class FileTransferNode {
     for (final out in f.onPacket(p)) {
       send(out.pack());
     }
-    // Surface single-source (direct-from-sender) progress to the UI too — the
-    // same map multiSourceFetch updates — so a chat media download shows
-    // received/total instead of an indefinite "Downloading…".
-    if (f.totalBytes > 0) {
-      _fetchProgress[_hex(e.fileHash)] =
-          (received: f.receivedBytes, total: f.totalBytes);
-      // Once the manifest tells us the size, extend the deadline for a large
-      // file so a slow single source isn't cut off by the flat default.
-      if (!e.deadlineScaled && f.manifest != null) {
-        e.deadlineScaled = true;
-        final n = f.manifest!.chunkCount;
-        final scaled = Duration(seconds: 120 + (n ~/ 5));
-        if (scaled > e.baseTimeout) {
-          e.timeout?.cancel();
-          e.timeout = Timer(scaled, () {
-            if (!e.done.isCompleted) {
-              log?.call('files: fetch timeout ${_hex(e.fileHash)}');
-              e.done.complete(null);
-            }
-          });
-        }
-      }
+    final got = f.receivedBytes;
+    if (got > 0) {
+      _fetchProgress[_hex(e.fileHash)] = (received: got, total: 0);
     }
     if (f.state == FileFetchState.done) {
       _finishFetch(e, f.result, null);
@@ -473,139 +491,26 @@ class FileTransferNode {
   ({int received, int total})? fetchProgress(Uint8List sha256) =>
       _fetchProgress[_hex(sha256)];
 
+  /// Resolve providers for [sha256] via the DHT and fetch the whole file from the
+  /// best available one over a single RNS Resource (the Resource layer segments,
+  /// windows and HMUs it for arbitrary size). Falls back to the next provider on
+  /// failure. Returns the sha-verified bytes, or null.
   Future<Uint8List?> resolveAndFetch(
     Uint8List sha256, {
-    Duration timeout = const Duration(seconds: 60),
+    Duration timeout = const Duration(minutes: 20),
   }) async {
     final d = dht;
     if (d == null) return null;
     final providers = await d.resolve(sha256);
     log?.call('files: resolved ${providers.length} provider(s) for '
         '${_hex(sha256).substring(0, 8)}');
-    if (providers.isEmpty) return null;
-    return multiSourceFetch(sha256, providers, timeout: timeout);
-  }
-
-  /// Fetch [sha256] from up to [maxConns] providers in parallel. The manifest is
-  /// pulled from any provider; chunks are work-stolen from a shared queue, so
-  /// faster providers naturally serve more (bandwidth-aware), and a failed chunk
-  /// is requeued for another provider. Verifies each chunk and the whole file.
-  Future<Uint8List?> multiSourceFetch(
-    Uint8List sha256,
-    List<ProviderRecord> providers, {
-    int maxConns = 5,
-    Duration timeout = const Duration(seconds: 60),
-  }) async {
-    if (providers.isEmpty) return null;
-    final chosen =
-        providers.length <= maxConns ? providers : providers.sublist(0, maxConns);
-    final conns = <ProviderConnection>[];
-    for (final pr in chosen) {
-      conns.add(await openProvider(pr.providerIdentity));
+    final self = _hex(identity.hash);
+    for (final pr in providers) {
+      if (_hex(pr.providerIdentity.hash) == self) continue;
+      final bytes = await fetch(sha256, pr.providerIdentity, timeout: timeout);
+      if (bytes != null && bytes.isNotEmpty) return bytes;
     }
-    final ready = <ProviderConnection>[];
-    await Future.wait(conns.map((c) async {
-      if (await c.ready()) {
-        ready.add(c);
-      } else {
-        closeProvider(c);
-      }
-    }));
-    if (ready.isEmpty) return null;
-
-    FileManifest? manifest;
-    for (final c in ready) {
-      manifest = await c.getManifestSegmented(sha256);
-      if (manifest != null) break;
-    }
-    final m = manifest;
-    if (m == null) {
-      for (final c in ready) {
-        closeProvider(c);
-      }
-      return null;
-    }
-
-    final n = m.chunkCount;
-    final chunks = List<Uint8List?>.filled(n, null);
-    final queue = Queue<int>()..addAll(List.generate(n, (i) => i));
-    final attempts = <int, int>{};
-
-    final progressKey = _hex(sha256);
-    var received = 0;
-    _fetchProgress[progressKey] = (received: 0, total: m.size);
-
-    Future<void> worker(ProviderConnection c) async {
-      var consecutiveFails = 0;
-      while (queue.isNotEmpty) {
-        int? idx;
-        while (queue.isNotEmpty) {
-          final i = queue.removeFirst();
-          if (chunks[i] == null) {
-            idx = i;
-            break;
-          }
-        }
-        if (idx == null) break;
-        final bytes = await c.getChunk(sha256, idx);
-        if (bytes != null && _sha(bytes) == _hex(m.chunkHashes[idx])) {
-          chunks[idx] = bytes;
-          received += m.chunkLength(idx);
-          _fetchProgress[progressKey] = (received: received, total: m.size);
-          consecutiveFails = 0;
-        } else {
-          final t = (attempts[idx] ?? 0) + 1;
-          attempts[idx] = t;
-          if (t <= 6) queue.addLast(idx); // retry (this or another provider)
-          // A transient chunk failure must NOT retire the only provider — that
-          // abandons the whole transfer mid-way (the bug that made large single-
-          // source fetches flaky). Tolerate a run of failures before giving up on
-          // this connection; a success resets the counter.
-          consecutiveFails++;
-          if (consecutiveFails >= 8) return; // connection really looks dead
-        }
-      }
-    }
-
-    // Scale the budget with the file's chunk count so a large (multi-thousand
-    // chunk) transfer over a slow link finishes; never shorter than the caller's
-    // [timeout]. Single-source RNS throughput over public hubs is modest (each
-    // chunk is a Resource round-trip), so budget generously: ~1s per 5 chunks
-    // (≈ 5 min for 55 MB, ~11 min for 107 MB) — reliability over speed.
-    final scaled = Duration(seconds: 120 + (n ~/ 5));
-    final effective = scaled > timeout ? scaled : timeout;
-    await Future.wait(ready.map(worker))
-        .timeout(effective, onTimeout: () => const []);
-    final sources = ready.length;
-    for (final c in ready) {
-      closeProvider(c);
-    }
-    _fetchProgress.remove(progressKey);
-    if (chunks.any((c) => c == null)) return null;
-    final out = BytesBuilder();
-    for (final c in chunks) {
-      out.add(c!);
-    }
-    final bytes = out.toBytes();
-    if (_sha(bytes) != _hex(sha256)) return null;
-    log?.call('files: assembled ${bytes.length}B from $sources source(s)');
-    return bytes;
-  }
-
-  /// Open a (registered) provider connection to [provider]'s files destination.
-  Future<ProviderConnection> openProvider(RnsIdentity provider) async {
-    final link = await RnsLink.initiator(provider, kFilesApp, kFilesAspects);
-    link.nextHop = await _ensurePath(provider, kFilesApp, kFilesAspects);
-    final reqPkt = link.buildRequest(); // sets link.linkId
-    final conn = ProviderConnection(link, send);
-    _provConns[_hex(link.linkId!)] = conn;
-    send(reqPkt.pack());
-    return conn;
-  }
-
-  void closeProvider(ProviderConnection c) {
-    _provConns.remove(_hex(c.link.linkId!));
-    c.close();
+    return null;
   }
 
   /// Announce ourselves as a provider of [sha256] (auto-seed): publish a signed
@@ -684,9 +589,6 @@ class FileTransferNode {
     );
     return d.publish(rec);
   }
-
-  static String _sha(Uint8List b) =>
-      _hex(crypto.sha256.convert(b).bytes);
 
   // DhtNode.sendRpc bridge: send a DHT message to a contact over a (transient)
   // link to its dht destination, await the single-packet reply.

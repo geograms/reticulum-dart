@@ -188,6 +188,10 @@ So a folder is a **mutable directory pointing at immutable, content‑addressed
 files** — the mutable part is signed and key‑addressed, the file bytes are the
 same hash‑addressed, re‑seedable objects described above.
 
+For the full permission model — who can read, who can host, who can write, and
+why sharing the `folderId` is safe but the master private key must never travel
+just to host — see [mutable-folders.md](mutable-folders.md).
+
 ---
 
 ## 8. Summary of guarantees

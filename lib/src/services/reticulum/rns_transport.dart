@@ -14,9 +14,11 @@
  * announce signature does not cover hops, so the original announce data is reused
  * verbatim.
  */
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'rns_announce.dart';
+import 'rns_crypto.dart';
 import 'rns_identity.dart';
 import 'rns_link.dart';
 import 'rns_packet.dart';
@@ -30,6 +32,12 @@ const int kRnsMaxHops = 128;
 abstract class RnsInterface {
   String get label;
   void send(Uint8List packetRaw);
+
+  /// True for discovery-only interfaces (e.g. the LAN UDP interface) that carry
+  /// announces but DROP all data packets. A path learned on such an interface
+  /// can never carry a link/DHT/file transfer, so it must not shadow a path
+  /// learned on a data-capable interface (the hub). Default false.
+  bool get announceOnly => false;
 }
 
 class RnsPathEntry {
@@ -109,11 +117,88 @@ class RnsTransport {
   static const int _maxLinkRoutes = 4096;
   static const int _linkRouteTtlMs = 3600 * 1000; // 1h idle
 
+  // ── Passive (leaf) mode under CPU pressure ───────────────────────────────
+  // Relaying the whole public-hub announce flood (rebroadcasting every inbound
+  // announce onto every other interface, plus link/resource transit) is what
+  // pegs a phone CPU and ANRs the app. When the inbound announce rate shows the
+  // node can't afford that work, it drops to PASSIVE: it stays connected to all
+  // hubs and keeps announcing + receiving its OWN traffic (the hubs do the
+  // relaying), but stops relaying OTHER nodes' traffic. It auto-resumes when the
+  // network quiets. This keeps a constrained device usable without leaving the
+  // mesh — exactly the real-world "my CPU can't take it, so go passive" case.
+  bool _passive = false;
+  bool get passive => _passive;
+
+  /// When true (default), [passive] is managed automatically from the observed
+  /// announce load. Set false to pin the mode (manual override / tests).
+  bool autoPassive = true;
+
+  /// Force passive on/off (also stops auto-management until re-enabled).
+  void setPassive(bool value, {bool auto = false}) {
+    autoPassive = auto;
+    if (_passive != value) {
+      _passive = value;
+      log?.call('passive ${value ? 'ON (manual)' : 'OFF (manual)'}');
+    }
+  }
+
+  // Inbound-announce-rate sampler (the relay-work proxy: relay cost rises with
+  // announces/sec × interface count). Sampled even while passive so we can tell
+  // when the flood has subsided enough to safely resume relaying. Hysteresis: go
+  // passive after a few sustained high-rate seconds, resume after a longer calm.
+  static const int _loadHighPerSec = 50; // above → relaying would peg a phone
+  static const int _loadLowPerSec = 12;  // below → relaying is affordable again
+  static const int _overSecsToPassive = 3;
+  static const int _underSecsToActive = 10;
+  int _loadWinStartMs = 0;
+  int _annInWin = 0;
+  int _overSecs = 0;
+  int _underSecs = 0;
+  double _lastAnnPerSec = 0;
+
+  /// Most recent measured inbound announce rate (announces/second).
+  double get announceRatePerSec => _lastAnnPerSec;
+
+  void _accountAnnounceLoad() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_loadWinStartMs == 0) _loadWinStartMs = now;
+    _annInWin++;
+    final elapsed = now - _loadWinStartMs;
+    if (elapsed < 1000) return;
+    final perSec = _annInWin * 1000 / elapsed;
+    _lastAnnPerSec = perSec;
+    _loadWinStartMs = now;
+    _annInWin = 0;
+    if (!autoPassive) return;
+    if (perSec >= _loadHighPerSec) {
+      _underSecs = 0;
+      _overSecs++;
+      if (!_passive && _overSecs >= _overSecsToPassive) {
+        _passive = true;
+        log?.call(
+            'passive ON — announce flood ${perSec.round()}/s, shedding relay to save CPU');
+      }
+    } else if (perSec <= _loadLowPerSec) {
+      _overSecs = 0;
+      _underSecs++;
+      if (_passive && _underSecs >= _underSecsToActive) {
+        _passive = false;
+        log?.call(
+            'passive OFF — announce load ${perSec.round()}/s, resuming relay');
+      }
+    } else {
+      _overSecs = 0;
+      _underSecs = 0;
+    }
+  }
+
   RnsTransport({this.log, this.transportId});
 
   int get pathCount => _paths.length;
   Iterable<RnsPathEntry> get paths => _paths.values;
-  bool get isTransportNode => transportId != null;
+  // A relaying transport node only when it has a relay id AND isn't shedding
+  // load. In passive mode it still announces/receives its own traffic.
+  bool get isTransportNode => transportId != null && !_passive;
 
   void addInterface(RnsInterface iface) => _interfaces.add(iface);
   void removeInterface(RnsInterface iface) =>
@@ -127,8 +212,144 @@ class RnsTransport {
     }
   }
 
+  // The interface label a given link's traffic flows on (link_id hex -> label),
+  // learned from inbound link packets. A link is sticky to the path it was
+  // established on, so its DATA/parts must go out ONLY there — broadcasting link
+  // traffic on every interface multiplies our uplink load (e.g. 5 hubs => 5x),
+  // which on a phone saturates the uplink and stalls a large Resource transfer.
+  final Map<String, String> _linkIface = {};
+  final List<String> _linkIfaceOrder = [];
+  static const int _maxLinkIface = 512;
+
+  /// Record that link [linkId] is reachable on interface [via] (called for every
+  /// inbound link-addressed packet).
+  void noteLinkIface(Uint8List linkId, String via) {
+    final k = _hex(linkId);
+    if (_linkIface[k] != via) {
+      if (!_linkIface.containsKey(k)) {
+        _linkIfaceOrder.add(k);
+        if (_linkIfaceOrder.length > _maxLinkIface) {
+          _linkIface.remove(_linkIfaceOrder.removeAt(0));
+        }
+      }
+      _linkIface[k] = via;
+    }
+  }
+
+  /// Send a locally-produced packet, routing LINK-addressed traffic on the single
+  /// interface that link uses (if known); everything else goes on all interfaces.
+  /// This is the right default for file/relay/lxmf link traffic — it keeps a big
+  /// Resource transfer from being multiplied across every hub uplink.
+  void sendLinkAware(Uint8List raw) {
+    final p = RnsPacket.parse(raw);
+    if (p != null && p.destType == RnsDestType.link) {
+      final label = _linkIface[_hex(p.destHash)];
+      if (label != null) {
+        final iface = _ifaceByLabel(label);
+        if (iface != null) {
+          iface.send(raw);
+          return;
+        }
+      }
+    }
+    sendOnAll(raw);
+  }
+
   RnsPathEntry? pathFor(Uint8List destHash) => _paths[_hex(destHash)];
   bool hasPath(Uint8List destHash) => _paths.containsKey(_hex(destHash));
+
+  /// Originate a single connectionless DATA packet addressed to [destHash]
+  /// (already-encrypted [data]), routed via our path table: HEADER_2 to the
+  /// next-hop transport node if we hold one, else HEADER_1 broadcast for the
+  /// directly-attached hub to forward toward the destination. Used for
+  /// connectionless app delivery to a SINGLE destination (e.g. a circles
+  /// rendezvous join request) WITHOUT a link handshake — one packet, so it
+  /// survives an asymmetric inbound far better than a 3-way link setup.
+  void sendDataTo(Uint8List destHash, Uint8List data,
+      {int context = RnsContext.none}) {
+    final path = _paths[_hex(destHash)];
+    final toTransport = path?.nextHop != null;
+    final pkt = RnsPacket(
+      destHash: destHash,
+      data: data,
+      headerType:
+          toTransport ? RnsHeaderType.header2 : RnsHeaderType.header1,
+      transportType: toTransport
+          ? RnsTransportType.transport
+          : RnsTransportType.broadcast,
+      destType: RnsDestType.single,
+      packetType: RnsPacketType.data,
+      context: context,
+      transportId: toTransport ? path!.nextHop : null,
+    );
+    sendOnAll(pkt.pack());
+  }
+
+  /// Diagnostic: the routing details of our path to [destHash] (next hop, the
+  /// interface we'd forward on, hops, age). Null if we hold no path.
+  Map<String, dynamic>? pathInfo(Uint8List destHash) {
+    final e = _paths[_hex(destHash)];
+    if (e == null) return null;
+    return {
+      'nextHop': e.nextHop == null ? null : _hex(e.nextHop!),
+      'via': e.via,
+      'hops': e.hops,
+      'ageMs': DateTime.now().millisecondsSinceEpoch - e.updatedMs,
+      'identity': _hex(e.identity.hash),
+    };
+  }
+
+  /// Diagnostic: labels of the live interfaces (the hubs/links we forward on).
+  List<String> get interfaceLabels => [for (final i in _interfaces) i.label];
+
+  // ── Path requests (pull path-finding) ───────────────────────────────────
+  // The well-known RNS path-request destination: PLAIN "rnstransport.path.request"
+  // → truncated_hash(name_hash). Asking this destination for a path is the PULL
+  // half of RNS path-finding: a peer (or a hub the target is a local client of)
+  // answers with the target's announce (context PATH_RESPONSE), which ingest()
+  // learns as an ordinary announce. This reaches a destination whose announce
+  // never passively flooded to us (busy/asymmetric public hubs) — the hub the
+  // target is directly attached to answers on our direct link.
+  static final Uint8List _pathRequestDest = RnsCrypto.truncatedHash(
+      RnsDestination.nameHash('rnstransport', ['path', 'request']));
+  final Random _rng = Random.secure();
+
+  /// Ask the network for a path to [destHash]. Best-effort, fire-and-forget;
+  /// the response arrives asynchronously as a PATH_RESPONSE announce.
+  void requestPath(Uint8List destHash) {
+    if (_interfaces.isEmpty) return;
+    final tag = Uint8List(16);
+    for (var i = 0; i < 16; i++) {
+      tag[i] = _rng.nextInt(256);
+    }
+    // transport-enabled form: dest_hash(16) + our_transport_id(16) + tag(16).
+    final data = BytesBuilder();
+    data.add(destHash);
+    data.add(transportId ?? Uint8List(16));
+    data.add(tag);
+    final pkt = RnsPacket(
+      destHash: _pathRequestDest,
+      data: data.toBytes(),
+      headerType: RnsHeaderType.header1,
+      transportType: RnsTransportType.broadcast,
+      destType: RnsDestType.plain,
+      packetType: RnsPacketType.data,
+      context: RnsContext.none,
+      hops: 0,
+    );
+    sendOnAll(pkt.pack());
+    log?.call('path request -> ${_hex(destHash)}');
+  }
+
+  /// Whether the interface with [label] is announce-only (discovery, no data).
+  /// Unknown labels (e.g. a removed interface) are treated as data-capable so a
+  /// stale entry is never wrongly preferred or dropped.
+  bool _isAnnounceOnly(String label) {
+    for (final i in _interfaces) {
+      if (i.label == label) return i.announceOnly;
+    }
+    return false;
+  }
 
   /// The next-hop transport for reaching [identity]'s destinations. A peer
   /// announces one destination (e.g. its chat dest), but every destination of
@@ -155,10 +376,16 @@ class RnsTransport {
       _seenPackets.remove(_seenPackets.first);
     }
 
-    // As a transport node, forward link/resource traffic that isn't for us.
-    if (transportId != null && _maybeForward(p, via)) return null;
+    // As a transport node, forward link/resource traffic that isn't for us —
+    // unless we've dropped to passive (leaf) mode to shed CPU load.
+    if (transportId != null && !_passive && _maybeForward(p, via)) return null;
 
     if (p.packetType != RnsPacketType.announce) return null;
+
+    // Sample the inbound announce rate (drives the passive-mode auto-switch).
+    // Counted before the flood-shed below so it reflects true load, not what we
+    // chose to process.
+    _accountAnnounceLoad();
 
     // Connected to a busy transport hub, a phone leaf hears the WHOLE network's
     // announce stream — hundreds of new destinations a second. Verifying an
@@ -172,7 +399,9 @@ class RnsTransport {
     // Exempt our own overlay's announces from the flood budget — otherwise the
     // rare Aurora announces get shed amid hundreds of foreign ones a second and
     // nodes never learn each other's routes (no media fetch, no FEED backfill).
-    if (!_paths.containsKey(destKey) && !_isPriorityAnnounce(p)) {
+    if (!_paths.containsKey(destKey) &&
+        !_isPriorityAnnounce(p) &&
+        p.context != RnsContext.pathResponse) {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (nowMs - _annWindowStart >= 1000) {
         _annWindowStart = nowMs;
@@ -197,7 +426,29 @@ class RnsTransport {
         p.headerType == RnsHeaderType.header2 ? p.transportId : null;
     final key = _hex(ann.destHash);
     final existing = _paths[key];
-    if (existing == null || pathHops <= existing.hops) {
+    // Path preference. A path's usefulness for DATA depends on whether the
+    // interface it was heard on can carry data: the LAN UDP interface is
+    // announce-only (it drops all non-announce packets), so a path learned there
+    // can never carry a link/DHT/file transfer. Such a path must NOT shadow a
+    // data-capable (hub/TCP) path even though the LAN announce is fewer hops —
+    // that shadowing made every link to a co-located peer time out. Rules:
+    //   1. a data-capable ingest always replaces an announce-only entry (any hops);
+    //   2. an announce-only ingest never overwrites a data-capable entry;
+    //   3. within the same capability class, prefer fewer/equal hops (LRU refresh).
+    final viaAnnounceOnly = _isAnnounceOnly(via);
+    final existingAnnounceOnly =
+        existing != null && _isAnnounceOnly(existing.via);
+    final bool replace;
+    if (existing == null) {
+      replace = true;
+    } else if (viaAnnounceOnly && !existingAnnounceOnly) {
+      replace = false;
+    } else if (!viaAnnounceOnly && existingAnnounceOnly) {
+      replace = true;
+    } else {
+      replace = pathHops <= existing.hops;
+    }
+    if (replace) {
       // Re-insert at the tail so recently-heard destinations are youngest —
       // the table is an LRU bounded by [_maxPaths] (below) so the network-wide
       // announce flood can't grow it without bound (the old OOM).
@@ -218,7 +469,10 @@ class RnsTransport {
       }
     }
 
-    _rebroadcast(p, ann, pathHops, via);
+    // Relay the announce onward only as an active transport node. In passive
+    // mode we still learned the path above and return the announce for local
+    // delivery, but we don't carry the network's flood on our back.
+    if (!_passive) _rebroadcast(p, ann, pathHops, via);
     return ann;
   }
 

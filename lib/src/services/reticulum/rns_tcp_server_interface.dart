@@ -18,6 +18,8 @@ import 'rns_transport.dart';
 /// One accepted client connection, exposed as an interface to the transport.
 class _RnsTcpServerConn implements RnsInterface {
   @override
+  bool get announceOnly => false;
+  @override
   final String label;
   final Socket socket;
   final RnsHdlcDeframer _deframer = RnsHdlcDeframer();

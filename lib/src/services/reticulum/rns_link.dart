@@ -169,18 +169,43 @@ class RnsLink {
   /// FileTransferNode and RelayNode both need before opening an initiator link.
   /// (LxmfRouter interleaves its own variant with message resolution and is left
   /// as-is to avoid destabilizing the working message path.)
+  ///
+  /// Reticulum routes PER-DESTINATION, not per-identity: the same node's `files`
+  /// and `chat` destinations can be reached through DIFFERENT transport nodes
+  /// (different hubs heard their announces). Prefer [hasPathForDest]/
+  /// [nextHopForDest] (keyed by the SPECIFIC destination hash) so the link request
+  /// is transport-addressed to the hub that actually has a route to THIS
+  /// destination. The per-identity [nextHopFor] is a legacy fallback that picks
+  /// any of the identity's paths — wrong when destinations route via different
+  /// hubs, which silently broke link establishment to a different-hub peer.
   static Future<Uint8List?> ensurePath(
     RnsIdentity peer,
     String appName,
     List<String> aspects, {
     Uint8List? Function(RnsIdentity peer)? nextHopFor,
+    Uint8List? Function(Uint8List destHash)? nextHopForDest,
+    bool Function(Uint8List destHash)? hasPathForDest,
     void Function(Uint8List destHash)? requestPath,
     Duration pollInterval = const Duration(milliseconds: 300),
     int maxPolls = 10,
   }) async {
+    final destHash = RnsDestination.hash(peer, appName, aspects);
+    if (nextHopForDest != null) {
+      // Per-destination routing (correct).
+      var have = hasPathForDest?.call(destHash) ?? false;
+      if (!have && requestPath != null) {
+        requestPath(destHash);
+        for (var i = 0; i < maxPolls && !have; i++) {
+          await Future<void>.delayed(pollInterval);
+          have = hasPathForDest?.call(destHash) ?? false;
+        }
+      }
+      return nextHopForDest(destHash); // null = direct neighbour (HEADER_1)
+    }
+    // Legacy per-identity fallback.
     var hop = nextHopFor?.call(peer);
     if (hop == null && requestPath != null) {
-      requestPath(RnsDestination.hash(peer, appName, aspects));
+      requestPath(destHash);
       for (var i = 0; i < maxPolls && hop == null; i++) {
         await Future<void>.delayed(pollInterval);
         hop = nextHopFor?.call(peer);
@@ -197,6 +222,8 @@ class RnsLink {
     String appName,
     List<String> aspects, {
     Uint8List? Function(RnsIdentity peer)? nextHopFor,
+    Uint8List? Function(Uint8List destHash)? nextHopForDest,
+    bool Function(Uint8List destHash)? hasPathForDest,
     void Function(Uint8List destHash)? requestPath,
     Duration pollInterval = const Duration(milliseconds: 300),
     int maxPolls = 10,
@@ -207,6 +234,8 @@ class RnsLink {
       appName,
       aspects,
       nextHopFor: nextHopFor,
+      nextHopForDest: nextHopForDest,
+      hasPathForDest: hasPathForDest,
       requestPath: requestPath,
       pollInterval: pollInterval,
       maxPolls: maxPolls,

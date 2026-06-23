@@ -1,38 +1,30 @@
 /*
  * File transfer protocol over an established RNS Link.
  *
- * Two transport-agnostic session state machines drive one provider<->fetcher
- * link. They consume inbound RnsPackets (already routed to this link) and return
- * the RnsPackets to send back, so they can be wired to any interface (and unit-
- * tested in-process). Bulk bytes (the manifest, then each chunk) ride the RNS
- * Resource layer; small commands ride a link-encrypted DATA packet with
- * context=none.
+ * Transport-agnostic session state machines drive one provider<->fetcher link.
+ * They consume inbound RnsPackets (already routed to this link) and return the
+ * RnsPackets to send back, so they can be wired to any interface and unit-tested
+ * in-process. A whole file rides ONE RNS Resource (the Resource layer segments,
+ * windows and HMUs it for arbitrary size); small commands ride a link-encrypted
+ * DATA packet with context=none.
  *
  * Wire commands (plaintext of a context-none link DATA):
- *   0x01 GET_MANIFEST       + fileHash(32)                  (legacy, small files)
- *   0x02 GET_CHUNK          + fileHash(32) + index(4 BE)
- *   0x04 GET_MANIFEST_INFO  + fileHash(32)                  (segmented manifest)
- *   0x05 GET_MANIFEST_PART  + fileHash(32) + index(4 BE)
- *   0x81 NOT_FOUND          + fileHash(32)                  (provider -> fetcher)
- *   0x86 MANIFEST_INFO      + fileHash(32) + manifestLen(4 BE)  (provider reply)
+ *   0x01 GET_FILE   + fileHash(32)                 (fetch the whole file)
+ *   0x81 NOT_FOUND  + fileHash(32)                 (provider -> fetcher)
  *
- * A reply that carries bytes is sent as a Resource: GET_CHUNK with the raw chunk
- * bytes; GET_MANIFEST_PART with a slice of the encoded manifest. The fetcher pulls
- * sequentially over one link; parallelism across providers is achieved by running
- * several connections (one per provider link) against a shared chunk-assembly
- * state — that orchestration lives a layer above this file.
+ * A GET_FILE is answered with the file's bytes as a single Resource. Integrity:
+ * the Resource verifies each part + each segment; the fetcher additionally checks
+ * sha256(assembled) == the requested file id, binding an untrusted transfer to the
+ * content the caller asked for.
  *
- * Segmented manifest (the large-file fix): one RNS Resource is a single segment
- * (<= ~34 KB), so the legacy GET_MANIFEST — which serves the whole encoded
- * manifest as one Resource — caps a file at ~34 MB (a 55 MB apk's 57 KB manifest
- * overflows one segment and is declined). GET_MANIFEST_INFO returns just the
- * manifest's byte length; the fetcher then pulls the manifest in <=34 KB parts
- * (exactly like chunks) and reassembles it. Now nothing exceeds one Resource —
- * each chunk AND each manifest part fits — so file size is effectively unbounded.
- * Integrity is unchanged: every chunk is verified against the (reassembled,
- * decoded) manifest, and the assembled bytes' sha256 must equal the requested id.
- * The legacy GET_MANIFEST is kept on the provider so not-yet-updated fetchers
- * still work for small files; new fetchers always use the segmented path.
+ * Store-and-forward deposit (a peer asks a host to KEEP a blob it doesn't hold):
+ *   client -> host : 0x03 PUT_OFFER  sha(32) size(8 BE) extLen(1) ext pub(32) sig(64)
+ *   host -> client : 0x84 PUT_ACCEPT sha(32)            (send the bytes now)
+ *   host -> client : 0x82 PUT_REJECT reason(utf8)
+ *   client -> host : the blob as an RNS Resource (client = sender, host = receiver)
+ *   host -> client : 0x85 PUT_STORED sha(32)
+ * The compact auth proves a NOSTR identity authorizes hosting THIS sha: sig is a
+ * BIP-340 Schnorr signature by [pub] over sha256("blossom-deposit:"+shaHex).
  */
 import 'dart:convert';
 import 'dart:typed_data';
@@ -43,25 +35,10 @@ import '../reticulum/rns_link.dart';
 import '../reticulum/rns_packet.dart';
 import '../reticulum/rns_resource.dart';
 import '../reticulum/rns_resource_receiver.dart';
-import 'file_manifest.dart';
 import 'serve_quota.dart';
 
-const int kOpGetManifest = 0x01;
-const int kOpGetChunk = 0x02;
-const int kOpGetManifestInfo = 0x04; // segmented manifest: ask for its byte length
-const int kOpGetManifestPart = 0x05; // segmented manifest: ask for one part
+const int kOpGetFile = 0x01;
 const int kOpNotFound = 0x81;
-const int kOpManifestInfo = 0x86; // reply to GET_MANIFEST_INFO: + fileHash + len
-// Store-and-forward deposit: a peer asks a host to KEEP a blob it doesn't hold.
-//   client -> host : 0x03 PUT_OFFER  sha(32) size(8 BE) extLen(1) ext pub(32) sig(64)
-//   host -> client : 0x84 PUT_ACCEPT sha(32)            (send the bytes now)
-//   host -> client : 0x82 PUT_REJECT reason(utf8)
-//   client -> host : the blob as an RNS Resource (client = sender, host = receiver)
-//   host -> client : 0x85 PUT_STORED sha(32)
-// The compact auth proves a NOSTR identity authorizes hosting THIS sha: sig is a
-// BIP-340 Schnorr signature by [pub] over sha256("blossom-deposit:"+shaHex), so
-// the host can classify the depositor's retention tier and the sig can't be
-// reused for a different blob.
 const int kOpPutOffer = 0x03;
 const int kOpPutReject = 0x82;
 const int kOpPutAccept = 0x84;
@@ -113,20 +90,18 @@ class MemoryFileSource implements FileSource {
 
 // ── Provider side ──────────────────────────────────────────────────────────
 
-/// Serves files to one connected fetcher over an active link. One Resource is in
-/// flight at a time (the fetcher requests sequentially).
+/// Serves files to one connected fetcher over an active link. One file (one
+/// Resource, possibly multi-segment) is served at a time.
 class FileServeSession {
   final RnsLink link;
   final FileSource source;
   final ServeQuota? quota; // optional serving budget / anti-abuse guard
   final String requesterId; // best-effort requester key (the link id)
-  /// Called once per download a peer starts (when we serve the manifest), with
+  /// Called once per download a peer starts (when we begin serving a file), with
   /// the 32-byte file hash — drives the per-file download metric.
   final void Function(Uint8List fileHash)? onServed;
 
-  /// Store-and-forward deposit: decide on an inbound offer (verify the auth,
-  /// classify tier, enforce quota) and, when accepted, persist the verified
-  /// bytes. Null = this node does not accept deposits.
+  /// Store-and-forward deposit hooks (null = this node does not accept deposits).
   final DepositVerdict Function(
       Uint8List sha, int size, String ext, String pubHex, String sigHex)?
       onDepositOffer;
@@ -135,23 +110,21 @@ class FileServeSession {
       onDepositStore;
 
   RnsResourceSender? _sender; // current in-flight resource (serving)
-  // Per-link manifest cache: building a manifest hashes the whole file, so we
-  // compute it once and reuse it across the fetcher's GET_MANIFEST_INFO + every
-  // GET_MANIFEST_PART for the same file (a fetcher pulls one file's parts in a row).
-  Uint8List? _cachedManifest;
-  String? _cachedManifestFor; // hex of the file hash _cachedManifest describes
   RnsResourceReceiver? _rx; // current in-flight resource (deposit receive)
   Uint8List? _depSha;
   int _depTier = 2;
   String _depOrigin = '';
   String _depExt = 'bin';
 
+  final void Function(String msg)? log;
+
   FileServeSession(this.link, this.source,
       {this.quota,
       this.requesterId = '',
       this.onServed,
       this.onDepositOffer,
-      this.onDepositStore});
+      this.onDepositStore,
+      this.log});
 
   void _abortDeposit() {
     _rx = null;
@@ -162,12 +135,38 @@ class FileServeSession {
   List<RnsPacket> onPacket(RnsPacket p) {
     switch (p.context) {
       case RnsContext.resourceReq:
+        // Serving: a part request (or an HMU request, 0xFF) for the file we send.
+        final s = _sender;
+        if (s == null) {
+          log?.call('serve: REQ but no active sender');
+          return const [];
+        }
+        final req = link.decrypt(p);
+        final out = s.handleRequest(req);
+        // Only log HMU (exhausted) requests — low volume, the interesting ones
+        // for diagnosing multi-segment/hashmap stalls. Per-part requests are far
+        // too frequent to log per-packet.
+        if (log != null && req.isNotEmpty && req[0] == 0xFF) {
+          final hmu =
+              out.where((x) => x.context == RnsContext.resourceHmu).length;
+          final parts =
+              out.where((x) => x.context == RnsContext.resource).length;
+          log!('serve: HMU req seg=${s.segmentIndex} -> hmu=$hmu parts=$parts');
+        }
+        return out;
+      case RnsContext.resourcePrf:
+        // Serving: a per-segment proof. Advance + advertise the next segment.
+        // RNS sends resource proofs UNENCRYPTED (RNS/Packet.py RESOURCE_PRF), so
+        // validate the raw packet data — do NOT link.decrypt() it.
         final s = _sender;
         if (s == null) return const [];
-        return s.handleRequest(link.decrypt(p));
-      case RnsContext.resourcePrf:
-        _sender?.validateProof(link.decrypt(p));
-        _sender = null;
+        if (s.validateProof(p.data)) {
+          log?.call('serve: PROOF ok complete=${s.complete}');
+          if (!s.complete) return [s.advertisementPacket()];
+          _sender = null;
+        } else {
+          log?.call('serve: PROOF INVALID');
+        }
         return const [];
       case RnsContext.resourceAdv:
         // Inbound deposit bytes: only when we accepted an offer.
@@ -178,20 +177,37 @@ class FileServeSession {
           _abortDeposit();
           return [_putReject('bad advertisement')];
         }
-        return [rx.buildRequest()];
+        return _depositAfterReceive(rx);
+      case RnsContext.resourceHmu:
+        final rx = _rx;
+        if (rx == null) return const [];
+        rx.ingestHmu(link.decrypt(p));
+        return rx.pump();
       case RnsContext.resource:
         final rx = _rx;
         if (rx == null) return const [];
-        final complete = rx.ingestPart(p.data);
+        rx.ingestPart(p.data);
         if (rx.error != null) {
           _abortDeposit();
           return [_putReject('resource error')];
         }
-        if (!complete) return const [];
+        return _depositAfterReceive(rx);
+      case RnsContext.none:
+        return _onCommand(link.decrypt(p));
+      default:
+        return const [];
+    }
+  }
+
+  // Drive the deposit receiver: keep the window full; on segment completion send
+  // the proof; on full completion verify the sha and store.
+  List<RnsPacket> _depositAfterReceive(RnsResourceReceiver rx) {
+    if (rx.segmentComplete) {
+      final out = <RnsPacket>[];
+      final prf = rx.proofPacket();
+      if (prf != null) out.add(prf);
+      if (rx.complete) {
         final bytes = rx.payload!;
-        final out = <RnsPacket>[];
-        final prf = rx.proofPacket();
-        if (prf != null) out.add(prf);
         final h = Uint8List.fromList(crypto.sha256.convert(bytes).bytes);
         if (_eq(h, _depSha!)) {
           onDepositStore?.call(_depSha!, bytes, _depOrigin, _depTier, _depExt);
@@ -200,68 +216,22 @@ class FileServeSession {
           out.add(_putReject('hash mismatch'));
         }
         _abortDeposit();
-        return out;
-      case RnsContext.none:
-        return _onCommand(link.decrypt(p));
-      default:
-        return const [];
+      }
+      return out;
     }
+    return rx.pump();
   }
 
   List<RnsPacket> _onCommand(Uint8List cmd) {
     if (cmd.isEmpty) return const [];
     final op = cmd[0];
-    if (op == kOpGetManifest && cmd.length >= 1 + 32) {
+    if (op == kOpGetFile && cmd.length >= 1 + 32) {
       final fileHash = Uint8List.sublistView(cmd, 1, 33);
       final bytes = source.read(fileHash);
       if (bytes == null) return [_notFound(fileHash)];
-      final manifest = FileManifest.ofBytes(bytes).encode();
-      if (!_allow(fileHash, manifest.length, manifest: true)) {
-        return [_notFound(fileHash)];
-      }
-      return _serveResource(manifest, fileHash, manifest: true);
-    }
-    if (op == kOpGetChunk && cmd.length >= 1 + 32 + 4) {
-      final fileHash = Uint8List.sublistView(cmd, 1, 33);
-      final idx = ByteData.sublistView(cmd, 33, 37).getUint32(0, Endian.big);
-      final bytes = source.read(fileHash);
-      if (bytes == null) return [_notFound(fileHash)];
-      final off = idx * kFileChunkSize;
-      if (off >= bytes.length && bytes.isNotEmpty) return [_notFound(fileHash)];
-      final end =
-          off + kFileChunkSize < bytes.length ? off + kFileChunkSize : bytes.length;
-      final chunk = Uint8List.fromList(bytes.sublist(off, end));
-      if (!_allow(fileHash, chunk.length)) return [_notFound(fileHash)];
-      return _serveResource(chunk, fileHash);
-    }
-    if (op == kOpGetManifestInfo && cmd.length >= 1 + 32) {
-      final fileHash = Uint8List.sublistView(cmd, 1, 33);
-      final manifest = _manifestBytes(fileHash);
-      if (manifest == null) return [_notFound(fileHash)];
-      if (!_allow(fileHash, manifest.length, manifest: true)) {
-        return [_notFound(fileHash)];
-      }
-      // A manifest-info request marks the start of one download by another node.
+      if (!_allow(fileHash, bytes.length)) return [_notFound(fileHash)];
       onServed?.call(Uint8List.fromList(fileHash));
-      return [_manifestInfo(fileHash, manifest.length)];
-    }
-    if (op == kOpGetManifestPart && cmd.length >= 1 + 32 + 4) {
-      final fileHash = Uint8List.sublistView(cmd, 1, 33);
-      final idx = ByteData.sublistView(cmd, 33, 37).getUint32(0, Endian.big);
-      final manifest = _manifestBytes(fileHash);
-      if (manifest == null) return [_notFound(fileHash)];
-      final off = idx * kFileChunkSize;
-      if (off >= manifest.length && manifest.isNotEmpty) {
-        return [_notFound(fileHash)];
-      }
-      final end = off + kFileChunkSize < manifest.length
-          ? off + kFileChunkSize
-          : manifest.length;
-      final part = Uint8List.fromList(manifest.sublist(off, end));
-      if (!_allow(fileHash, part.length, manifest: true)) {
-        return [_notFound(fileHash)];
-      }
-      return _serveResource(part, fileHash);
+      return _serveResource(bytes, fileHash);
     }
     if (op == kOpPutOffer && cmd.length >= 1 + 32 + 8 + 1) {
       // [0x03][sha32][size8][extLen1][ext][pub32][sig64]
@@ -275,8 +245,7 @@ class FileServeSession {
       final pub = Uint8List.sublistView(cmd, o, o + 32);
       o += 32;
       final sig = Uint8List.sublistView(cmd, o, o + 64);
-      final accept =
-          onDepositOffer?.call(sha, size, ext, _hex(pub), _hex(sig));
+      final accept = onDepositOffer?.call(sha, size, ext, _hex(pub), _hex(sig));
       if (accept == null || !accept.ok) {
         return [_putReject(accept?.reason ?? 'deposits not accepted')];
       }
@@ -311,26 +280,18 @@ class FileServeSession {
   }
 
   // Quota gate: may we serve [bytes] for [fileHash] to this requester now?
-  bool _allow(Uint8List fileHash, int bytes, {bool manifest = false}) {
+  bool _allow(Uint8List fileHash, int bytes) {
     final q = quota;
     if (q == null) return true;
-    return q.canServe(requesterId, fileHash, bytes, manifest: manifest);
+    return q.canServe(requesterId, fileHash, bytes);
   }
 
-  List<RnsPacket> _serveResource(Uint8List payload, Uint8List fileHash,
-      {bool manifest = false}) {
-    try {
-      final s = RnsResourceSender(link, payload);
-      s.prepare();
-      _sender = s;
-      quota?.record(requesterId, fileHash, payload.length, manifest: manifest);
-      // A manifest serve marks the start of one download by another node.
-      if (manifest) onServed?.call(fileHash);
-      return [s.advertisementPacket()];
-    } catch (_) {
-      // Payload too large for a single Resource segment (v1 limit) — decline.
-      return [_notFound(fileHash)];
-    }
+  List<RnsPacket> _serveResource(Uint8List payload, Uint8List fileHash) {
+    final s = RnsResourceSender(link, payload);
+    s.prepare();
+    _sender = s;
+    quota?.record(requesterId, fileHash, payload.length);
+    return [s.advertisementPacket()];
   }
 
   RnsPacket _notFound(Uint8List fileHash) {
@@ -339,79 +300,38 @@ class FileServeSession {
       ..add(fileHash);
     return link.encrypt(b.toBytes(), context: RnsContext.none);
   }
-
-  /// The encoded manifest for [fileHash] (cached per link), or null if we don't
-  /// hold the file. Computing it hashes the whole file, so the cache spares us
-  /// re-hashing on every GET_MANIFEST_PART of the same download.
-  Uint8List? _manifestBytes(Uint8List fileHash) {
-    final hex = _hex(fileHash);
-    if (_cachedManifestFor == hex && _cachedManifest != null) {
-      return _cachedManifest;
-    }
-    final bytes = source.read(fileHash);
-    if (bytes == null) return null;
-    final m = FileManifest.ofBytes(bytes).encode();
-    _cachedManifest = m;
-    _cachedManifestFor = hex;
-    return m;
-  }
-
-  RnsPacket _manifestInfo(Uint8List fileHash, int manifestLen) {
-    final b = BytesBuilder()
-      ..addByte(kOpManifestInfo)
-      ..add(fileHash);
-    final n = ByteData(4)..setUint32(0, manifestLen, Endian.big);
-    b.add(n.buffer.asUint8List());
-    return link.encrypt(b.toBytes(), context: RnsContext.none);
-  }
 }
 
 // ── Fetcher side ───────────────────────────────────────────────────────────
 
-enum FileFetchState { idle, manifestInfo, manifestParts, chunks, done, failed }
+enum FileFetchState { idle, fetching, done, failed }
 
-/// Fetches one file (by id) from one provider over an active link. Asks for the
-/// manifest's length, pulls the manifest in <=34 KB parts and reassembles it,
-/// then pulls each chunk sequentially — verifying every chunk against the
-/// manifest and the assembled bytes against the requested id.
+/// Fetches one file (by id) from one provider over an active link: GET_FILE, then
+/// drive the RnsResourceReceiver (windowed parts, HMU, multi-segment) to
+/// completion, verifying sha256(assembled) == the requested id.
 class FileFetchSession {
   final RnsLink link;
   final Uint8List wantHash; // requested file id (sha256, 32B)
 
   FileFetchState state = FileFetchState.idle;
   String? error;
-  FileManifest? manifest;
   Uint8List? result; // assembled, verified file bytes
 
-  RnsResourceReceiver? _rx; // in-flight resource
-  // Segmented-manifest assembly (before the manifest is decoded).
-  int _manifestLen = 0; // total manifest bytes, from MANIFEST_INFO
-  int _manifestPartIdx = 0; // next manifest part to request
-  final BytesBuilder _manifestBuf = BytesBuilder();
-  // Chunk assembly (after the manifest is decoded).
-  int _expectIdx = 0; // chunk index being fetched
-  List<Uint8List?> _chunks = [];
+  late final RnsResourceReceiver _rx = RnsResourceReceiver(link);
 
   FileFetchSession(this.link, this.wantHash);
 
-  /// Bytes received so far (sum of the chunks we hold), for a progress display.
-  int get receivedBytes {
-    final m = manifest;
-    if (m == null) return 0;
-    var n = 0;
-    for (var i = 0; i < _chunks.length; i++) {
-      if (_chunks[i] != null) n += m.chunkLength(i);
-    }
-    return n;
-  }
+  /// Bytes received so far (for a progress display).
+  int get receivedBytes => _rx.receivedBytes;
 
-  /// Total file size from the manifest (0 until the manifest arrives).
-  int get totalBytes => manifest?.size ?? 0;
+  /// Total size is unknown until the transfer completes (segments are advertised
+  /// one at a time), so progress is indeterminate; returns 0.
+  int get totalBytes => 0;
 
-  /// Begin: returns the GET_MANIFEST_INFO packet to send.
+  /// Begin: returns the GET_FILE packet to send.
   RnsPacket start() {
-    state = FileFetchState.manifestInfo;
-    return _cmd(kOpGetManifestInfo, wantHash);
+    state = FileFetchState.fetching;
+    return _cmd(kOpGetFile, wantHash);
   }
 
   /// Process one inbound packet; returns packets to send back. When [state]
@@ -420,122 +340,42 @@ class FileFetchSession {
     if (state == FileFetchState.done || state == FileFetchState.failed) {
       return const [];
     }
-    switch (p.context) {
-      case RnsContext.none:
-        final cmd = link.decrypt(p);
-        if (cmd.isNotEmpty && cmd[0] == kOpNotFound) {
-          return _fail('provider does not have the file');
-        }
-        if (state == FileFetchState.manifestInfo &&
-            cmd.length >= 1 + 32 + 4 &&
-            cmd[0] == kOpManifestInfo) {
-          _manifestLen =
-              ByteData.sublistView(cmd, 33, 37).getUint32(0, Endian.big);
-          if (_manifestLen <= 0) return _fail('manifest length invalid');
-          state = FileFetchState.manifestParts;
-          _manifestPartIdx = 0;
-          return [_manifestPartCmd(0)];
-        }
-        return const [];
-      case RnsContext.resourceAdv:
-        final rx = RnsResourceReceiver(link);
-        _rx = rx;
-        if (!rx.ingestAdvertisement(link.decrypt(p))) {
-          return _fail('bad advertisement: ${rx.error}');
-        }
-        return [rx.buildRequest()];
-      case RnsContext.resource:
-        final rx = _rx;
-        if (rx == null) return const [];
-        final complete = rx.ingestPart(p.data);
-        if (rx.error != null) return _fail('resource error: ${rx.error}');
-        if (!complete) return const [];
-        final out = <RnsPacket>[];
-        final prf = rx.proofPacket();
-        if (prf != null) out.add(prf);
-        out.addAll(_onResourceComplete(rx.payload!));
-        return out;
-      default:
-        return const [];
+    if (p.context == RnsContext.none) {
+      final cmd = link.decrypt(p);
+      if (cmd.isNotEmpty && cmd[0] == kOpNotFound) {
+        return _fail('provider does not have the file');
+      }
+      return const [];
     }
+    // resourceAdv / resourceHmu / resource → the shared multi-segment driver.
+    final out = _rx.handle(p);
+    if (_rx.error != null) return _fail('resource error: ${_rx.error}');
+    if (_rx.complete) _finish();
+    return out;
   }
 
-  List<RnsPacket> _onResourceComplete(Uint8List payload) {
-    _rx = null;
-    if (state == FileFetchState.manifestParts) {
-      // One manifest part arrived; append and pull the next, or decode.
-      _manifestBuf.add(payload);
-      if (_manifestBuf.length < _manifestLen) {
-        _manifestPartIdx++;
-        return [_manifestPartCmd(_manifestPartIdx)];
-      }
-      if (_manifestBuf.length != _manifestLen) {
-        return _fail('manifest reassembly length mismatch');
-      }
-      final m = FileManifest.decode(_manifestBuf.toBytes());
-      if (m == null) return _fail('manifest decode failed');
-      if (!_eq(m.fileHash, wantHash)) {
-        return _fail('manifest file hash != requested id');
-      }
-      manifest = m;
-      _chunks = List<Uint8List?>.filled(m.chunkCount, null);
-      if (m.chunkCount == 0) return _finish(); // empty file
-      state = FileFetchState.chunks;
-      _expectIdx = 0;
-      return [_chunkCmd(0)];
-    }
-    // A chunk arrived for _expectIdx.
-    final m = manifest!;
-    final idx = _expectIdx;
-    final h = Uint8List.fromList(crypto.sha256.convert(payload).bytes);
-    if (!_eq(h, m.chunkHashes[idx])) {
-      return _fail('chunk $idx hash mismatch');
-    }
-    _chunks[idx] = payload;
-    final next = idx + 1;
-    if (next < m.chunkCount) {
-      _expectIdx = next;
-      return [_chunkCmd(next)];
-    }
-    return _finish();
-  }
+  /// Re-request stalled parts (call on a stall timer).
+  List<RnsPacket> retry() => _rx.retry();
 
-  List<RnsPacket> _finish() {
-    final out = BytesBuilder();
-    for (final c in _chunks) {
-      if (c == null) return _fail('missing chunk at assembly');
-      out.add(c);
+  void _finish() {
+    final bytes = _rx.payload;
+    if (bytes == null) {
+      _fail('no payload after completion');
+      return;
     }
-    final bytes = out.toBytes();
     final h = Uint8List.fromList(crypto.sha256.convert(bytes).bytes);
-    if (!_eq(h, wantHash)) return _fail('assembled file hash != requested id');
+    if (!_eq(h, wantHash)) {
+      _fail('assembled file hash != requested id');
+      return;
+    }
     result = bytes;
     state = FileFetchState.done;
-    return const [];
   }
 
   List<RnsPacket> _fail(String why) {
     error = why;
     state = FileFetchState.failed;
     return const [];
-  }
-
-  RnsPacket _chunkCmd(int idx) {
-    final b = BytesBuilder()
-      ..addByte(kOpGetChunk)
-      ..add(wantHash);
-    final n = ByteData(4)..setUint32(0, idx, Endian.big);
-    b.add(n.buffer.asUint8List());
-    return link.encrypt(b.toBytes(), context: RnsContext.none);
-  }
-
-  RnsPacket _manifestPartCmd(int idx) {
-    final b = BytesBuilder()
-      ..addByte(kOpGetManifestPart)
-      ..add(wantHash);
-    final n = ByteData(4)..setUint32(0, idx, Endian.big);
-    b.add(n.buffer.asUint8List());
-    return link.encrypt(b.toBytes(), context: RnsContext.none);
   }
 
   RnsPacket _cmd(int op, Uint8List arg) {
@@ -593,15 +433,11 @@ class FileDepositSession {
         if (cmd.isEmpty) return const [];
         if (cmd[0] == kOpPutAccept) {
           // Host accepted — stream the bytes as a Resource.
-          try {
-            final s = RnsResourceSender(link, bytes);
-            s.prepare();
-            _sender = s;
-            state = FileDepositState.sending;
-            return [s.advertisementPacket()];
-          } catch (_) {
-            return _fail('blob too large for one resource segment');
-          }
+          final s = RnsResourceSender(link, bytes);
+          s.prepare();
+          _sender = s;
+          state = FileDepositState.sending;
+          return [s.advertisementPacket()];
         }
         if (cmd[0] == kOpPutReject) {
           return _fail(utf8.decode(cmd.sublist(1), allowMalformed: true));
@@ -616,8 +452,12 @@ class FileDepositSession {
         if (s == null) return const [];
         return s.handleRequest(link.decrypt(p));
       case RnsContext.resourcePrf:
-        _sender?.validateProof(link.decrypt(p));
-        _sender = null;
+        final s = _sender;
+        if (s == null) return const [];
+        // RNS resource proofs are UNENCRYPTED — validate raw p.data.
+        if (s.validateProof(p.data) && !s.complete) {
+          return [s.advertisementPacket()]; // next segment
+        }
         return const []; // success is confirmed by PUT_STORED
       default:
         return const [];

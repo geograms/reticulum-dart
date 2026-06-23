@@ -323,6 +323,33 @@ class FileTransferNode {
     RnsIdentity providerPublicIdentity, {
     Duration timeout = const Duration(minutes: 20),
   }) async {
+    // The link handshake (request -> proof -> RTT) can be lost over a lossy,
+    // high-RTT cross-network path: the responder's LRPROOF in particular is sent
+    // on all interfaces and a copy can be dropped before it returns. Re-sending
+    // the SAME request is useless (RNS dedups by packet hash), so each retry
+    // builds a FRESH link (new ephemeral key -> new link id -> new packet).
+    // Once the handshake completes the transfer phase is single-interface and
+    // reliable, so we only retry the handshake itself.
+    const handshakeAttempts = 6;
+    for (var attempt = 0; attempt < handshakeAttempts; attempt++) {
+      final (result, handshakeOk) =
+          await _fetchOnce(fileHash, providerPublicIdentity, timeout);
+      // Got the bytes, or the handshake established and the transfer ran (and
+      // failed for a real reason) — either way don't re-handshake.
+      if (result != null || handshakeOk) return result;
+      log?.call('files: handshake attempt ${attempt + 1} failed, retrying '
+          '${_hex(fileHash)}');
+    }
+    return null;
+  }
+
+  /// One link-open + handshake + transfer attempt. Returns (bytesOrNull,
+  /// handshakeCompleted) so [fetch] can decide whether to re-handshake.
+  Future<(Uint8List?, bool)> _fetchOnce(
+    Uint8List fileHash,
+    RnsIdentity providerPublicIdentity,
+    Duration timeout,
+  ) async {
     final link =
         await RnsLink.initiator(providerPublicIdentity, kFilesApp, kFilesAspects);
     link.nextHop =
@@ -332,24 +359,23 @@ class FileTransferNode {
     entry.baseTimeout = timeout;
     final id = _hex(link.linkId!);
     _fetch[id] = entry;
-    // Reference RNS aborts a Resource only after MAX_RETRIES *consecutive*
-    // no-progress retries (each shrinking the window) — never on a fixed
-    // wall-clock budget. That lets a healthy-but-slow transfer of ANY size ride
-    // out hub latency: as long as bytes keep arriving (at any rate) the stall
-    // counter resets. We mirror that here instead of the old "abort if no bytes
-    // in ~24s" + 20-min cap, which killed large/slow transfers.
-    const maxStalls = 16; // Resource.MAX_RETRIES
-    const tick = Duration(seconds: 4); // ~64s of dead air before giving up
+    const tick = Duration(seconds: 4);
+    // Per-attempt handshake budget (~32s); [fetch] retries with a fresh link.
+    const maxHandshakeStalls = 8;
+    // Once bytes are flowing, tolerate long no-progress gaps: over a lossy,
+    // high-RTT cross-network path a healthy large transfer can go minutes
+    // between visible byte advances (slow segment transitions, HMU round-trips,
+    // a Wi-Fi blip). Reference RNS scales its part timeout by the link's
+    // measured throughput; we approximate that with a generous fixed budget
+    // (~5 min of dead air) and re-request every tick to drive recovery.
+    const maxTransferStalls = 75;
     var lastSeen = -1;
     var stalls = 0;
     entry.retry = Timer.periodic(tick, (_) {
       final f = entry.fetch;
       if (f == null) {
-        // Still in the link handshake: a link that never establishes must still
-        // abort eventually, so count idle ticks here too.
-        if (++stalls > maxStalls && !entry.done.isCompleted) {
-          log?.call('files: fetch handshake timeout ${_hex(fileHash)}');
-          entry.done.complete(null);
+        if (++stalls > maxHandshakeStalls && !entry.done.isCompleted) {
+          entry.done.complete(null); // handshake never completed -> retry
         }
         return;
       }
@@ -359,9 +385,9 @@ class FileTransferNode {
         stalls = 0;
         return;
       }
-      if (++stalls > maxStalls) {
+      if (++stalls > maxTransferStalls) {
         if (!entry.done.isCompleted) {
-          log?.call('files: fetch stalled ($maxStalls dead ticks) '
+          log?.call('files: fetch stalled ($maxTransferStalls dead ticks) '
               '${_hex(fileHash)}');
           entry.done.complete(null);
         }
@@ -377,7 +403,7 @@ class FileTransferNode {
     entry.timeout?.cancel();
     entry.retry?.cancel();
     _fetch.remove(id);
-    return result;
+    return (result, entry.fetch != null);
   }
 
   Future<void> _onFetchPacket(_FetchEntry e, RnsPacket p) async {

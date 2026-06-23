@@ -96,8 +96,17 @@ class DhtNode {
       if (resp != null && resp.op == DhtOp.storeOk && resp.ok) ok++;
       routing.add(c);
     }
-    if (closest.isEmpty && await _accept(r)) ok = 1; // tiny/isolated network
-    log?.call('publish ${dhtHex(r.sha256).substring(0, 8)} -> $ok holders');
+    // ALWAYS keep our own record locally: we are authoritative for content we
+    // hold, so a resolver that queries us (we're in its routing) must get it even
+    // if every replication STORE to the k-closest failed. Previously we stored
+    // locally only when isolated (closest.isEmpty), so a publisher with peers but
+    // flaky paths replicated to nobody AND kept nothing — its file became
+    // undiscoverable despite it sitting right there. That was the root cause of
+    // "resolved 0 providers" between two meshed devices.
+    final keptSelf = await _accept(r);
+    if (keptSelf && ok == 0) ok = 1;
+    log?.call('publish ${dhtHex(r.sha256).substring(0, 8)} -> $ok holders'
+        '${keptSelf ? ' (+self)' : ''}');
     return ok;
   }
 

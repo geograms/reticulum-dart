@@ -375,7 +375,7 @@ class FileTransferNode {
       if (!e.deadlineScaled && f.manifest != null) {
         e.deadlineScaled = true;
         final n = f.manifest!.chunkCount;
-        final scaled = Duration(seconds: 60 + (n ~/ 50));
+        final scaled = Duration(seconds: 120 + (n ~/ 5));
         if (scaled > e.baseTimeout) {
           e.timeout?.cancel();
           e.timeout = Timer(scaled, () {
@@ -536,6 +536,7 @@ class FileTransferNode {
     _fetchProgress[progressKey] = (received: 0, total: m.size);
 
     Future<void> worker(ProviderConnection c) async {
+      var consecutiveFails = 0;
       while (queue.isNotEmpty) {
         int? idx;
         while (queue.isNotEmpty) {
@@ -551,19 +552,27 @@ class FileTransferNode {
           chunks[idx] = bytes;
           received += m.chunkLength(idx);
           _fetchProgress[progressKey] = (received: received, total: m.size);
+          consecutiveFails = 0;
         } else {
           final t = (attempts[idx] ?? 0) + 1;
           attempts[idx] = t;
-          if (t <= 3) queue.addLast(idx); // try another provider
-          if (bytes == null) return; // this connection looks dead — retire it
+          if (t <= 6) queue.addLast(idx); // retry (this or another provider)
+          // A transient chunk failure must NOT retire the only provider — that
+          // abandons the whole transfer mid-way (the bug that made large single-
+          // source fetches flaky). Tolerate a run of failures before giving up on
+          // this connection; a success resets the counter.
+          consecutiveFails++;
+          if (consecutiveFails >= 8) return; // connection really looks dead
         }
       }
     }
 
     // Scale the budget with the file's chunk count so a large (multi-thousand
-    // chunk) transfer over a slow link isn't cut off by the flat default; never
-    // shorter than the caller's [timeout]. ~1s per 50 chunks (≈ +34s for 55 MB).
-    final scaled = Duration(seconds: 60 + (n ~/ 50));
+    // chunk) transfer over a slow link finishes; never shorter than the caller's
+    // [timeout]. Single-source RNS throughput over public hubs is modest (each
+    // chunk is a Resource round-trip), so budget generously: ~1s per 5 chunks
+    // (≈ 5 min for 55 MB, ~11 min for 107 MB) — reliability over speed.
+    final scaled = Duration(seconds: 120 + (n ~/ 5));
     final effective = scaled > timeout ? scaled : timeout;
     await Future.wait(ready.map(worker))
         .timeout(effective, onTimeout: () => const []);

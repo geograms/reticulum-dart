@@ -46,7 +46,6 @@ class RnsResourceSender {
 
   // Current-segment state (rebuilt by _prepareSegment).
   late Uint8List _encrypted; // link-encrypted segment stream
-  late int _segDataLen; // plaintext length of this segment
   final List<Uint8List> _parts = [];
   final List<Uint8List> _mapHashes = [];
   late Uint8List _resourceHash; // 32B, over segment plaintext + map random
@@ -80,7 +79,6 @@ class RnsResourceSender {
     _rmch = 0; // each segment's hashmap is requested from the start
     final start = idx * kMaxEfficientSize;
     final len = math.min(kMaxEfficientSize, payload.length - start);
-    _segDataLen = len;
     final segData = Uint8List.sublistView(payload, start, start + len);
     final stream = Uint8List(_randomHashSize + len)
       ..setRange(0, _randomHashSize, _randomBytes(_randomHashSize))
@@ -116,8 +114,8 @@ class RnsResourceSender {
     }
     final adv = _MsgpackEncoder()
       ..mapHeader(11)
-      ..str('t')..integer(_encrypted.length) // encrypted transfer size
-      ..str('d')..integer(_segDataLen) // segment plaintext size
+      ..str('t')..integer(_encrypted.length) // this segment's transfer size
+      ..str('d')..integer(payload.length) // TOTAL data size (all segments), per RNS
       ..str('n')..integer(_parts.length) // parts in this segment
       ..str('h')..bin(_resourceHash) // segment resource hash
       ..str('r')..bin(_mapRandom) // map random

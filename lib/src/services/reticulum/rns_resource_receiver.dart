@@ -362,9 +362,11 @@ class RnsResourceReceiver {
       return _fail('stream shorter than random header');
     }
     final segData = Uint8List.sublistView(stream, _randomHashSize);
-    if (_dataSize > 0 && segData.length != _dataSize) {
-      return _fail('segment size ${segData.length} != advertised $_dataSize');
-    }
+    // NOTE: the advertisement 'd' field is the resource's TOTAL data size (all
+    // segments), NOT this segment's size — so it must NOT be compared against a
+    // single segment (that rejects every multi-segment transfer from a correct
+    // sender, e.g. reference RNS, where seg size < total). Per-segment integrity
+    // is verified by the resource_hash; the total is checked once assembled.
     final check = Uint8List.sublistView(
         RnsCrypto.fullHash([...segData, ..._mapRandom]), 0, _hashLen);
     if (!RnsCrypto.constantTimeEquals(check, _resourceHash)) {
@@ -374,7 +376,11 @@ class RnsResourceReceiver {
     _pendingProof = RnsCrypto.fullHash([...segData, ..._resourceHash]);
     _segmentComplete = true;
     if (_segIndex + 1 >= _totalSegments) {
-      _payload = _assembled.toBytes();
+      final full = _assembled.toBytes();
+      if (_dataSize > 0 && full.length != _dataSize) {
+        return _fail('total size ${full.length} != advertised $_dataSize');
+      }
+      _payload = full;
       _complete = true;
     }
     return true;

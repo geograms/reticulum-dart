@@ -46,6 +46,11 @@ class DhtNode {
 
   int get storedKeys => _store.length;
 
+  /// How many provider records we have accepted from OTHER nodes (replicas) —
+  /// the live signal that replication is actually landing on this node, as
+  /// opposed to records we published about our own content.
+  int replicasStored = 0;
+
   // ── Responder side ───────────────────────────────────────────────────────
   Future<DhtMessage> handle(DhtMessage req) async {
     routing.add(req.sender); // learn whoever contacts us
@@ -63,7 +68,13 @@ class DhtNode {
             : DhtMessage.valueNodes(
                 myPub, _cap(routing.closest(key, k), kDhtWireMaxContacts));
       case DhtOp.store:
-        final ok = await _accept(req.records.first);
+        final r = req.records.first;
+        final ok = await _accept(r);
+        if (ok && !_eq(r.providerPub, myPub)) {
+          replicasStored++;
+          log?.call('stored replica ${dhtHex(r.sha256).substring(0, 8)} from '
+              '${dhtHex(r.providerPub).substring(0, 8)} (replication landed)');
+        }
         return DhtMessage.storeOk(myPub, ok);
       default:
         return DhtMessage.pong(myPub);

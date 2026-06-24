@@ -257,6 +257,11 @@ class FileTransferNode {
   /// publish/resolve can only act locally — useful for diagnosing discovery.
   int get dhtRoutingSize => dht?.routing.size ?? 0;
 
+  /// DHT keys we custody (our own + replicas from peers), and — the signal that
+  /// replication is landing — how many of those records came from OTHER nodes.
+  int get dhtStoredKeys => dht?.storedKeys ?? 0;
+  int get dhtReplicasStored => dht?.replicasStored ?? 0;
+
   /// Identity hashes of the DHT peers in the routing table (debug: lets us see
   /// WHICH Aurora nodes are in the overlay, to diagnose discovery convergence).
   List<String> get dhtPeerHexes =>

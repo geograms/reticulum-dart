@@ -38,6 +38,12 @@ abstract class RnsInterface {
   /// can never carry a link/DHT/file transfer, so it must not shadow a path
   /// learned on a data-capable interface (the hub). Default false.
   bool get announceOnly => false;
+
+  /// The hardware MTU this interface can carry, used for link MTU discovery
+  /// (RNS Interface.HW_MTU). The default [kRnsMtu] means "no discovery" — links
+  /// over this interface stay at the 500-byte protocol MTU. Interfaces that can
+  /// carry larger frames (TCP) override this to negotiate bigger resource parts.
+  int get hardwareMtu => kRnsMtu;
 }
 
 class RnsPathEntry {
@@ -277,6 +283,21 @@ class RnsTransport {
 
   RnsPathEntry? pathFor(Uint8List destHash) => _paths[_hex(destHash)];
   bool hasPath(Uint8List destHash) => _paths.containsKey(_hex(destHash));
+
+  /// The hardware MTU of the interface a packet to [destHash] would leave on —
+  /// used by the link initiator to offer a larger link MTU (RNS link MTU
+  /// discovery / Transport.next_hop_interface_hw_mtu). Falls back to [kRnsMtu]
+  /// when no path/interface is known (i.e. no discovery).
+  int nextHopInterfaceHwMtu(Uint8List destHash) {
+    final path = pathFor(destHash);
+    if (path == null) return kRnsMtu;
+    return _ifaceByLabel(path.via)?.hardwareMtu ?? kRnsMtu;
+  }
+
+  /// HW MTU of the interface labelled [via] (the one a packet just arrived on) —
+  /// used by the responder to cap the link MTU it confirms to what its return
+  /// path can carry. Falls back to [kRnsMtu] for unknown labels.
+  int hwMtuForVia(String via) => _ifaceByLabel(via)?.hardwareMtu ?? kRnsMtu;
 
   /// Originate a single connectionless DATA packet addressed to [destHash]
   /// (already-encrypted [data]), routed via our path table: HEADER_2 to the

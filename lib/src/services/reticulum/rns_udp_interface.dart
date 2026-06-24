@@ -12,11 +12,14 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'rns_packet.dart' show kRnsMtu;
 import 'rns_transport.dart';
 
 class RnsUdpInterface implements RnsInterface {
   @override
   bool get announceOnly => false;
+  @override
+  int get hardwareMtu => kRnsMtu; // UDP datagrams: stay at the protocol MTU
   @override
   final String label;
   final String listenHost;

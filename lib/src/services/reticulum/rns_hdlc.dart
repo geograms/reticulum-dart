@@ -10,6 +10,8 @@
  */
 import 'dart:typed_data';
 
+import 'rns_packet.dart' show kRnsLinkMtuMax;
+
 const int kHdlcFlag = 0x7E;
 const int kHdlcEsc = 0x7D;
 const int kHdlcEscMask = 0x20;
@@ -37,7 +39,9 @@ class RnsHdlcDeframer {
   bool _escaping = false;
   final BytesBuilder _buf = BytesBuilder();
 
-  RnsHdlcDeframer({this.maxFrameBytes = 262144});
+  // Allow margin above the largest negotiable link MTU so a max-size packet
+  // survives HDLC byte-stuffing (worst case ~2x) on the wire.
+  RnsHdlcDeframer({this.maxFrameBytes = 2 * kRnsLinkMtuMax});
 
   /// Consume [chunk]; return zero or more complete, de-escaped frames.
   List<Uint8List> feed(List<int> chunk) {

@@ -29,6 +29,9 @@ class RnsLanInterface implements RnsInterface {
   // must never shadow a data-capable (hub) path (see RnsTransport.ingest).
   @override
   bool get announceOnly => true;
+  // Announce-only; never carries a link, so MTU discovery is irrelevant.
+  @override
+  int get hardwareMtu => kRnsMtu;
   final int port; // shared listen + send port (all Aurora nodes use the same)
   final String broadcastHost;
   final void Function(Uint8List packetRaw) onPacket;

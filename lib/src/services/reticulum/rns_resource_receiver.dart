@@ -44,7 +44,10 @@ const int _windowMaxFast = 75; // Resource.WINDOW_MAX_FAST
 const int _windowFlexibility = 4; // Resource.WINDOW_FLEXIBILITY
 const int _fastRateThreshold = _windowMaxSlow - _windowStart - 2; // 4
 
-/// Max map-hashes listed in one RESOURCE_REQ packet (fits the link MDU).
+// Map-hashes carried per RESOURCE_REQ / HMU batch. FIXED at 74 — RNS's
+// ResourceAdvertisement.HASHMAP_MAX_LEN is a class constant from the DEFAULT
+// MTU, NOT the per-link negotiated MTU (MTU discovery scales the part SDU, not
+// the hashmap batch). Both ends use 74 so HMU segment boundaries stay aligned.
 const int _reqBatch = 74;
 
 /// Receiver-side state machine for one inbound Resource (possibly multi-segment).
@@ -95,7 +98,7 @@ class RnsResourceReceiver {
   /// Compact internal state for stall diagnostics.
   String get debugState => 'seg=${_segIndex + 1}/$_totalSegments '
       'parts=${_parts.length}/$_n known=$_knownHashes '
-      'win=$_window(min=$_windowMin,max=$_windowMax) '
+      'win=$_window(min=$_windowMin,max=$_windowMax) mtu=${link.mtu} '
       'out=${_outstanding.length} hmu=$_hmuOutstanding done=$_segmentComplete';
 
   /// Received plaintext bytes so far (completed segments + current segment's
@@ -243,7 +246,8 @@ class RnsResourceReceiver {
         if (!_parts.containsKey(i) && !_outstanding.contains(i)) pick.add(i);
       }
       for (var off = 0; off < pick.length; off += _reqBatch) {
-        final batch = pick.sublist(off, math.min(off + _reqBatch, pick.length));
+        final batch =
+            pick.sublist(off, math.min(off + _reqBatch, pick.length));
         _outstanding.addAll(batch);
         out.add(_partRequest(batch));
       }

@@ -21,6 +21,7 @@
  */
 import 'dart:typed_data';
 
+import 'rns_packet.dart' show kRnsMtu;
 import 'rns_transport.dart';
 
 /// A packet radio with a connectionless broadcast medium (one transmission ->
@@ -46,6 +47,9 @@ abstract class RnsBleRadio {
 class RnsBleInterface implements RnsInterface {
   @override
   bool get announceOnly => false;
+  // BLE can't carry large frames, so no MTU discovery — stay at protocol MTU.
+  @override
+  int get hardwareMtu => kRnsMtu;
 
   final RnsBleRadio radio;
   @override

@@ -124,6 +124,11 @@ class FileTransferNode {
   /// Whether the host has a path to [destHash] (RnsTransport.hasPath).
   final bool Function(Uint8List destHash)? hasPathForDest;
 
+  /// Hardware MTU of the interface a packet to [destHash] would leave on
+  /// (RnsTransport.nextHopInterfaceHwMtu). Lets an outbound link offer a larger
+  /// link MTU over TCP (link MTU discovery). Null → no discovery (500).
+  final int Function(Uint8List destHash)? nextHopMtuForDest;
+
   /// Pull a transport path to [destHash] (a PATH_REQUEST). Supplied by the host
   /// (RnsTransport.requestPath). Needed because we often know a peer's IDENTITY
   /// (e.g. a DHT contact learned from an incoming STORE) without having a cached
@@ -156,6 +161,7 @@ class FileTransferNode {
     this.nextHopForDest,
     this.hasPathForDest,
     this.requestPath,
+    this.nextHopMtuForDest,
     this.onServed,
     this.onDepositOffer,
     this.onDepositStore,
@@ -238,11 +244,11 @@ class FileTransferNode {
   /// Feed an inbound packet. Returns true if it was a file/link packet we
   /// consumed (so the caller can skip announce handling). Safe to call for every
   /// packet.
-  Future<bool> handlePacket(RnsPacket p) async {
+  Future<bool> handlePacket(RnsPacket p, {int arrivalHwMtu = kRnsMtu}) async {
     // 1) A peer opening a link to one of our destinations.
     if (p.packetType == RnsPacketType.linkRequest) {
       if (RnsCrypto.constantTimeEquals(p.destHash, filesDestHash)) {
-        await _acceptLink(p);
+        await _acceptLink(p, arrivalHwMtu);
         return true;
       }
       if (dht != null && RnsCrypto.constantTimeEquals(p.destHash, dhtDestHash)) {
@@ -283,9 +289,10 @@ class FileTransferNode {
   }
 
   // ── Serve side ─────────────────────────────────────────────────────────
-  Future<void> _acceptLink(RnsPacket request) async {
+  Future<void> _acceptLink(RnsPacket request, int arrivalHwMtu) async {
     try {
-      final link = await RnsLink.responder(identity, request);
+      final link =
+          await RnsLink.responder(identity, request, arrivalHwMtu: arrivalHwMtu);
       final id = _hex(link.linkId!);
       _serve[id] = _ServeEntry(
         link,
@@ -354,6 +361,10 @@ class FileTransferNode {
         await RnsLink.initiator(providerPublicIdentity, kFilesApp, kFilesAspects);
     link.nextHop =
         await _ensurePath(providerPublicIdentity, kFilesApp, kFilesAspects);
+    // Link MTU discovery: offer the next-hop interface's MTU so a TCP path
+    // negotiates large resource parts (falls back to 500 with no callback).
+    link.offerMtu(nextHopMtuForDest?.call(link.destHash) ?? kRnsMtu);
+    log?.call('files: link offer mtu=${link.mtu} for ${_hex(link.destHash)}');
     final req = link.buildRequest();
     final entry = _FetchEntry(link, fileHash, Completer<Uint8List?>());
     entry.baseTimeout = timeout;

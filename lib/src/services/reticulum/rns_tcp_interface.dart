@@ -11,11 +11,17 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'rns_hdlc.dart';
+import 'rns_packet.dart' show kRnsLinkMtuMax;
 import 'rns_transport.dart';
 
 class RnsTcpInterface implements RnsInterface {
   @override
   bool get announceOnly => false;
+
+  // TCP/HDLC carries arbitrary-size frames, so advertise the link-MTU-discovery
+  // ceiling (matches reference RNS TCPInterface.HW_MTU) for big resource parts.
+  @override
+  int get hardwareMtu => kRnsLinkMtuMax;
 
   final String host;
   final int port;

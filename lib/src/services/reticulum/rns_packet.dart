@@ -15,8 +15,12 @@ import 'dart:typed_data';
 
 import 'rns_crypto.dart';
 
-/// RNS MTU (RNS/Reticulum.py).
+/// RNS default/protocol MTU (RNS/Reticulum.py). The baseline every peer adheres
+/// to; individual links may negotiate a larger MTU via link MTU discovery.
 const int kRnsMtu = 500;
+/// Upper bound a link may negotiate via MTU discovery — matches reference RNS
+/// `TCPInterface.HW_MTU = 262144`. Bounds the packet-size guard below.
+const int kRnsLinkMtuMax = 262144;
 const int kRnsDestHashBytes = 16;
 
 class RnsPacketType {
@@ -110,8 +114,10 @@ class RnsPacket {
     b.addByte(context);
     b.add(data);
     final raw = b.toBytes();
-    if (raw.length > kRnsMtu) {
-      throw StateError('Packet size ${raw.length} exceeds MTU $kRnsMtu');
+    // A link that negotiated a larger MTU sends bigger resource parts; only
+    // reject packets beyond the discovery ceiling.
+    if (raw.length > kRnsLinkMtuMax) {
+      throw StateError('Packet size ${raw.length} exceeds max $kRnsLinkMtuMax');
     }
     return raw;
   }

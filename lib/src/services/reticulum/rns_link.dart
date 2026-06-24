@@ -16,6 +16,7 @@
  * key = HKDF(64, shared, salt=link_id, context=None); link traffic is a Token
  * (AES-256-CBC + HMAC) over that key. Mode pinned to AES_256_CBC (RNS default).
  */
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'rns_crypto.dart';
@@ -34,7 +35,10 @@ class RnsLink {
   final RnsIdentity destinationIdentity;
   final Uint8List destHash;
   final int mode = kLinkModeAes256Cbc;
-  final int mtu = kRnsMtu;
+  // Negotiated via link MTU discovery: the initiator offers its next-hop
+  // interface MTU, the responder caps + echoes it, both ends end up equal.
+  // Default [kRnsMtu] (500) for peers/interfaces that don't do discovery.
+  int mtu = kRnsMtu;
 
   // Our ephemeral keys for this link. The ephemeral Ed25519 public key is sent
   // in the request (its private half is only needed for the optional, not-yet-
@@ -71,8 +75,9 @@ class RnsLink {
   /// the link becomes active when the initiator's LRRTT arrives ([handleRtt]).
   static Future<RnsLink> responder(
     RnsIdentity localIdentity,
-    RnsPacket request,
-  ) async {
+    RnsPacket request, {
+    int arrivalHwMtu = kRnsMtu,
+  }) async {
     // request.data = peer_eph_x25519_pub(32) + peer_eph_ed25519_pub(32) +
     // signalling(3). We only need the peer X25519 pub to derive the key.
     final data = request.data;
@@ -85,6 +90,16 @@ class RnsLink {
     link._localIdentity = localIdentity;
     link._peerXPub = Uint8List.fromList(peerXPub);
     link.linkId = _linkIdFromRequest(request);
+    // Link MTU discovery: if the request carries the 3 signalling bytes, the
+    // initiator offered a link MTU. Cap it by what OUR return interface (the one
+    // the request arrived on) can carry, then echo the result in the proof
+    // (buildProof signals link.mtu). Both ends converge on this value.
+    if (data.length >= 2 * _ecPubHalf + _linkMtuSize) {
+      const off = 2 * _ecPubHalf;
+      final offered =
+          ((data[off] << 16) | (data[off + 1] << 8) | data[off + 2]) & 0x1FFFFF;
+      link.mtu = _negotiatedMtu(offered, arrivalHwMtu);
+    }
     final x = await RnsCrypto.x25519Generate();
     link._xPrv = x.priv;
     link._xPub = x.pub;
@@ -225,6 +240,7 @@ class RnsLink {
     Uint8List? Function(Uint8List destHash)? nextHopForDest,
     bool Function(Uint8List destHash)? hasPathForDest,
     void Function(Uint8List destHash)? requestPath,
+    int Function(Uint8List destHash)? nextHopMtuForDest,
     Duration pollInterval = const Duration(milliseconds: 300),
     int maxPolls = 10,
   }) async {
@@ -240,6 +256,9 @@ class RnsLink {
       pollInterval: pollInterval,
       maxPolls: maxPolls,
     );
+    // Link MTU discovery: offer the next-hop interface's HW MTU (now that the
+    // path is resolved) so [buildRequest] signals a larger link MTU on TCP.
+    link.offerMtu(nextHopMtuForDest?.call(link.destHash) ?? kRnsMtu);
     return link;
   }
 
@@ -309,6 +328,10 @@ class RnsLink {
         Uint8List.fromList(signature), signedData.toBytes());
     if (!ok) return null;
 
+    // Adopt the MTU the responder confirmed (was parsed-then-discarded before).
+    // Without signalling this stays at the 500 default. Clamp for safety.
+    mtu = _negotiatedMtu(confirmedMtu, kRnsLinkMtuMax);
+
     // Derive the session key.
     final shared = await RnsCrypto.x25519Shared(_xPrv, Uint8List.fromList(peerPub));
     _derivedKey = RnsCrypto.hkdf(64, shared, salt: linkId, context: null);
@@ -367,8 +390,26 @@ class RnsLink {
   }
 
   /// Resource SDU = mtu - HEADER_MAXSIZE(35) - IFAC_MIN_SIZE(1). For MTU 500
-  /// this is 464 bytes per resource part (RNS Resource.__init__).
+  /// this is 464 bytes per resource part (RNS Resource.__init__). Scales with
+  /// the negotiated [mtu].
   int get resourceSdu => mtu - 35 - 1;
+
+  // NOTE: the Resource hashmap batch length (RNS HASHMAP_MAX_LEN = 74) is a
+  // FIXED constant derived from the DEFAULT MTU, not the negotiated link MTU —
+  // see _hashmapMaxLen in rns_resource.dart. Only [resourceSdu] scales with MTU.
+
+  /// Resolve a negotiated link MTU: the smaller of what was offered and what our
+  /// side can carry ([ourCap], the return/next-hop interface HW MTU), bounded by
+  /// the discovery ceiling and never below the 500-byte protocol MTU floor.
+  static int _negotiatedMtu(int offered, int ourCap) {
+    final m = math.min(offered, math.min(ourCap, kRnsLinkMtuMax));
+    return m < kRnsMtu ? kRnsMtu : m;
+  }
+
+  /// Initiator: set the link MTU to OFFER in the request (= the next-hop
+  /// interface HW MTU, capped at the ceiling, floored at the protocol MTU). Call
+  /// before [buildRequest]; the responder caps it again and echoes the result.
+  void offerMtu(int nextHopHwMtu) => mtu = _negotiatedMtu(nextHopHwMtu, kRnsLinkMtuMax);
 
   /// Is this packet addressed to this link (dest LINK, hash == link_id)?
   bool ownsPacket(RnsPacket p) =>

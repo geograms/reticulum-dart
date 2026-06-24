@@ -13,12 +13,17 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:reticulum/reticulum.dart';
 
 /// Bring up an active Link pair (initiator + responder) sharing a session token.
-Future<(RnsLink initiator, RnsLink responder)> _linkPair() async {
+/// [hwMtu] simulates the next-hop/arrival interface hardware MTU so the pair
+/// runs link MTU discovery (both ends end up at the negotiated MTU).
+Future<(RnsLink initiator, RnsLink responder)> _linkPair(
+    {int hwMtu = kRnsMtu}) async {
   final dest = await RnsIdentity.generate(); // the responder's identity
   final initiator = await RnsLink.initiator(
       RnsIdentity.fromPublicKey(dest.getPublicKey()), 'test', ['resource']);
+  initiator.offerMtu(hwMtu); // initiator offers its next-hop interface MTU
   final request = initiator.buildRequest();
-  final responder = await RnsLink.responder(dest, request);
+  final responder =
+      await RnsLink.responder(dest, request, arrivalHwMtu: hwMtu);
   final proof = await responder.buildProof();
   final rtt = await initiator.handleProof(proof);
   expect(rtt, isNotNull, reason: 'link handshake failed');
@@ -47,8 +52,9 @@ Future<Uint8List?> _runTransfer(
   Uint8List payload, {
   int? corruptIndexEveryTime,
   int maxRounds = 80000000,
+  int hwMtu = kRnsMtu,
 }) async {
-  final (initiator, responder) = await _linkPair();
+  final (initiator, responder) = await _linkPair(hwMtu: hwMtu);
   final sender = RnsResourceSender(responder, payload)..prepare();
   final rx = RnsResourceReceiver(initiator);
 
@@ -138,5 +144,62 @@ void main() {
           corruptIndexEveryTime: 3, maxRounds: 200000);
       expect(got, isNull, reason: 'a corrupt part must never assemble as valid');
     });
+  });
+
+  group('link MTU discovery', () {
+    test('negotiates the offered MTU on both ends + derived sizes scale',
+        () async {
+      final (initiator, responder) = await _linkPair(hwMtu: kRnsLinkMtuMax);
+      // Both ends converge on the negotiated MTU.
+      expect(responder.mtu, kRnsLinkMtuMax);
+      expect(initiator.mtu, kRnsLinkMtuMax);
+      // The part SDU scales up with the MTU (vs 464 at MTU 500); the hashmap
+      // batch (HASHMAP_MAX_LEN=74) is fixed and does NOT scale.
+      expect(responder.resourceSdu, greaterThan(200000));
+      // A 1 MB segment now splits into a handful of big parts, not 2260.
+      final sender = RnsResourceSender(responder, _bytes(1024 * 1024))
+        ..prepare();
+      expect(sender.parts, lessThan(10),
+          reason: 'big MTU -> few parts per 1 MB segment');
+    });
+
+    test('falls back to MTU 500 when no discovery (default interface)',
+        () async {
+      final (initiator, responder) = await _linkPair(); // hwMtu = kRnsMtu
+      expect(initiator.mtu, kRnsMtu);
+      expect(responder.mtu, kRnsMtu);
+      expect(responder.resourceSdu, 464); // the historical 500-MTU SDU
+    });
+
+    test('caps the link MTU at the responder return-path capability', () async {
+      // Initiator offers a big MTU, but the responder's arrival interface only
+      // does 500 (e.g. a BLE-reachable responder) → both must end up at 500.
+      final dest = await RnsIdentity.generate();
+      final initiator = await RnsLink.initiator(
+          RnsIdentity.fromPublicKey(dest.getPublicKey()), 'test', ['resource']);
+      initiator.offerMtu(kRnsLinkMtuMax);
+      final request = initiator.buildRequest();
+      final responder =
+          await RnsLink.responder(dest, request, arrivalHwMtu: kRnsMtu);
+      final proof = await responder.buildProof();
+      final rtt = await initiator.handleProof(proof);
+      expect(rtt, isNotNull);
+      expect(responder.mtu, kRnsMtu);
+      expect(initiator.mtu, kRnsMtu, reason: 'initiator adopts the capped value');
+    });
+
+    for (final spec in const [
+      ('1 MB', 1024 * 1024),
+      ('16 MB', 16 * 1024 * 1024),
+      ('55 MB', 55 * 1024 * 1024),
+    ]) {
+      test('round-trips ${spec.$1} byte-exact at a large negotiated MTU',
+          () async {
+        final payload = _bytes(spec.$2, seed: spec.$2 ^ 0x5a5a);
+        final got = await _runTransfer(payload, hwMtu: kRnsLinkMtuMax);
+        expect(got, isNotNull, reason: '${spec.$1} did not complete');
+        expect(_sha(got!), equals(_sha(payload)), reason: 'bytes differ');
+      }, timeout: const Timeout(Duration(minutes: 5)));
+    }
   });
 }

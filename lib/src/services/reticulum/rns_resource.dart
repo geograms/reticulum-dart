@@ -26,7 +26,12 @@ import 'rns_packet.dart';
 const int _mapHashLen = 4;
 const int _randomHashSize = 4;
 const int _hashLen = 32; // Identity.HASHLENGTH/8
-const int _hashmapMaxLen = 74; // floor((Link.MDU 431 - OVERHEAD 134)/4)
+// Map-hashes per advertisement / HMU batch. FIXED at 74 — RNS computes
+// ResourceAdvertisement.HASHMAP_MAX_LEN once from the DEFAULT MTU's Link.MDU
+// (floor((431-134)/4)=74), NOT from the per-link negotiated MTU. Link MTU
+// discovery scales the part SDU (bigger parts), but the hashmap batch stays 74,
+// so both ends must agree on 74 regardless of the negotiated MTU.
+const int _hashmapMaxLen = 74;
 const int _hashmapExhausted = 0xFF; // request flag: "send me more hashmap"
 
 /// Per-segment cap (RNS Resource.MAX_EFFICIENT_SIZE = 1 MB - 1). Bounds the
@@ -57,7 +62,8 @@ class RnsResourceSender {
   // confined to [_rmch : _rmch+_collisionGuard] so a 4-byte map-hash collision
   // far from the receiver's position can't make us serve the wrong part / batch.
   static const int _windowMax = 75; // Resource.WINDOW_MAX
-  static const int _collisionGuard = 2 * _windowMax + _hashmapMaxLen; // 224
+  // RNS COLLISION_GUARD_SIZE = 2*WINDOW_MAX + HASHMAP_MAX_LEN (both fixed) = 224.
+  static const int _collisionGuard = 2 * _windowMax + _hashmapMaxLen;
   int _rmch = 0; // receiver_min_consecutive_height (reset per segment)
 
   RnsResourceSender(this.link, this.payload);

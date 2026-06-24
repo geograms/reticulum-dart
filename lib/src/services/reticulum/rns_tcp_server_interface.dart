@@ -13,12 +13,16 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'rns_hdlc.dart';
+import 'rns_packet.dart' show kRnsLinkMtuMax;
 import 'rns_transport.dart';
 
 /// One accepted client connection, exposed as an interface to the transport.
 class _RnsTcpServerConn implements RnsInterface {
   @override
   bool get announceOnly => false;
+  // TCP/HDLC carries arbitrary-size frames (link MTU discovery).
+  @override
+  int get hardwareMtu => kRnsLinkMtuMax;
   @override
   final String label;
   final Socket socket;

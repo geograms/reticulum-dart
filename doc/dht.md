@@ -73,8 +73,15 @@ internally (§2) and just truncates what it puts on the wire.
 
 ## 4. Transport binding — DHT over Reticulum links (`file_node.dart`)
 
-Each RPC is a short‑lived **Reticulum link** to the peer's `geogram/dht`
-destination:
+Each RPC is a short‑lived **Reticulum link** to the peer's **RPC destination**.
+By default that is `geogram/dht`, but `FileTransferNode` takes `rpcApp`/
+`rpcAspects` config and Aurora points it at the **chat** destination
+(`geogram/chat`) — because the dedicated dht announce is dropped by the hubs'
+announce budget, leaving no transport path to it, while the chat announce
+propagates reliably (§8, §9). The Kademlia node id is still derived from
+`geogram/dht` locally and is unaffected. Updated nodes also **dual‑accept** DHT
+links on the legacy dht dest for the mixed‑fleet migration. The shape below is
+the same regardless of which dest it targets:
 
 ```
 _dhtRpcRaw(peer, reqBytes):
@@ -246,13 +253,14 @@ Every Aurora node re‑announces its service destinations on an adaptive cadence
 peer coming into view; on a hub with no other Aurora nodes it simply stays empty
 and `resolve` returns nothing immediately instead of timing out on dead contacts.
 
-> **Knowing a peer ≠ being able to route to its DHT dest.** Adding a contact from
-> its chat announce gives us its identity (hence its DHT id), but the DHT RPC
-> still needs a transport *path* to the peer's `geogram/dht` destination — a
-> different destination hash, whose own announce the hubs may have dropped. That
-> gap (path‑request to an unannounced dest goes unanswered) is why replication
-> STOREs fail in the wild (§6, §9), and why `_dhtRpcRaw` skips a contact fast when
-> no route resolves (§4).
+> **Knowing a peer ≠ being able to route to its DHT dest — so we route to its
+> chat dest.** Adding a contact from its chat announce gives us its identity
+> (hence its DHT id), and a transport path to its **chat** dest. The dedicated
+> `geogram/dht` dest is a *different* destination hash whose announce the hubs may
+> have dropped, leaving no path to it — historically why replication STOREs failed.
+> Aurora now runs the DHT RPC over the chat dest we already have a route to (§4),
+> closing that gap; `_dhtRpcRaw` still skips a contact fast when even the configured
+> RPC dest has no route resolved.
 
 The same pattern identifies peers for the other overlays — the relay
 (`geogram/relay`), LXMF (`lxmf/delivery`), files (`geogram/files`) — each by its own
@@ -260,16 +268,17 @@ announced destination name.
 
 ## 9. Honest limitations
 
-- **Replication doesn't land on the live mesh.** This is the big one. STOREs to a
-  peer's `geogram/dht` destination fail because there is no transport path to it
-  (its dedicated dht announce was dropped by the hubs' announce budget, §8), so a
-  provider record in practice lives **only on its holder**. We work around it —
-  the holder keeps its own copy, k spans the whole overlay so resolve reaches the
-  holder (§2), and discovery is fast again (§4, §7) — but it is a work‑around, not
-  true Kademlia replication. The proper fix is to run the DHT RPC over the
-  **reliably‑propagated `geogram/chat` destination** (the one we already learned a
-  route to) instead of the separate `geogram/dht` dest, so any peer we can reach
-  for chat we can reach for DHT. That's a larger change, not yet done.
+- **Replication (historically the big one) — now addressed by routing RPC over
+  chat.** STOREs to a peer's `geogram/dht` dest failed because there was no
+  transport path to it (its dedicated dht announce was dropped by the hubs'
+  announce budget, §8), so a provider record lived **only on its holder**. The fix
+  (§4): run the DHT RPC over the **reliably‑propagated `geogram/chat`
+  destination**, so any peer reachable for chat is reachable for DHT and STOREs
+  land on the k‑closest. The holder‑keeps‑own‑record + k‑spans‑overlay safety nets
+  (§2, §6, §7) remain as belt‑and‑braces. Two follow‑ups are intentionally *not*
+  yet done: stop announcing `geogram/dht` (a release after dual‑accept is
+  everywhere), and relax `k`/`alpha` back toward Kademlia norms once replication is
+  confirmed landing on the live mesh.
 - **Reply size caps** (5 contacts / 2 records per packet) mean wide result sets
   take extra rounds; there is no multi‑packet framing yet.
 - **Stale eviction** is conservative — a dead contact lingers in its bucket until

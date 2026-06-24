@@ -87,6 +87,20 @@ class FileTransferNode {
   late final Uint8List dhtDestHash =
       RnsDestination.hash(identity, kDhtApp, kDhtAspects);
 
+  /// The destination DHT RPC links ride over. Defaults to the dedicated
+  /// geogram/dht dest, but the host can point it at a more reliably-announced
+  /// destination (e.g. the chat dest) so RPC links route where transport paths
+  /// actually exist — public hubs drop the dedicated geogram/dht announce,
+  /// leaving no path to it, so STOREs to peers never land. The Kademlia node id
+  /// (DhtContact.id) is unaffected: it is still derived from the geogram/dht dest
+  /// locally and never needs a path or an announce.
+  final String rpcApp;
+  final List<String> rpcAspects;
+  late final Uint8List rpcDestHash =
+      RnsDestination.hash(identity, rpcApp, rpcAspects);
+  late final bool _rpcIsDht =
+      RnsCrypto.constantTimeEquals(rpcDestHash, dhtDestHash);
+
   final Map<String, _ServeEntry> _serve = {}; // link_id hex -> serve
   final Map<String, _FetchEntry> _fetch = {}; // link_id hex -> fetch
   // DHT links: responder links we host, and in-flight outbound RPC links.
@@ -165,6 +179,8 @@ class FileTransferNode {
     this.onServed,
     this.onDepositOffer,
     this.onDepositStore,
+    this.rpcApp = kDhtApp,
+    this.rpcAspects = kDhtAspects,
   }) : serveQuota = serveQuota ?? ServeQuota() {
     if (enableDht) {
       // k=96 (vs Kademlia's 8): a geogram overlay is small (tens of nodes) and
@@ -232,7 +248,7 @@ class FileTransferNode {
   void requestPeerPaths(RnsIdentity peer) {
     final rp = requestPath;
     if (rp == null) return;
-    rp(RnsDestination.hash(peer, kDhtApp, kDhtAspects));
+    rp(RnsDestination.hash(peer, rpcApp, rpcAspects)); // the DHT RPC dest (chat)
     rp(RnsDestination.hash(peer, kFilesApp, kFilesAspects));
   }
 
@@ -257,7 +273,14 @@ class FileTransferNode {
         await _acceptLink(p, arrivalHwMtu);
         return true;
       }
-      if (dht != null && RnsCrypto.constantTimeEquals(p.destHash, dhtDestHash)) {
+      // Accept DHT links on the configured RPC dest (e.g. the chat dest) AND on
+      // the legacy geogram/dht dest, so a node updated to route DHT over chat is
+      // still reachable by peers still dialling the old dht dest (migration). The
+      // files dest is matched first above, and chat/files/dht are disjoint, so a
+      // real file link is never mis-accepted as DHT.
+      if (dht != null &&
+          (RnsCrypto.constantTimeEquals(p.destHash, rpcDestHash) ||
+              RnsCrypto.constantTimeEquals(p.destHash, dhtDestHash))) {
         await _acceptDhtLink(p);
         return true;
       }
@@ -639,25 +662,44 @@ class FileTransferNode {
   // DhtNode.sendRpc bridge: send a DHT message to a contact over a (transient)
   // link to its dht destination, await the single-packet reply.
   Future<DhtMessage?> _dhtSendRpc(DhtContact to, DhtMessage req) async {
-    final respBytes = await _dhtRpcRaw(to.identity, req.encode());
+    final reqBytes = req.encode();
+    // Primary: the configured RPC dest (e.g. the reliably-propagated chat dest),
+    // where a transport path actually exists.
+    var respBytes = await _dhtRpcRaw(to.identity, reqBytes, rpcApp, rpcAspects);
+    // Free fallback to the legacy geogram/dht dest for peers running older code
+    // that only accept DHT links there — but ONLY if we already hold a cached
+    // path to it. We never pay a fresh path request for the dht dest: "no dht
+    // path" is the common failing case that moving RPC to chat exists to fix.
+    if (respBytes == null && !_rpcIsDht) {
+      final dhtHash = RnsDestination.hash(to.identity, kDhtApp, kDhtAspects);
+      if (hasPathForDest?.call(dhtHash) ?? false) {
+        respBytes =
+            await _dhtRpcRaw(to.identity, reqBytes, kDhtApp, kDhtAspects);
+      }
+    }
     return respBytes == null ? null : DhtMessage.decode(respBytes);
   }
 
-  Future<Uint8List?> _dhtRpcRaw(RnsIdentity peer, Uint8List reqBytes) async {
-    // Resolve a route to the contact's DHT dest with a SHORT path wait. A DHT
+  Future<Uint8List?> _dhtRpcRaw(RnsIdentity peer, Uint8List reqBytes, String app,
+      List<String> aspects) async {
+    // Resolve a route to the contact's RPC dest with a SHORT path wait. A DHT
     // lookup queries many contacts and tolerates individual misses, so we must
     // not spend the ~9s file-fetch path budget per contact. If there is no
     // route, skip this contact immediately instead of broadcasting a doomed
     // link request and waiting out the handshake — that 8s-per-stale-node cost,
     // times the whole shortlist, is what made resolve() take minutes.
-    final hop = await RnsLink.ensurePath(peer, kDhtApp, kDhtAspects,
+    final destHash = RnsDestination.hash(peer, app, aspects);
+    final hop = await RnsLink.ensurePath(peer, app, aspects,
         nextHopFor: nextHopFor,
         nextHopForDest: nextHopForDest,
         hasPathForDest: hasPathForDest,
         requestPath: requestPath,
         maxPolls: 10); // ~3s, vs 9s for a file fetch
-    if (hop == null) return null;
-    final link = await RnsLink.initiator(peer, kDhtApp, kDhtAspects);
+    // No route resolved → skip. hop==null is AMBIGUOUS (it is also a direct
+    // neighbour, HEADER_1), so gate on the path actually existing, not on hop —
+    // otherwise we'd wrongly skip a directly-reachable (LAN) DHT contact.
+    if (!(hasPathForDest?.call(destHash) ?? (hop != null))) return null;
+    final link = await RnsLink.initiator(peer, app, aspects);
     link.nextHop = hop;
     final reqPkt = link.buildRequest();
     final id = _hex(link.linkId!);
@@ -692,6 +734,12 @@ class FileTransferNode {
     }
     if (p.context == RnsContext.none) {
       final reqBytes = link.decrypt(p);
+      // Safe even though the RPC dest may be shared with chat: handleEncoded does
+      // DhtMessage.decode and returns null for anything that isn't a DHT op, so a
+      // non-DHT frame simply gets no reply (and the link ages out of the LRU map)
+      // rather than being misinterpreted. We deliberately keep the payload a bare
+      // DhtMessage (no type byte) so chat-routed and dht-routed RPCs stay
+      // byte-identical for the mixed-fleet migration.
       final respBytes = await dht?.handleEncoded(reqBytes);
       if (respBytes != null) {
         send(link.encrypt(respBytes, context: RnsContext.none).pack());

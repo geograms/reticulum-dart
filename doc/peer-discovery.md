@@ -27,9 +27,13 @@ For node A to reach node B over the internet, ALL of these must hold:
    UDP discovery interface) must never shadow the hub path in the route table, or
    links to the peer time out.
 
-If all three hold, the Aurora DHT overlay forms (each node hears the other's
-`geogram/dht` announce → adds it as a routing-table contact), provider records get
-stored at a reachable peer, `resolve` finds holders, and links/fetches complete.
+If all three hold, the Aurora DHT overlay forms (each node hears one of the
+other's signed `geogram` announces — `dht`, `files`, **or** `chat` — and adds it
+as a routing-table contact; see [dht.md](dht.md) §8), `resolve` finds holders, and
+links/fetches complete. (Note: provider records mostly do **not** replicate to
+peers on the live mesh — no path to their `geogram/dht` dest — so discovery relies
+on the holder keeping its own record and on `k` spanning the overlay; see
+[dht.md](dht.md) §2, §9.)
 
 ## What is NOT the problem: NAT
 
@@ -56,8 +60,11 @@ above. Do not chase NAT.
 ## How it works once the requirements hold
 
 1. **Overlay membership** is by announce: a node is added to the DHT routing table
-   only when its signed `geogram/dht` announce is heard (rns_service.dart
-   `_onInbound` → `_files.addPeerFromAnnounce`). Confirm with `status.dhtPeers > 0`.
+   when any of its signed `geogram` announces is heard — `dht`, `files`, or `chat`
+   (rns_service.dart `_onInbound` → `_files.addPeerFromAnnounce`). The chat announce
+   is included on purpose: hubs rate-limit announces and the dedicated `geogram/dht`
+   one is often dropped, so keying membership only off it was fragile (see
+   [dht.md](dht.md) §8). Confirm with `status.dhtPeers > 0`.
 2. **Find a holder:** `DhtNode.resolve(key)` walks the routing table; a node answers
    `FIND_VALUE` with any provider record it holds **locally, regardless of XOR
    distance** (dht_node.dart). On a small overlay `closest()` returns *all* known

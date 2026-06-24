@@ -90,12 +90,19 @@ class DhtNode {
   /// Returns how many accepted it.
   Future<int> publish(ProviderRecord r) async {
     final closest = await iterativeFindNode(r.fileKey);
-    var ok = 0;
-    for (final c in closest) {
-      final resp = await sendRpc(c, DhtMessage.store(myPub, r));
-      if (resp != null && resp.op == DhtOp.storeOk && resp.ok) ok++;
+    // Fan the STOREs out concurrently. Serially, a single slow/dead contact's
+    // link handshake (up to its full timeout) stalled every STORE behind it, so
+    // replicating to k peers could take k × timeout — far past the time bound
+    // the hosted-folder advertiser allows (disk_folder_manager._advertise caps
+    // each publish at 10 s), which cut replication off after self only. In
+    // parallel the whole fan-out costs one timeout, so records actually land on
+    // the k-closest and content stays discoverable without querying the origin.
+    final results = await Future.wait(closest.map((c) async {
       routing.add(c);
-    }
+      final resp = await sendRpc(c, DhtMessage.store(myPub, r));
+      return resp != null && resp.op == DhtOp.storeOk && resp.ok;
+    }));
+    var ok = results.where((accepted) => accepted).length;
     // ALWAYS keep our own record locally: we are authoritative for content we
     // hold, so a resolver that queries us (we're in its routing) must get it even
     // if every replication STORE to the k-closest failed. Previously we stored
@@ -128,6 +135,13 @@ class DhtNode {
           found[dhtHex(r.providerPub)] = r;
         }
       },
+      // FIND_VALUE short-circuits: the moment a queried node returns a verified
+      // record, stop the lookup. Without this, resolve ground through all k
+      // contacts (8 s timeout each) even after the value was in hand on round 1
+      // — the cause of the multi-minute "check for updates" hang when most
+      // contacts were stale. We still keep the whole round that found it, so a
+      // resolver gets several providers (redundancy), not just the first.
+      stopEarly: () => found.isNotEmpty,
     );
     final list = found.values.toList()
       ..sort((a, b) => a.capacity.compareTo(b.capacity));
@@ -147,6 +161,7 @@ class DhtNode {
     Uint8List target, {
     DhtMessage Function()? makeReq,
     Future<void> Function(DhtMessage resp)? onResponse,
+    bool Function()? stopEarly,
   }) async {
     final shortlist = <String, DhtContact>{};
     for (final c in routing.closest(target, k)) {
@@ -190,6 +205,9 @@ class DhtNode {
           }
         }
       }
+      // FIND_VALUE early termination: the value was found this round, stop now
+      // rather than walking the rest of the (possibly stale, slow) shortlist.
+      if (stopEarly?.call() ?? false) break;
       final top = (shortlist.values.toList()..sort(cmp)).take(k);
       if (top.every((c) => queried.contains(c.idHex) || failed.contains(c.idHex))) {
         break;

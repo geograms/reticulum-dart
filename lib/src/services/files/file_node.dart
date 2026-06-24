@@ -167,14 +167,20 @@ class FileTransferNode {
     this.onDepositStore,
   }) : serveQuota = serveQuota ?? ServeQuota() {
     if (enableDht) {
-      // k=24 (vs the Kademlia default 8): a geogram overlay is small (tens of
-      // nodes), so a wider fanout makes resolve()/publish() query/replicate to
-      // (nearly) ALL peers — crucially including the actual holder, which keeps
-      // its own record locally. With k=8 a resolver only asked the 8 closest to
-      // the key, which can exclude the holder once the overlay grows past 8, so a
-      // freshly-published file resolved 0 providers even though its holder was
-      // meshed. k=24 closes that gap on the small networks we actually run.
-      dht = DhtNode(identity: identity, k: 24, sendRpc: _dhtSendRpc, log: log);
+      // k=96 (vs Kademlia's 8): a geogram overlay is small (tens of nodes) and
+      // — because replication STOREs to the k-closest routinely fail on the
+      // public hubs (no transport path to a peer's geogram/dht dest) — a record
+      // usually lives ONLY on its holder, which keeps its own copy. So a resolver
+      // must query the holder directly, but Kademlia only asks the k closest to
+      // the key: with k=24 and ~37 live peers, 13 contacts (possibly including
+      // the holder) were NEVER queried, so a fetch failed with "no provider yet"
+      // for any key the holder wasn't XOR-close to. Sizing k to cover the whole
+      // overlay makes resolve()/publish() reach EVERY known peer — the holder is
+      // always among them. alpha=12 (vs 3) fans each round out wide so all peers
+      // are reached in a few rounds despite stale contacts; with FIND_VALUE
+      // early-exit the lookup still stops the instant the holder answers.
+      dht = DhtNode(
+          identity: identity, k: 96, alpha: 12, sendRpc: _dhtSendRpc, log: log);
     }
   }
 
@@ -294,6 +300,8 @@ class FileTransferNode {
       final link =
           await RnsLink.responder(identity, request, arrivalHwMtu: arrivalHwMtu);
       final id = _hex(link.linkId!);
+      log?.call('files: accepted link $id mtu=${link.mtu} '
+          '(arrivalHwMtu=$arrivalHwMtu)');
       _serve[id] = _ServeEntry(
         link,
         FileServeSession(link, source,
@@ -305,7 +313,6 @@ class FileTransferNode {
             log: log),
       );
       send((await link.buildProof()).pack());
-      log?.call('files: accepted link $id');
     } catch (e) {
       log?.call('files: accept link failed: $e');
     }
@@ -637,15 +644,28 @@ class FileTransferNode {
   }
 
   Future<Uint8List?> _dhtRpcRaw(RnsIdentity peer, Uint8List reqBytes) async {
+    // Resolve a route to the contact's DHT dest with a SHORT path wait. A DHT
+    // lookup queries many contacts and tolerates individual misses, so we must
+    // not spend the ~9s file-fetch path budget per contact. If there is no
+    // route, skip this contact immediately instead of broadcasting a doomed
+    // link request and waiting out the handshake — that 8s-per-stale-node cost,
+    // times the whole shortlist, is what made resolve() take minutes.
+    final hop = await RnsLink.ensurePath(peer, kDhtApp, kDhtAspects,
+        nextHopFor: nextHopFor,
+        nextHopForDest: nextHopForDest,
+        hasPathForDest: hasPathForDest,
+        requestPath: requestPath,
+        maxPolls: 10); // ~3s, vs 9s for a file fetch
+    if (hop == null) return null;
     final link = await RnsLink.initiator(peer, kDhtApp, kDhtAspects);
-    link.nextHop = await _ensurePath(peer, kDhtApp, kDhtAspects);
+    link.nextHop = hop;
     final reqPkt = link.buildRequest();
     final id = _hex(link.linkId!);
     final e = _DhtRpcEntry(link, reqBytes);
     _dhtRpcByLink[id] = e;
     send(reqPkt.pack());
     final resp = await e.done.future
-        .timeout(const Duration(seconds: 8), onTimeout: () => null);
+        .timeout(const Duration(seconds: 6), onTimeout: () => null);
     _dhtRpcByLink.remove(id);
     return resp;
   }

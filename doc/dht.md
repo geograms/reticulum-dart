@@ -30,10 +30,25 @@ index — see [file-sharing.md](file-sharing.md) §6.)
 
 ## 2. Routing table — k‑buckets (`routing_table.dart`)
 
-128 buckets (one per bit), each holding up to **k = 8** contacts in
+128 buckets (one per bit), each holding up to **k** contacts in
 least‑recently‑seen → most‑recently‑seen order. On a full bucket the existing,
 proven‑live contacts are kept and the newcomer is dropped (conservative under
 churn; stale eviction is a noted future refinement).
+
+> **k is sized to cover the whole overlay, not the Kademlia default (8).**
+> `FileTransferNode` constructs its `DhtNode` with **k = 96** and **α = 12**
+> (`file_node.dart`), for a reason specific to how this overlay runs in the wild:
+> replication STOREs to the k‑closest *routinely fail on public hubs* (§6), so a
+> provider record usually lives **only on its holder**, which always keeps its own
+> copy. A resolver therefore has to query the holder directly — but classic
+> Kademlia only asks the *k closest to the key*. With k = 8 (or even 24) and a
+> ~40‑node overlay, a chunk of peers — possibly including the sole holder — were
+> **never queried**, so a fetch failed `no provider yet` for any key the holder
+> wasn't XOR‑close to. Sizing k to span the overlay makes `resolve`/`publish`
+> reach *every* known peer, so the holder is always among them; α = 12 fans each
+> round out wide enough that this still finishes in a couple of rounds. This is
+> the right trade only because the overlay is small (tens of nodes); a large
+> overlay would need working replication instead (§9).
 
 ## 3. RPC protocol (`dht_message.dart`)
 
@@ -53,8 +68,8 @@ sender's 64‑byte public key so the receiver can learn it as a contact:
 
 Replies are capped to fit **one ~450 B link‑encrypted packet** — at most 5
 contacts or 2 records per reply (`kDhtWireMaxContacts`, `kDhtWireMaxRecords`) —
-so no per‑RPC fragmentation is needed; the routing table still uses the full
-k=8 internally.
+so no per‑RPC fragmentation is needed; the routing table holds the full k
+internally (§2) and just truncates what it puts on the wire.
 
 ## 4. Transport binding — DHT over Reticulum links (`file_node.dart`)
 
@@ -63,12 +78,23 @@ destination:
 
 ```
 _dhtRpcRaw(peer, reqBytes):
-  link = RnsLink.initiator(peer, "aurora", ["dht"])
-  link.nextHop = nextHopFor(peer)         // route via the learned hub if needed
+  hop = ensurePath(peer, "geogram", ["dht"], maxPolls: 10)  // ~3 s path wait
+  if hop == null: return null             // no route → SKIP this contact fast
+  link = RnsLink.initiator(peer, "geogram", ["dht"])
+  link.nextHop = hop                      // route via the learned hub if needed
   send(link.buildRequest())               // LINKREQUEST
   …on proof, send link.encrypt(reqBytes)  // the DHT message, encrypted
-  await one encrypted reply (8 s timeout)
+  await one encrypted reply (6 s timeout)
 ```
+
+> **Skip‑fast matters for lookup latency.** A DHT lookup queries many contacts
+> and tolerates individual misses, so it must *not* spend the ~9 s path budget a
+> file fetch uses. When there is no route to a contact's `geogram/dht`
+> destination, `_dhtRpcRaw` returns immediately instead of broadcasting a doomed
+> link request and waiting out the handshake. Before this fix, every stale
+> contact cost ≈9 s (path) + 8 s (handshake), and a resolve walking ~40 of them
+> took **minutes**; now a dead contact costs ≈3 s and live ones answer in one
+> RTT.
 
 The responder side (`_acceptDhtLink` / `_onDhtServePacket`) accepts the link,
 decrypts the request, hands it to `DhtNode.handleEncoded`, and returns the
@@ -101,14 +127,33 @@ A signed "I provide this file" record:
 ```
 publish(record):
   closest = iterativeFindNode(record.fileKey)   // k nodes nearest the file key
-  for c in closest: STORE(record) → count STORE_OK
-  if closest empty: store locally (tiny/isolated network)
+  await Future.wait(closest.map STORE(record))   // fan out CONCURRENTLY
+  ok = count(STORE_OK)
+  always also store locally (we are authoritative for content we hold);
+  if ok == 0: ok = 1   // we count as a holder of our own record
 ```
 
 `FileTransferNode.publishProvider(sha256)` builds and signs the record then
 publishes it, **and remembers it for the 30‑minute republish loop**. It is gated
 by the serve quota: a node that can't currently serve doesn't advertise, so
-resolvers route around it until it recovers.
+resolvers route around it until it recovers. (Folder *keys* and other metadata go
+through `publishKey`, which is **not** quota‑gated and lands in a separate
+`_providedKeys` map — so the status field `provided`, which counts only
+`_provided`, reads 0 on a node that is in fact advertising folders. That zero is a
+red herring, not a bug.)
+
+> **Two STORE fixes learned the hard way.** (a) The fan‑out is **parallel**: when
+> it was a sequential `for` loop, one slow/dead contact's link handshake stalled
+> every STORE behind it, and the hosted‑folder advertiser (which time‑bounds each
+> publish at 10 s) cut replication off after the local copy only. (b) The
+> publisher **always keeps its own record**, even when every replication STORE
+> fails — otherwise a node with peers but flaky paths replicated to nobody *and*
+> kept nothing, making content it was literally holding undiscoverable.
+>
+> **Reality check:** on the live public‑hub mesh, publish still typically logs
+> `-> 1 holders (+self)` — replication to peers fails because there is no
+> transport path to their `geogram/dht` destination (§9). Discovery works anyway
+> because the holder keeps its own copy and resolve is sized to reach it (§2, §7).
 
 Exposed to the app as `RnsService.dhtPublish(fileHash)`. This is called when you
 **attach** a file *and* — now — whenever you **finish downloading** one (see
@@ -121,18 +166,25 @@ seeder.
 resolve(sha256):
   target = sha256[:16]
   seed found{} with any live local records
-  iterate (α=3 in parallel, up to 24 rounds):
+  iterate (α=12 in parallel, up to 24 rounds):
     FIND_VALUE(sha256) to the closest unqueried contacts
     on VALUE: verify signature, drop expired/mismatched, dedup by providerPub
     on NODES: add to the shortlist, keep walking toward target
+    EARLY‑EXIT: stop the instant this round produced a verified record
   return providers sorted by capacity (best first)
 ```
 
-The iterative lookup converges in roughly **log₂(N)** rounds (typically 3–4) —
-each round queries α=3 nodes concurrently and stops once the k closest have all
-answered. `FileTransferNode.resolveAndFetch` then does a **multi‑source**
-download from several providers in parallel and verifies the bytes against the
-hash.
+> **FIND_VALUE short‑circuits.** Classic Kademlia FIND_VALUE returns as soon as a
+> node hands back the value; ours did not — `_iterate` walked the *entire*
+> shortlist (timeout per stale contact) even after the record was already in
+> hand. Combined with the per‑contact cost in §4, a `resolve` that found the
+> holder on round 1 still ground on for the rest of the k contacts — the
+> multi‑minute "check for updates" hang. Now the lookup stops the moment any
+> queried node returns a verified record (we keep the whole round that found it,
+> so a resolver still gets a few providers for redundancy).
+
+`FileTransferNode.resolveAndFetch` then does a **multi‑source** download from
+several providers in parallel and verifies the bytes against the hash.
 
 Exposed as `RnsService.dhtResolveFetch(fileHash)`.
 
@@ -157,31 +209,50 @@ destination hash cryptographically binds the name to the announcing identity
 **`geogram/dht`** (`_announceServiceDests` in `rns_service.dart`). No other software
 announces that name, so its `name_hash` is unique to our overlay.
 
-So membership is a wire test, not a guess (`rns_service.dart`, `_onInbound`):
+So membership is a wire test, not a guess (`rns_service.dart`, `_onInbound`). A
+peer is added to the routing table when we hear **any** of its signed `geogram`
+announces — and we match on `geogram/dht`, `geogram/files`, *and* the
+`geogram/chat` announce:
 
 ```dart
-final dhtHash = RnsDestination.hash(ann.identity, 'aurora', ['dht']);
-if (RnsCrypto.constantTimeEquals(ann.destHash, dhtHash)) {
-  _files?.addPeerFromAnnounce(ann.identity);   // confirmed Aurora DHT node
+final dhtHash   = RnsDestination.hash(ann.identity, 'geogram', ['dht']);
+final filesHash = RnsDestination.hash(ann.identity, 'geogram', ['files']);
+if (constantTimeEquals(ann.destHash, dhtHash) ||
+    constantTimeEquals(ann.destHash, filesHash)) {
+  _files?.addPeerFromAnnounce(ann.identity);   // confirmed overlay node
+}
+…
+final chatHash = RnsDestination.hash(ann.identity, 'geogram', ['chat']);
+if (constantTimeEquals(ann.destHash, chatHash)) {
+  _files?.addPeerFromAnnounce(ann.identity);   // chat announce ⇒ also a DHT member
 }
 ```
 
-A peer is added to the routing table **only** when we hear its signed
-`geogram/dht` announce — the destHash matches the hash we recompute from the
-announcing identity, so a non‑Aurora node (which never announces that name) is
-never added, and nobody can forge membership for an identity they don't hold the
-key to. Every Aurora node re‑announces its service destinations on an adaptive
-cadence (30 s when charging on Wi‑Fi/Ethernet, 5 min on battery/cellular — see
-[reticulum.md](reticulum.md) §3), so the table fills within one announce cycle of
-a peer coming into view; on a hub
-with no other Aurora nodes the table simply stays empty and `resolve` returns
-nothing immediately (we then fall back to a direct fetch from the sender, §9)
-instead of timing out on dead contacts.
+A contact's DHT id is derived from its **identity**, not from which destination
+we heard — so any proven `geogram` announce is enough to add it. We deliberately
+accept the **chat** announce too, and that is a lesson from the field: **public
+hubs rate‑limit announce propagation**, and the dedicated `geogram/dht` announce
+is frequently the one that gets dropped while the same node's `chat` announce
+(the most frequently sent, most reliably flooded one) gets through. Keying
+overlay membership *only* off `geogram/dht` was fragile — peers whose dht announce
+was dropped never joined the overlay and folder/file discovery silently failed.
+Matching any `geogram` destination is still a cryptographic identity↔name proof,
+so non‑Aurora identities (Sideband/NomadNet/`rnsd`, which never announce a
+`geogram` name) are still never added.
 
-> Earlier the code added *every* announced identity optimistically and relied on
-> the 8‑second RPC timeout to prune non‑members. That worked but wasted lookup
-> rounds on a populated public hub; gating on the `geogram/dht` announce makes the
-> routing table contain only confirmed overlay nodes.
+Every Aurora node re‑announces its service destinations on an adaptive cadence
+(30 s when charging on Wi‑Fi/Ethernet, 5 min on battery/cellular — see
+[reticulum.md](reticulum.md) §3), so the table fills within an announce cycle of a
+peer coming into view; on a hub with no other Aurora nodes it simply stays empty
+and `resolve` returns nothing immediately instead of timing out on dead contacts.
+
+> **Knowing a peer ≠ being able to route to its DHT dest.** Adding a contact from
+> its chat announce gives us its identity (hence its DHT id), but the DHT RPC
+> still needs a transport *path* to the peer's `geogram/dht` destination — a
+> different destination hash, whose own announce the hubs may have dropped. That
+> gap (path‑request to an unannounced dest goes unanswered) is why replication
+> STOREs fail in the wild (§6, §9), and why `_dhtRpcRaw` skips a contact fast when
+> no route resolves (§4).
 
 The same pattern identifies peers for the other overlays — the relay
 (`geogram/relay`), LXMF (`lxmf/delivery`), files (`geogram/files`) — each by its own
@@ -189,13 +260,39 @@ announced destination name.
 
 ## 9. Honest limitations
 
+- **Replication doesn't land on the live mesh.** This is the big one. STOREs to a
+  peer's `geogram/dht` destination fail because there is no transport path to it
+  (its dedicated dht announce was dropped by the hubs' announce budget, §8), so a
+  provider record in practice lives **only on its holder**. We work around it —
+  the holder keeps its own copy, k spans the whole overlay so resolve reaches the
+  holder (§2), and discovery is fast again (§4, §7) — but it is a work‑around, not
+  true Kademlia replication. The proper fix is to run the DHT RPC over the
+  **reliably‑propagated `geogram/chat` destination** (the one we already learned a
+  route to) instead of the separate `geogram/dht` dest, so any peer we can reach
+  for chat we can reach for DHT. That's a larger change, not yet done.
 - **Reply size caps** (5 contacts / 2 records per packet) mean wide result sets
   take extra rounds; there is no multi‑packet framing yet.
 - **Stale eviction** is conservative — a dead contact lingers in its bucket until
-  displaced.
+  displaced (skip‑fast, §4, keeps that cheap rather than fixing it).
 - **On a large *foreign* public testnet**, the XOR‑closest nodes to a file key
   are reference RNS nodes that don't run this overlay and ignore the STORE/FIND
-  RPCs. That's exactly why file resolution tries a **direct fetch from the
-  sender** first (the sender is, by definition, a holder, and you already learned
-  its route from its chat announce) before relying on the DHT. Among Aurora nodes
-  that *do* form the overlay, the DHT is the discovery mechanism.
+  RPCs — another reason replication can't rely on "the k closest to the key" and
+  why k spans our own overlay instead. When a **sender is known** (chat media:
+  you learned its route from its chat announce, and it is by definition a
+  holder), the fetch goes **direct to that sender** and skips the DHT entirely.
+  Content with **no known sender** — a folder/update file discovered by hash — is
+  resolved through the DHT as above.
+
+## 10. Validated end‑to‑end: the update flow
+
+The decentralised app updater ([file-sharing.md](file-sharing.md),
+`update_service.dart`) is the integration test for all of the above and is
+**validated live between two devices on different networks**: a host publishes a
+signed update folder; a phone that has *never seen* a freshly‑hosted build
+discovers it (DHT resolve of the folder key → query the holder's relay for the
+signed op‑log) in seconds, then fetches the binary by content hash over the same
+DHT, verifies `sha256`, writes it, and re‑seeds it. Folder discovery queries the
+resolved providers **concurrently with a short per‑provider timeout**
+(`folder_relay.dart`) so a single stale/offline provider can't stall the check —
+the same serial‑query‑times‑timeout trap that produced the original hang. See
+[mutable-folders.md](mutable-folders.md) for the folder side.

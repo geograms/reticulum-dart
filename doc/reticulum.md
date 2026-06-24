@@ -207,6 +207,30 @@ Both sides derive the same session key: `HKDF(X25519(eph), salt=link_id)` →
 the 64‑byte token (AES‑256‑CBC + HMAC). All subsequent `DATA` packets on the
 link are token‑encrypted. Links are how DHT RPCs and file transfers are carried.
 
+### Link MTU discovery
+
+Matching reference RNS 1.3.5's `LINK_MTU_DISCOVERY`, the handshake negotiates a
+**path MTU** so a capable path carries large packets instead of the conservative
+500‑byte default:
+
+- The **initiator** offers the next‑hop interface's hardware MTU in the link
+  request's signalling bytes (`offerMtu`). A `TCPInterface` advertises
+  **`HW_MTU = 262144`**; BLE/UDP/LAN stay at the 500‑byte default, so discovery
+  is automatically TCP‑only, exactly like reference.
+- The **responder** caps the offer by *its* arrival interface and echoes the
+  accepted value in the proof; **transport nodes (hubs) cap the signalling to
+  their own bitrate‑derived HW MTU as they relay**, so the agreed MTU is the
+  minimum along the whole path.
+- Both ends then size resource parts to the negotiated MTU. The **part SDU
+  scales** (`mtu − 36`: ≈256 KB on a full‑MTU TCP path vs 464 B at MTU 500), so a
+  1 MB segment splits into a handful of big parts instead of ~2260 — far fewer
+  round‑trips. **`HASHMAP_MAX_LEN` stays fixed at 74** (it is a class constant
+  derived from the *default* MTU in reference RNS; scaling it desynchronises the
+  receiver's HashMap‑Update boundary and breaks interop — a real bug found and
+  reverted during interop testing).
+- The `link_id` excludes the signalling bytes, so it is stable regardless of the
+  negotiated MTU; a peer that sends no MTU signalling (old/BLE) just stays at 500.
+
 ---
 
 ## 7. Resource transfer (`rns_resource.dart`, `rns_resource_receiver.dart`)
@@ -226,11 +250,24 @@ msgpack map of `{transfer_size, part_count, resource_hash, map_random, hashmap}`
 reassembles, decrypts, and verifies `sha256(payload || map_random) ==
 resource_hash` before returning the bytes and sending its proof.
 
-> **Caveat (real‑world):** the hashmap fits **74 parts per advertisement**
-> (≈32 KB per segment), and there is a fixed link + advertise + request round‑trip
-> overhead, so even small files take on the order of tens of seconds over a
-> multi‑hop public hub. This is why file sharing tries a **direct fetch from the
-> sender** before falling back to the DHT (see [file-sharing.md](file-sharing.md)).
+**Multi‑segment + adaptive window.** Payloads larger than one segment
+(`MAX_EFFICIENT_SIZE`, ~1 MB) are split into segments transferred back‑to‑back;
+within a segment, parts are requested under an **adaptive flow‑control window**
+(`WINDOW` grows 4→…→75 as parts arrive cleanly) that is **reset per segment**.
+The advertisement's `d` field is the **total** transfer size (not per‑segment) —
+the receiver validates it only at completion. Resource proofs are **unencrypted**
+(`RESOURCE_PRF`): the receiver validates `p.data` directly, matching reference.
+
+> **Interoperability & speed (validated).** This stack round‑trips arbitrary
+> sizes **byte‑exact against the reference Python RNS 1.3.5** in *both* directions
+> on the same machine (5 MB and 45 MB, sha‑exact). With link MTU discovery (§6) a
+> TCP path carries ~256 KB parts, so a 1 MB segment is a handful of parts rather
+> than ~2260 — roughly 1.8× faster and far fewer round‑trips. Throughput is now
+> bounded by **path RTT through the public hubs**, not by this code: a small file
+> over a multi‑hop hub path still takes seconds, and a large one (a ~100 MB APK)
+> is minutes. When a holder is a *known sender* (chat media), file sharing fetches
+> **direct** from it; content addressed only by hash goes through the DHT (see
+> [dht.md](dht.md), [file-sharing.md](file-sharing.md)).
 
 ---
 

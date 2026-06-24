@@ -92,6 +92,12 @@ class RnsResourceReceiver {
   int get expectedParts => _n;
   int get receivedParts => _parts.length;
 
+  /// Compact internal state for stall diagnostics.
+  String get debugState => 'seg=${_segIndex + 1}/$_totalSegments '
+      'parts=${_parts.length}/$_n known=$_knownHashes '
+      'win=$_window(min=$_windowMin,max=$_windowMax) '
+      'out=${_outstanding.length} hmu=$_hmuOutstanding done=$_segmentComplete';
+
   /// Received plaintext bytes so far (completed segments + current segment's
   /// received parts, approximate), for a progress display.
   int get receivedBytes {
@@ -145,6 +151,15 @@ class RnsResourceReceiver {
       _hmuOutstanding = false;
       _segmentComplete = false;
       _pendingProof = null;
+      // Reset the adaptive flow-control window for the new segment. In RNS each
+      // segment is a fresh Resource that starts at WINDOW and re-ramps; carrying
+      // the window/min/max across segments lets them degenerate over a long
+      // multi-segment transfer (window_min creeps up, window_max creeps down)
+      // until throughput collapses and the sender times the segment out.
+      _window = _windowStart;
+      _windowMin = _windowMin0;
+      _windowMax = _windowMaxSlow;
+      _fastRounds = 0;
 
       // Fill the first hashmap batch from the advertisement.
       final firstCount = math.min(hashmap.length ~/ _mapHashLen, _n);

@@ -385,6 +385,8 @@ class FileTransferNode {
         stalls = 0;
         return;
       }
+      // No byte progress this tick — log the receiver state to diagnose stalls.
+      log?.call('fetch stall tick ${stalls + 1}: ${f.debugState}');
       if (++stalls > maxTransferStalls) {
         if (!entry.done.isCompleted) {
           log?.call('files: fetch stalled ($maxTransferStalls dead ticks) '

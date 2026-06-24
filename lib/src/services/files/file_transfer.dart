@@ -324,6 +324,9 @@ class FileFetchSession {
   /// Bytes received so far (for a progress display).
   int get receivedBytes => _rx.receivedBytes;
 
+  /// Compact receiver state for stall diagnostics.
+  String get debugState => _rx.debugState;
+
   /// Total size is unknown until the transfer completes (segments are advertised
   /// one at a time), so progress is indeterminate; returns 0.
   int get totalBytes => 0;

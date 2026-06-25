@@ -5,12 +5,48 @@
  * was the root cause of "resolved 0 providers" between two meshed devices: the
  * publisher replicated to nobody (flaky paths) AND kept nothing.
  */
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:reticulum/reticulum.dart';
 
 void main() {
+  group('DhtNode.publish early-stop (lost-ack fix)', () {
+    test('returns at targetReplicas without blocking on a hung contact',
+        () async {
+      final me = await RnsIdentity.generate();
+      final hung = DhtContact.ofIdentity(await RnsIdentity.generate());
+      // STORE to the hung contact NEVER answers (models an ACK that never comes
+      // back); FIND always answers so iterativeFindNode itself doesn't stall.
+      final node = DhtNode(
+        identity: me,
+        k: 20, // cover all seeded contacts so >= targetReplicas healthy are tried
+        sendRpc: (to, req) async {
+          if (req.op == DhtOp.store) {
+            if (to.idHex == hung.idHex) return Completer<DhtMessage?>().future;
+            return DhtMessage.storeOk(to.publicKey, true);
+          }
+          return DhtMessage.nodes(to.publicKey, const []);
+        },
+      );
+      // Enough healthy peers to reach the target, plus the black-hole contact.
+      for (var i = 0; i < DhtNode.targetReplicas + 2; i++) {
+        node.routing.add(DhtContact.ofIdentity(await RnsIdentity.generate()));
+      }
+      node.routing.add(hung);
+
+      final sha = Uint8List.fromList(List<int>.generate(32, (i) => i));
+      final rec = await ProviderRecord.create(providerIdentity: me, sha256: sha);
+      // Without early-stop this would hang on the never-completing STORE; the
+      // timeout makes the failure mode a test failure, not an infinite wait.
+      final holders =
+          await node.publish(rec).timeout(const Duration(seconds: 5));
+      expect(holders, greaterThanOrEqualTo(DhtNode.targetReplicas),
+          reason: 'publish confirms enough replicas and returns');
+    });
+  });
+
   group('DhtNode.publish keeps the publisher authoritative', () {
     test('keeps its own record when replication STOREs all fail', () async {
       final me = await RnsIdentity.generate();

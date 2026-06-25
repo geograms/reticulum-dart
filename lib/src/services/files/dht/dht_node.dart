@@ -97,23 +97,42 @@ class DhtNode {
     await iterativeFindNode(myId);
   }
 
-  /// Publish a signed provider record at the k nodes closest to its file key.
-  /// Returns how many accepted it.
+  /// Enough confirmed replicas for solid redundancy. Once this many peers ACK a
+  /// STORE, publish() returns without waiting for the rest to answer (or to time
+  /// out) — k is sized to cover the whole overlay (most of which is unreachable
+  /// or slow), so waiting for all of them just stalled publish and undercounted.
+  static const int targetReplicas = 8;
+
+  /// Publish a signed provider record at the nodes closest to its file key.
+  /// Returns how many peers CONFIRMED storing it (plus self).
   Future<int> publish(ProviderRecord r) async {
     final closest = await iterativeFindNode(r.fileKey);
-    // Fan the STOREs out concurrently. Serially, a single slow/dead contact's
-    // link handshake (up to its full timeout) stalled every STORE behind it, so
-    // replicating to k peers could take k × timeout — far past the time bound
-    // the hosted-folder advertiser allows (disk_folder_manager._advertise caps
-    // each publish at 10 s), which cut replication off after self only. In
-    // parallel the whole fan-out costs one timeout, so records actually land on
-    // the k-closest and content stays discoverable without querying the origin.
-    final results = await Future.wait(closest.map((c) async {
-      routing.add(c);
-      final resp = await sendRpc(c, DhtMessage.store(myPub, r));
-      return resp != null && resp.op == DhtOp.storeOk && resp.ok;
-    }));
-    var ok = results.where((accepted) => accepted).length;
+    // Fan the STOREs out concurrently, but return as soon as [targetReplicas]
+    // peers have ACKed — don't block on the long tail. Two reasons this matters:
+    // (a) the k-closest is most of the overlay, much of it unreachable/slow, so
+    // waiting for every STORE to answer-or-time-out stalled publish for the full
+    // RPC timeout on each dead-but-routable contact; (b) a STORE ACK arrives a
+    // full extra round-trip after the data is already stored, so under the old
+    // tight wait the ACKs landed AFTER we'd given up — publish logged
+    // "1 holders" even though replication had succeeded. The in-flight STOREs we
+    // don't wait for still complete in the background and still land their
+    // records (more replicas = better); we just stop COUNTING once we have enough.
+    var ok = 0;
+    final enough = Completer<void>();
+    var pending = closest.length;
+    for (final c in closest) {
+      // Detached on purpose: survives past the early return to keep replicating.
+      // ignore: discarded_futures
+      () async {
+        routing.add(c);
+        final resp = await sendRpc(c, DhtMessage.store(myPub, r));
+        if (resp != null && resp.op == DhtOp.storeOk && resp.ok) {
+          if (++ok >= targetReplicas && !enough.isCompleted) enough.complete();
+        }
+        if (--pending == 0 && !enough.isCompleted) enough.complete();
+      }();
+    }
+    if (closest.isNotEmpty) await enough.future;
     // ALWAYS keep our own record locally: we are authoritative for content we
     // hold, so a resolver that queries us (we're in its routing) must get it even
     // if every replication STORE to the k-closest failed. Previously we stored
@@ -122,9 +141,10 @@ class DhtNode {
     // undiscoverable despite it sitting right there. That was the root cause of
     // "resolved 0 providers" between two meshed devices.
     final keptSelf = await _accept(r);
+    final confirmed = ok; // peers that ACKed by the time we returned
     if (keptSelf && ok == 0) ok = 1;
-    log?.call('publish ${dhtHex(r.sha256).substring(0, 8)} -> $ok holders'
-        '${keptSelf ? ' (+self)' : ''}');
+    log?.call('publish ${dhtHex(r.sha256).substring(0, 8)} -> $confirmed peer '
+        'replica(s)${keptSelf ? ' +self' : ''}');
     return ok;
   }
 

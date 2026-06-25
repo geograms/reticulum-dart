@@ -683,9 +683,18 @@ class FileTransferNode {
     final reqBytes = req.encode();
     final rpcHash = RnsDestination.hash(to.identity, rpcApp, rpcAspects);
     final dhtHash = RnsDestination.hash(to.identity, kDhtApp, kDhtAspects);
+    // A STORE's ACK arrives a full extra round-trip after the data is already
+    // stored, and publish fans out wide (contention), so its ACK routinely landed
+    // just after the lookup-sized 6s wait — the publisher then logged the STORE
+    // as failed even though the record had replicated. Give STOREs a longer ACK
+    // budget; FINDs stay short (resolve early-exits, so it tolerates slow peers).
+    final timeout = req.op == DhtOp.store
+        ? const Duration(seconds: 12)
+        : const Duration(seconds: 6);
     // Primary: the configured RPC dest (e.g. the reliably-propagated chat dest),
     // where a transport path actually exists.
-    var respBytes = await _dhtRpcRaw(to.identity, reqBytes, rpcApp, rpcAspects);
+    var respBytes =
+        await _dhtRpcRaw(to.identity, reqBytes, rpcApp, rpcAspects, timeout: timeout);
     // Free fallback to the legacy geogram/dht dest for peers running older code
     // that only accept DHT links there — but ONLY if we already hold a cached
     // path to it. We never pay a fresh path request for the dht dest: "no dht
@@ -693,7 +702,8 @@ class FileTransferNode {
     if (respBytes == null &&
         !_rpcIsDht &&
         (hasPathForDest?.call(dhtHash) ?? false)) {
-      respBytes = await _dhtRpcRaw(to.identity, reqBytes, kDhtApp, kDhtAspects);
+      respBytes = await _dhtRpcRaw(to.identity, reqBytes, kDhtApp, kDhtAspects,
+          timeout: timeout);
     }
     // Routing-table liveness (eviction). A reply proves the contact is alive. A
     // failure is only a DEATH signal when we actually had a route to try AND it
@@ -716,7 +726,8 @@ class FileTransferNode {
   }
 
   Future<Uint8List?> _dhtRpcRaw(RnsIdentity peer, Uint8List reqBytes, String app,
-      List<String> aspects) async {
+      List<String> aspects,
+      {Duration timeout = const Duration(seconds: 6)}) async {
     // Resolve a route to the contact's RPC dest with a SHORT path wait. A DHT
     // lookup queries many contacts and tolerates individual misses, so we must
     // not spend the ~9s file-fetch path budget per contact. If there is no
@@ -741,8 +752,7 @@ class FileTransferNode {
     final e = _DhtRpcEntry(link, reqBytes);
     _dhtRpcByLink[id] = e;
     send(reqPkt.pack());
-    final resp = await e.done.future
-        .timeout(const Duration(seconds: 6), onTimeout: () => null);
+    final resp = await e.done.future.timeout(timeout, onTimeout: () => null);
     _dhtRpcByLink.remove(id);
     return resp;
   }

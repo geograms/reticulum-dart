@@ -192,6 +192,47 @@ class AprxSign {
     }
   }
 
+  // ── NIP-04 (NOSTR kind-4 DM) wire format ─────────────────────────────────
+  // Same crypto as encryptFor/decryptFrom (ECDH-secp256k1 shared X + AES-256-CBC)
+  // but serialized as the standard NIP-04 content string
+  // "<base64(ciphertext)>?iv=<base64(iv)>" so the events interoperate with the
+  // NOSTR protocol. Used for the relay store-and-forward DM backup.
+
+  /// NIP-04 encrypt [plaintext] to x-only pubkey [pubXonly] with our scalar [d].
+  /// Returns the NIP-04 content string, or null on error.
+  static String? nip04Encrypt(BigInt d, Uint8List pubXonly, Uint8List plaintext) {
+    final key = _ecdhKey(d, pubXonly);
+    if (key == null) return null;
+    final iv = Uint8List(16);
+    for (var i = 0; i < 16; i++) {
+      iv[i] = _rng.nextInt(256);
+    }
+    try {
+      final ct = _aesCbc(true, key, iv, plaintext);
+      return '${base64.encode(ct)}?iv=${base64.encode(iv)}';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// NIP-04 decrypt a [content] string (`b64ct?iv=b64iv`) from x-only
+  /// pubkey [pubXonly] with our scalar [d]. Returns the plaintext, or null.
+  static Uint8List? nip04Decrypt(BigInt d, Uint8List pubXonly, String content) {
+    final sep = content.indexOf('?iv=');
+    if (sep < 0) return null;
+    final key = _ecdhKey(d, pubXonly);
+    if (key == null) return null;
+    try {
+      final ct = base64.decode(content.substring(0, sep).trim());
+      final iv = base64.decode(content.substring(sep + 4).trim());
+      if (iv.length != 16) return null;
+      return _aesCbc(
+          false, key, Uint8List.fromList(iv), Uint8List.fromList(ct));
+    } catch (_) {
+      return null;
+    }
+  }
+
   // ── APRS-safe base85 (Z85-style: 4 bytes → 5 chars) ──────────────────
   // 85 printable chars, excluding space and APRS-reserved '{', '|', '~'.
   static const String _b85 =

@@ -15,6 +15,7 @@
  * time in a request/response exchange, so contexts never collide).
  */
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
@@ -29,6 +30,7 @@ import '../reticulum/lxmf/lxmf.dart';
 import '../reticulum/lxmf/lxmf_message.dart';
 import '../reticulum/lxmf/lxmf_router.dart';
 import '../../util/nostr_event.dart';
+import '../../util/nostr_crypto.dart';
 import 'relay_event_store.dart';
 import 'relay_protocol.dart';
 import 'spam.dart';
@@ -186,6 +188,19 @@ class RelayNode {
         propNode, RelayProtocol.deposit(recipientDeliveryDestHex, packed),
         timeout: timeout);
     return r != null && r.op == RelayOp.stored && r.ok;
+  }
+
+  /// Recipient-authorized delete: ask [relay] to drop [ids]. [reqPubHex] is our
+  /// NOSTR pubkey and [sigHex] a BIP-340 signature by it over
+  /// sha256(ids.join(',')). The relay drops only ids whose event has a `p` tag
+  /// == reqPubHex (i.e. addressed to us). Returns the number it dropped.
+  Future<int> dropForRecipient(
+      RnsIdentity relay, List<String> ids, String reqPubHex, String sigHex,
+      {Duration timeout = const Duration(seconds: 20)}) async {
+    if (ids.isEmpty) return 0;
+    final r = await _request(relay, RelayProtocol.drop(reqPubHex, ids, sigHex),
+        timeout: timeout);
+    return (r != null && r.op == RelayOp.dropRes) ? r.count : 0;
   }
 
   /// Indexer side: deliver any mail queued for [recipient] (now believed online)
@@ -351,6 +366,30 @@ class RelayNode {
             ok = true;
           }
           rl.sendMessage(RelayProtocol.stored(ok, ok ? null : 'rejected'));
+          break;
+        case RelayOp.drop:
+          // Recipient-authorized delete: verify the requester owns reqPub (a
+          // BIP-340 sig over sha256 of the comma-joined ids), then drop only the
+          // ids whose event is p-tagged to reqPub. Never deletes a third party's
+          // events, and an unauthenticated request drops nothing.
+          final reqPub = f.reqPub;
+          final ids = f.ids;
+          final sig = f.sig;
+          var dropped = 0;
+          if (serve && reqPub != null && ids != null && sig != null &&
+              ids.isNotEmpty) {
+            final digest =
+                crypto.sha256.convert(utf8.encode(ids.join(','))).bytes;
+            final msgHex = _hex(Uint8List.fromList(digest));
+            var okSig = false;
+            try {
+              okSig = NostrCrypto.schnorrVerify(msgHex, sig, reqPub);
+            } catch (_) {
+              okSig = false;
+            }
+            if (okSig) dropped = store.dropForRecipient(ids, reqPub);
+          }
+          rl.sendMessage(RelayProtocol.dropResult(dropped));
           break;
         default:
           break;

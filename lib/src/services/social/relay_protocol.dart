@@ -30,6 +30,13 @@ class RelayOp {
   static const int stored = 0x81;
   static const int result = 0x82;
   static const int countRes = 0x83;
+  // Recipient-authorized delete (NON-NIP-09): the p-tagged recipient of a set of
+  // events asks the relay to drop them once received, to reclaim space after the
+  // DM backup is delivered. [reqPubHex] is the requester's NOSTR pubkey (hex);
+  // [sigHex] is a BIP-340 signature by reqPub over sha256(ids.join(',')). The
+  // relay drops each id whose stored event carries a `p` tag == reqPub.
+  static const int drop = 0x05; // [5, reqPubHex, [ids], sigHex]
+  static const int dropRes = 0x85; // [0x85, nDropped]
 }
 
 /// A decoded relay frame. Only the fields relevant to [op] are populated.
@@ -45,6 +52,9 @@ class RelayFrame {
   final int count;
   final String? dest; // DEPOSIT: recipient LXMF delivery dest hash (hex)
   final Uint8List? blob; // DEPOSIT: packed LXMF message
+  final String? reqPub; // DROP: requester NOSTR pubkey (hex)
+  final List<String>? ids; // DROP: event ids to delete
+  final String? sig; // DROP: BIP-340 sig over sha256(ids.join(','))
 
   const RelayFrame({
     required this.op,
@@ -58,6 +68,9 @@ class RelayFrame {
     this.count = 0,
     this.dest,
     this.blob,
+    this.reqPub,
+    this.ids,
+    this.sig,
   });
 }
 
@@ -91,6 +104,15 @@ class RelayProtocol {
   /// recipient [destHex] (its LXMF delivery dest hash).
   static Uint8List deposit(String destHex, Uint8List blob) =>
       msgpackEncode([RelayOp.deposit, destHex, blob]);
+
+  /// Recipient-authorized delete: ask the relay to drop [ids]. [reqPubHex] is
+  /// the requester's NOSTR pubkey and [sigHex] a BIP-340 signature by it over
+  /// sha256(ids.join(',')). The relay drops only ids whose event has a `p`
+  /// tag == reqPubHex.
+  static Uint8List drop(String reqPubHex, List<String> ids, String sigHex) =>
+      msgpackEncode([RelayOp.drop, reqPubHex, ids, sigHex]);
+
+  static Uint8List dropResult(int n) => msgpackEncode([RelayOp.dropRes, n]);
 
   // ── Decode ──────────────────────────────────────────────────────────────
 
@@ -147,6 +169,15 @@ class RelayProtocol {
             subId: raw[1] as String,
             count: raw[2] as int,
           );
+        case RelayOp.drop:
+          return RelayFrame(
+            op: op,
+            reqPub: raw[1] as String,
+            ids: (raw[2] as List).map((e) => e.toString()).toList(),
+            sig: raw[3] as String,
+          );
+        case RelayOp.dropRes:
+          return RelayFrame(op: op, count: raw[1] as int);
         default:
           return null;
       }

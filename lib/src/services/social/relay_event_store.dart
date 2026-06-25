@@ -281,6 +281,25 @@ class RelayEventStore {
   /// Intended for the relay operator (admin) to remove abusive content.
   void deleteById(String id) => _deleteById(id);
 
+  /// Recipient-authorized delete (NON-NIP-09): hard-delete each id in [ids]
+  /// whose event carries a `p` tag == [recipientPubHex]. The caller must have
+  /// already verified the requester owns [recipientPubHex]. Returns the number
+  /// deleted. Used to reclaim space after a DM backup has been delivered.
+  int dropForRecipient(List<String> ids, String recipientPubHex) {
+    var n = 0;
+    final pub = recipientPubHex.toLowerCase();
+    for (final id in ids) {
+      final rows = _db.select(
+        "SELECT 1 FROM tags WHERE event_id = ? AND name = 'p' AND value = ? LIMIT 1",
+        [id, pub],
+      );
+      if (rows.isEmpty) continue;
+      _deleteById(id);
+      n++;
+    }
+    return n;
+  }
+
   /// NIP-09: a kind-5 event deletes the events it references (#e) that belong to
   /// the same author. We tombstone rather than hard-delete so a replay of the
   /// deleted event won't resurrect it.

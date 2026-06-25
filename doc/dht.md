@@ -299,6 +299,15 @@ announced destination name.
   confirmed landing on the live mesh.
 - **Reply size caps** (5 contacts / 2 records per packet) mean wide result sets
   take extra rounds; there is no multi‑packet framing yet.
+- **Store anti‑abuse caps.** Routing RPC over the (widely‑known) chat dest means
+  any peer can open a DHT link and STORE at us, so the local store is bounded:
+  at most `maxStoredKeys` distinct keys and `maxRecordsPerKey` providers per key
+  (`DhtNode`). An over‑cap STORE is rejected BEFORE the Ed25519 verify, so a flood
+  can't burn CPU or memory once we're full; a refresh of a record we already hold
+  is always allowed (it doesn't grow the store). The `dhtRejected` status counter
+  exposes refusals. Residual gap: rapidly *refreshing* an already‑held record
+  still costs a re‑verify each time — a per‑peer rate limit would close that, not
+  yet done.
 - **Stale eviction** now removes a contact after 5 unanswered FINDs to a routable
   peer (§2), so the covered set trims to live nodes — but a peer we keep hearing
   announces from is re‑added, so on a quiet node (few lookups) the trim is gradual

@@ -275,6 +275,7 @@ class FileTransferNode {
   int get dhtStoredKeys => dht?.storedKeys ?? 0;
   int get dhtReplicasStored => dht?.replicasStored ?? 0;
   int get dhtProvidersDemoted => dht?.providersDemoted ?? 0;
+  int get dhtStoresRejected => dht?.storesRejected ?? 0;
 
   /// Identity hashes of the DHT peers in the routing table (debug: lets us see
   /// WHICH Aurora nodes are in the overlay, to diagnose discovery convergence).

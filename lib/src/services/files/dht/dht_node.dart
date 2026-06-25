@@ -29,6 +29,19 @@ class DhtNode {
   final DhtRpc sendRpc;
   final void Function(String msg)? log;
 
+  /// Anti-abuse ceilings on the local record store. Routing DHT RPC over the
+  /// (widely-known) chat dest means any peer can open a link and STORE at us, so
+  /// we bound how much they can make us hold: at most [maxStoredKeys] distinct
+  /// keys, and [maxRecordsPerKey] providers per key. A STORE that would exceed
+  /// either is rejected BEFORE the expensive signature verify, so a flood can't
+  /// burn CPU or memory once we're full. Worst-case memory is the product of the
+  /// two — sized to a safe ceiling, far above normal use.
+  final int maxStoredKeys;
+  final int maxRecordsPerKey;
+
+  /// STOREs refused by the caps above (observability).
+  int storesRejected = 0;
+
   late final Uint8List myId = DhtContact.ofIdentity(identity).id;
   late final Uint8List myPub = identity.getPublicKey();
   late final RoutingTable routing = RoutingTable(myId, k: k);
@@ -42,6 +55,8 @@ class DhtNode {
     this.alpha = 3,
     required this.sendRpc,
     this.log,
+    this.maxStoredKeys = 10000,
+    this.maxRecordsPerKey = 24,
   });
 
   int get storedKeys => _store.length;
@@ -73,6 +88,12 @@ class DhtNode {
                 myPub, _cap(routing.closest(key, k), kDhtWireMaxContacts));
       case DhtOp.store:
         final r = req.records.first;
+        // Anti-abuse: refuse over-cap STOREs BEFORE the signature verify so a
+        // flood can't burn CPU/memory once we're full.
+        if (!_admitStore(r)) {
+          storesRejected++;
+          return DhtMessage.storeOk(myPub, false);
+        }
         final ok = await _accept(r);
         if (ok && !_eq(r.providerPub, myPub)) {
           replicasStored++;
@@ -254,6 +275,19 @@ class DhtNode {
   }
 
   // ── Local store ────────────────────────────────────────────────────────────
+
+  /// Cheap (no-verify) admission gate for an incoming STORE. A refresh of a
+  /// record we already hold for this (key, provider) never grows the store and is
+  /// always allowed; otherwise the new key must fit under [maxStoredKeys] and the
+  /// existing key under [maxRecordsPerKey]. Uses only list/map sizes, so it is
+  /// drift-free (always accurate) and runs before the Ed25519 verify in _accept.
+  bool _admitStore(ProviderRecord r) {
+    final list = _store[dhtHex(r.fileKey)];
+    if (list == null) return _store.length < maxStoredKeys; // a brand-new key
+    if (list.any((e) => _eq(e.providerPub, r.providerPub))) return true; // refresh
+    return list.length < maxRecordsPerKey;
+  }
+
   Future<bool> _accept(ProviderRecord r) async {
     if (r.isExpired()) return false;
     if (!await r.verify()) return false;

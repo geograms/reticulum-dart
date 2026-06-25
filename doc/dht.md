@@ -334,3 +334,26 @@ resolved providers **concurrently with a short per‑provider timeout**
 (`folder_relay.dart`) so a single stale/offline provider can't stall the check —
 the same serial‑query‑times‑timeout trap that produced the original hang. See
 [mutable-folders.md](mutable-folders.md) for the folder side.
+
+## 11. Persistence anchors (capacity‑biased replication)
+
+The XOR‑closest set is mostly **ephemeral** here (phones that sleep), so a record
+can vanish on churn. To keep records alive on **always‑on** nodes without a wire
+change, the DHT uses *persistence anchors*: a small, stable set of holders the
+owner injects (`DhtNode.anchors`). Aurora feeds it the **relay indexers** from
+`RelayDirectory` filtered to a stable capacity class (`capacity ≤ kCapHomeWifi`),
+excluding self, top few by capacity/freshness — capacity is **already advertised**
+on the relay announce, so nothing new goes on the wire.
+
+- **`publish`** STOREs to the k‑closest **∪ anchors** (deduped) — records also
+  live on the stable index nodes.
+- **`resolve`** queries the anchors **first** (FIND_VALUE, in parallel) and
+  returns on a verified hit; only if they don't have it does it fall back to the
+  XOR‑walk. Anchors are queried **regardless of XOR distance or k**.
+
+This decouples persistence and findability from XOR distance. Two consequences:
+(a) records survive churn of the closest set; (b) it is the **enabler for shrinking
+`k`** (§2) — once anchors guarantee findability, the XOR‑walk can use a small
+Kademlia `k` as a secondary path. Note: anchors hold records for many keys, so an
+indexer reaches the anti‑abuse `maxStoredKeys` cap (§9) sooner — a higher cap for
+indexers is a future knob (the caps are already constructor params).

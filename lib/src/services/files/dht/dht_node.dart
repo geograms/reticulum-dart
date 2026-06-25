@@ -29,6 +29,14 @@ class DhtNode {
   final DhtRpc sendRpc;
   final void Function(String msg)? log;
 
+  /// Optional persistence anchors: a small, stable set of always-on holders
+  /// (e.g. the relay indexers) that we additionally STORE to and query FIRST on
+  /// resolve, regardless of XOR distance. Records thus survive churn of the
+  /// ephemeral k-closest, and stay findable even when k is small — the XOR-walk
+  /// becomes a fallback. Supplied by the owner (the DHT engine stays generic);
+  /// empty/unset → classic Kademlia behaviour.
+  final List<DhtContact> Function()? anchors;
+
   /// Anti-abuse ceilings on the local record store. Routing DHT RPC over the
   /// (widely-known) chat dest means any peer can open a link and STORE at us, so
   /// we bound how much they can make us hold: at most [maxStoredKeys] distinct
@@ -57,7 +65,22 @@ class DhtNode {
     this.log,
     this.maxStoredKeys = 10000,
     this.maxRecordsPerKey = 24,
+    this.anchors,
   });
+
+  /// Anchor contacts to also reach this round, excluding ourselves and anything
+  /// already in [exclude] (the k-closest), deduped by id.
+  List<DhtContact> _anchorsExcluding(Set<String> exclude) {
+    final list = anchors?.call();
+    if (list == null || list.isEmpty) return const [];
+    final out = <DhtContact>[];
+    final seen = <String>{...exclude};
+    for (final c in list) {
+      if (dhtIdEquals(c.id, myId)) continue;
+      if (seen.add(c.idHex)) out.add(c);
+    }
+    return out;
+  }
 
   int get storedKeys => _store.length;
 
@@ -131,7 +154,14 @@ class DhtNode {
   /// Publish a signed provider record at the nodes closest to its file key.
   /// Returns how many peers CONFIRMED storing it (plus self).
   Future<int> publish(ProviderRecord r) async {
-    final closest = await iterativeFindNode(r.fileKey);
+    final closestNodes = await iterativeFindNode(r.fileKey);
+    // Also STORE to the persistence anchors (always-on holders), deduped against
+    // the k-closest — records survive churn of the ephemeral closest set, and a
+    // resolver reaches them via the anchors-first path regardless of distance/k.
+    final closest = [
+      ...closestNodes,
+      ..._anchorsExcluding({for (final c in closestNodes) c.idHex}),
+    ];
     // Fan the STOREs out concurrently, but return as soon as [targetReplicas]
     // peers have ACKed — don't block on the long tail. Two reasons this matters:
     // (a) the k-closest is most of the overlay, much of it unreachable/slow, so
@@ -179,6 +209,27 @@ class DhtNode {
     final found = <String, ProviderRecord>{}; // providerPub hex -> record
     for (final r in _liveRecords(target, sha256)) {
       found[dhtHex(r.providerPub)] = r;
+    }
+    // Anchors-first fast path: query the always-on holders directly (regardless
+    // of XOR distance), in parallel. publish() stores to them, so for most keys a
+    // verified record is here in one round — and it stays findable even if k is
+    // small. Only fall through to the XOR-walk when the anchors don't have it.
+    final anchorContacts = _anchorsExcluding(const {});
+    if (anchorContacts.isNotEmpty) {
+      await Future.wait(anchorContacts.map((c) async {
+        final resp = await sendRpc(c, DhtMessage.findValue(myPub, sha256));
+        if (resp == null || !resp.hasValue) return;
+        routing.add(c);
+        for (final r in resp.records) {
+          if (!_eq(r.sha256, sha256) || r.isExpired()) continue;
+          if (!await r.verify()) continue;
+          found[dhtHex(r.providerPub)] = r;
+        }
+      }));
+      if (found.isNotEmpty) {
+        return found.values.toList()
+          ..sort((a, b) => a.capacity.compareTo(b.capacity));
+      }
     }
     await _iterate(
       target,

@@ -126,6 +126,11 @@ class FileTransferNode {
   final int dhtK;
   final int dhtAlpha;
 
+  /// Persistence anchors: always-on holder identities (e.g. relay indexers) the
+  /// DHT additionally STOREs to and queries first. Supplied by the host so the
+  /// library stays free of app concepts; null/empty → classic Kademlia.
+  final Iterable<RnsIdentity> Function()? stableAnchors;
+
   /// Serving-side budget / anti-abuse guard applied to everything we serve.
   final ServeQuota serveQuota;
 
@@ -189,6 +194,7 @@ class FileTransferNode {
     this.rpcAspects = kDhtAspects,
     this.dhtK = 96,
     this.dhtAlpha = 12,
+    this.stableAnchors,
   }) : serveQuota = serveQuota ?? ServeQuota() {
     if (enableDht) {
       // k is sized to COVER the whole (small, tens-of-nodes) overlay, not the
@@ -209,7 +215,16 @@ class FileTransferNode {
           k: dhtK,
           alpha: dhtAlpha,
           sendRpc: _dhtSendRpc,
-          log: log);
+          log: log,
+          // Persistence anchors: adapt the host-supplied always-on identities to
+          // DhtContacts. publish() also stores to them and resolve() queries them
+          // first, so records survive churn and stay findable independent of k.
+          anchors: stableAnchors == null
+              ? null
+              : () => [
+                    for (final id in stableAnchors!())
+                      DhtContact.ofIdentity(id)
+                  ]);
     }
   }
 

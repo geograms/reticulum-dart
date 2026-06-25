@@ -274,6 +274,7 @@ class FileTransferNode {
   /// replication is landing — how many of those records came from OTHER nodes.
   int get dhtStoredKeys => dht?.storedKeys ?? 0;
   int get dhtReplicasStored => dht?.replicasStored ?? 0;
+  int get dhtProvidersDemoted => dht?.providersDemoted ?? 0;
 
   /// Identity hashes of the DHT peers in the routing table (debug: lets us see
   /// WHICH Aurora nodes are in the overlay, to diagnose discovery convergence).
@@ -596,6 +597,10 @@ class FileTransferNode {
       if (_hex(pr.providerIdentity.hash) == self) continue;
       final bytes = await fetch(sha256, pr.providerIdentity, timeout: timeout);
       if (bytes != null && bytes.isNotEmpty) return bytes;
+      // Provider failed to serve the bytes → prune its record from our local DHT
+      // store so the next resolve (here, or by a peer that queries us) doesn't
+      // waste a round on a dead holder. It re-publishes (~30 min) to return.
+      d.demoteProvider(sha256, pr.providerPub);
     }
     return null;
   }

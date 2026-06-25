@@ -47,6 +47,34 @@ void main() {
     });
   });
 
+  group('DhtNode.demoteProvider (dead-holder pruning)', () {
+    test('a demoted provider is no longer returned by a local resolve',
+        () async {
+      final me = await RnsIdentity.generate();
+      final provider = await RnsIdentity.generate();
+      // Holder with the provider's record in its local store, no outbound peers.
+      final node = DhtNode(identity: me, sendRpc: (to, req) async => null);
+      final sha = Uint8List.fromList(List<int>.generate(32, (i) => i * 3));
+      await node.handle(DhtMessage.store(provider.getPublicKey(),
+          await ProviderRecord.create(
+              providerIdentity: provider, sha256: sha)));
+
+      expect((await node.resolve(sha)), isNotEmpty,
+          reason: 'record is present before demotion');
+      expect(node.providersDemoted, 0);
+
+      final removed = node.demoteProvider(sha, provider.getPublicKey());
+      expect(removed, isTrue);
+      expect(node.providersDemoted, 1);
+      expect(await node.resolve(sha), isEmpty,
+          reason: 'a fetch-failed provider must not be handed out again');
+
+      // Demoting something we do not hold is a harmless no-op.
+      expect(node.demoteProvider(sha, provider.getPublicKey()), isFalse);
+      expect(node.providersDemoted, 1);
+    });
+  });
+
   group('DhtNode.publish keeps the publisher authoritative', () {
     test('keeps its own record when replication STOREs all fail', () async {
       final me = await RnsIdentity.generate();

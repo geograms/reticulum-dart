@@ -51,6 +51,10 @@ class DhtNode {
   /// opposed to records we published about our own content.
   int replicasStored = 0;
 
+  /// How many provider records we have dropped because a fetch from that provider
+  /// failed (dead-holder pruning) — the counterpart to contact eviction.
+  int providersDemoted = 0;
+
   // ── Responder side ───────────────────────────────────────────────────────
   Future<DhtMessage> handle(DhtMessage req) async {
     routing.add(req.sender); // learn whoever contacts us
@@ -258,6 +262,23 @@ class DhtNode {
     list.removeWhere((e) => _eq(e.providerPub, r.providerPub));
     list.add(r);
     return true;
+  }
+
+  /// Drop a provider's record for [sha256] from our local store — called when a
+  /// fetch from that provider FAILED, so neither we (next resolve) nor a peer
+  /// querying us hands out a dead holder again. The provider re-publishes (every
+  /// ~30 min) to come back, so a transient failure self-heals. Returns true if a
+  /// record was actually removed.
+  bool demoteProvider(Uint8List sha256, Uint8List providerPub) {
+    final key = dhtHex(dhtFileKey(sha256));
+    final list = _store[key];
+    if (list == null) return false;
+    final before = list.length;
+    list.removeWhere((r) => _eq(r.providerPub, providerPub));
+    if (list.isEmpty) _store.remove(key);
+    final removed = list.length < before;
+    if (removed) providersDemoted++;
+    return removed;
   }
 
   List<ProviderRecord> _liveRecords(Uint8List fileKey16, Uint8List sha256) {

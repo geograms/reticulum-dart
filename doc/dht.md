@@ -203,8 +203,13 @@ resolve(sha256):
 > queried node returns a verified record (we keep the whole round that found it,
 > so a resolver still gets a few providers for redundancy).
 
-`FileTransferNode.resolveAndFetch` then does a **multi‑source** download from
-several providers in parallel and verifies the bytes against the hash.
+`FileTransferNode.resolveAndFetch` then tries the resolved providers in turn,
+verifying the bytes against the hash. **Dead‑holder pruning:** if a provider fails
+to serve, `DhtNode.demoteProvider` drops its record from our local store, so the
+next resolve — here, or by a peer that queries us — doesn't waste a round on it.
+The provider re‑publishes (~30 min) to come back, so a transient failure
+self‑heals; across the mesh this prunes dead holders as fetches hit them. It is
+the provider‑record counterpart to contact eviction (§2).
 
 Exposed as `RnsService.dhtResolveFetch(fileHash)`.
 

@@ -204,11 +204,13 @@ class FileTransferNode {
       // chat-routed replication only lands on the NEW-code nodes (the rest still
       // run DHT on geogram/dht), so redundancy among the closest is sparse and a
       // resolver MUST be able to reach the holder itself — which it can only
-      // guarantee by covering the overlay. Lower k below the live overlay size
-      // ONLY once the new-code fleet is dense enough that replication reaches the
-      // k-closest (then it is safe + cheaper). k/alpha are constructor params so
-      // that staging needs no library edit. Liveness eviction (routing_table.dart)
-      // is what trims the cost now: dead/unreachable contacts drop out, so the
+      // guarantee by covering the overlay. This 96 is the SAFE default for a
+      // consumer WITHOUT persistence anchors. A consumer that supplies anchors
+      // (DhtNode.anchors / stableAnchors) can lower k well below the overlay size
+      // — findability no longer depends on covering it, since resolve queries the
+      // anchors first regardless of distance/k (Aurora runs k=20/alpha=6). k/alpha
+      // are constructor params so staging needs no library edit. Liveness eviction
+      // (routing_table.dart) also trims the cost: dead/unreachable contacts drop, so the
       // covered set shrinks to live nodes. alpha is the per-round fan-out.
       dht = DhtNode(
           identity: identity,

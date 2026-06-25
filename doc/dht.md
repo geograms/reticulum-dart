@@ -354,6 +354,34 @@ on the relay announce, so nothing new goes on the wire.
 This decouples persistence and findability from XOR distance. Two consequences:
 (a) records survive churn of the closest set; (b) it is the **enabler for shrinking
 `k`** (§2) — once anchors guarantee findability, the XOR‑walk can use a small
-Kademlia `k` as a secondary path. Note: anchors hold records for many keys, so an
-indexer reaches the anti‑abuse `maxStoredKeys` cap (§9) sooner — a higher cap for
-indexers is a future knob (the caps are already constructor params).
+Kademlia `k` as a secondary path. **Aurora runs `k=20`/`alpha=6`** on top of this
+(the library default stays a safe `96`/`12` for consumers without anchors). Note:
+anchors hold records for many keys, so an indexer reaches the anti‑abuse
+`maxStoredKeys` cap (§9) sooner — a higher cap for indexers is a future knob (the
+caps are already constructor params).
+
+## 12. Remaining work (deferred — intentionally not built yet)
+
+The DHT is feature-complete for current needs; these are recorded follow-ups:
+
+- **Stop announcing `geogram/dht`.** Once the fleet has migrated to chat-routed
+  DHT (dual-accept everywhere, §4), the dedicated dht announce is redundant —
+  dropping it removes one of ~6 per-cycle service announces, helping the others
+  survive the hubs' announce budget. The Kademlia id needs no announce and
+  membership comes from the chat/files announces (§8). **Gated on migration:**
+  dropping it before dual-accept is universal would strand old nodes that still
+  dial the dht dest. Concrete change: drop `_aspectsDht` from the announce loop in
+  `rns_service._announceServiceDests` (keep the const + `dhtDestHash` for the id
+  and dual-accept).
+
+- **Reply fragmentation.** FIND replies are capped to one ~450 B packet (5
+  contacts / 2 records, §3), so wide result sets cost extra rounds. With link MTU
+  discovery in place ([reticulum.md](reticulum.md) §6), a reply could carry more,
+  or use multi-packet framing. **Minor** — the caps are adequate at this scale.
+
+- **Chat-dest type discriminator.** DHT RPC rides the chat destination's links
+  (§4); that is unambiguous today because chat itself uses no links, and
+  `handleEncoded` null-rejects any non-`DhtMessage` frame. Once migration is
+  complete (byte-identical payloads no longer needed for old-node interop),
+  reserve a 1-byte type tag on the first link frame so a future chat-over-links
+  feature can't collide with DHT traffic. **Gated on migration.**

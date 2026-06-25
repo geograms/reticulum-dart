@@ -120,6 +120,12 @@ class FileTransferNode {
   /// The Kademlia index node (provider lookup/publish). Null unless [enableDht].
   DhtNode? dht;
 
+  /// Kademlia bucket size / lookup breadth and per-round fan-out. Defaulted to
+  /// cover a small overlay (see the constructor); exposed so the host can stage
+  /// them down as the new-code fleet grows dense enough for replication.
+  final int dhtK;
+  final int dhtAlpha;
+
   /// Serving-side budget / anti-abuse guard applied to everything we serve.
   final ServeQuota serveQuota;
 
@@ -181,22 +187,29 @@ class FileTransferNode {
     this.onDepositStore,
     this.rpcApp = kDhtApp,
     this.rpcAspects = kDhtAspects,
+    this.dhtK = 96,
+    this.dhtAlpha = 12,
   }) : serveQuota = serveQuota ?? ServeQuota() {
     if (enableDht) {
-      // k=96 (vs Kademlia's 8): a geogram overlay is small (tens of nodes) and
-      // — because replication STOREs to the k-closest routinely fail on the
-      // public hubs (no transport path to a peer's geogram/dht dest) — a record
-      // usually lives ONLY on its holder, which keeps its own copy. So a resolver
-      // must query the holder directly, but Kademlia only asks the k closest to
-      // the key: with k=24 and ~37 live peers, 13 contacts (possibly including
-      // the holder) were NEVER queried, so a fetch failed with "no provider yet"
-      // for any key the holder wasn't XOR-close to. Sizing k to cover the whole
-      // overlay makes resolve()/publish() reach EVERY known peer — the holder is
-      // always among them. alpha=12 (vs 3) fans each round out wide so all peers
-      // are reached in a few rounds despite stale contacts; with FIND_VALUE
-      // early-exit the lookup still stops the instant the holder answers.
+      // k is sized to COVER the whole (small, tens-of-nodes) overlay, not the
+      // Kademlia default of 8. `closest(target, k)` returns min(k, overlay size),
+      // so k=96 simply means "query every peer we know"; it is not wasteful on a
+      // 37-node overlay (it queries 37). This matters because, mid-migration,
+      // chat-routed replication only lands on the NEW-code nodes (the rest still
+      // run DHT on geogram/dht), so redundancy among the closest is sparse and a
+      // resolver MUST be able to reach the holder itself — which it can only
+      // guarantee by covering the overlay. Lower k below the live overlay size
+      // ONLY once the new-code fleet is dense enough that replication reaches the
+      // k-closest (then it is safe + cheaper). k/alpha are constructor params so
+      // that staging needs no library edit. Liveness eviction (routing_table.dart)
+      // is what trims the cost now: dead/unreachable contacts drop out, so the
+      // covered set shrinks to live nodes. alpha is the per-round fan-out.
       dht = DhtNode(
-          identity: identity, k: 96, alpha: 12, sendRpc: _dhtSendRpc, log: log);
+          identity: identity,
+          k: dhtK,
+          alpha: dhtAlpha,
+          sendRpc: _dhtSendRpc,
+          log: log);
     }
   }
 
@@ -668,6 +681,8 @@ class FileTransferNode {
   // link to its dht destination, await the single-packet reply.
   Future<DhtMessage?> _dhtSendRpc(DhtContact to, DhtMessage req) async {
     final reqBytes = req.encode();
+    final rpcHash = RnsDestination.hash(to.identity, rpcApp, rpcAspects);
+    final dhtHash = RnsDestination.hash(to.identity, kDhtApp, kDhtAspects);
     // Primary: the configured RPC dest (e.g. the reliably-propagated chat dest),
     // where a transport path actually exists.
     var respBytes = await _dhtRpcRaw(to.identity, reqBytes, rpcApp, rpcAspects);
@@ -675,11 +690,26 @@ class FileTransferNode {
     // that only accept DHT links there — but ONLY if we already hold a cached
     // path to it. We never pay a fresh path request for the dht dest: "no dht
     // path" is the common failing case that moving RPC to chat exists to fix.
-    if (respBytes == null && !_rpcIsDht) {
-      final dhtHash = RnsDestination.hash(to.identity, kDhtApp, kDhtAspects);
-      if (hasPathForDest?.call(dhtHash) ?? false) {
-        respBytes =
-            await _dhtRpcRaw(to.identity, reqBytes, kDhtApp, kDhtAspects);
+    if (respBytes == null &&
+        !_rpcIsDht &&
+        (hasPathForDest?.call(dhtHash) ?? false)) {
+      respBytes = await _dhtRpcRaw(to.identity, reqBytes, kDhtApp, kDhtAspects);
+    }
+    // Routing-table liveness (eviction). A reply proves the contact is alive. A
+    // failure is only a DEATH signal when we actually had a route to try AND it
+    // was a lookup: a no-route skip is about OUR paths (e.g. unwarmed at boot,
+    // which would otherwise evict the whole table before paths converge), and a
+    // missing STORE ack is frequently lost over multi-hop even when the record
+    // landed — neither says the peer is dead. Only an unanswered FIND to a
+    // routable peer counts toward eviction.
+    final d = dht;
+    if (d != null) {
+      if (respBytes != null) {
+        d.routing.recordSuccess(to);
+      } else if (req.op != DhtOp.store &&
+          ((hasPathForDest?.call(rpcHash) ?? false) ||
+              (hasPathForDest?.call(dhtHash) ?? false))) {
+        d.routing.recordFailure(to);
       }
     }
     return respBytes == null ? null : DhtMessage.decode(respBytes);

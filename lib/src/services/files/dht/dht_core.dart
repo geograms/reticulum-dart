@@ -72,6 +72,7 @@ class DhtContact {
   final RnsIdentity identity; // public identity (64B key)
   final Uint8List id; // DHT destination hash (16B)
   DateTime lastSeen;
+  int failures = 0; // consecutive failed RPCs, for liveness eviction
 
   DhtContact._(this.identity, this.id, this.lastSeen);
 

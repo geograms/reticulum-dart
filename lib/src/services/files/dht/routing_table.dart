@@ -5,7 +5,14 @@
  * distance from us): closer nodes land in higher-index buckets. Each bucket holds
  * up to k contacts in least-recently-seen..most-recently-seen order. On a full
  * bucket we keep the existing (proven-live) contacts and drop the newcomer — the
- * conservative choice under heavy churn; stale eviction is a later refinement.
+ * conservative choice under heavy churn.
+ *
+ * Liveness: callers report the outcome of each RPC via recordSuccess/
+ * recordFailure. A contact that misses [maxFailures] RPCs in a row is evicted, so
+ * lookups stop wasting rounds on dead/unreachable nodes (e.g. peers we have no
+ * DHT-routable path to). The threshold is high enough that a one-off timeout — or
+ * a lost STORE ack, which doesn't mean the node is dead — doesn't evict a live
+ * node: it answers the frequent lookups, which reset its counter.
  */
 import 'dart:typed_data';
 
@@ -37,6 +44,36 @@ class RoutingTable {
       return;
     }
     if (bucket.length < k) bucket.add(c);
+  }
+
+  /// Consecutive failed RPCs before a contact is evicted.
+  static const int maxFailures = 5;
+
+  DhtContact? _find(Uint8List id) {
+    final bucket = _buckets[_bucketIndex(id)];
+    final idx = bucket.indexWhere((e) => dhtIdEquals(e.id, id));
+    return idx >= 0 ? bucket[idx] : null;
+  }
+
+  /// A contact answered an RPC: it is alive — clear its failure count and bump it
+  /// to most-recently-seen (adds it if we didn't have it).
+  void recordSuccess(DhtContact c) {
+    final existing = _find(c.id);
+    if (existing == null) {
+      add(c);
+      return;
+    }
+    existing.failures = 0;
+    add(existing); // moves to most-recently-seen + refreshes lastSeen
+  }
+
+  /// A contact failed to answer an RPC. Evict it after [maxFailures] in a row so
+  /// lookups stop paying its timeout every round.
+  void recordFailure(DhtContact c) {
+    final bucket = _buckets[_bucketIndex(c.id)];
+    final idx = bucket.indexWhere((e) => dhtIdEquals(e.id, c.id));
+    if (idx < 0) return;
+    if (++bucket[idx].failures >= maxFailures) bucket.removeAt(idx);
   }
 
   /// The [count] contacts closest (by XOR distance) to [target].

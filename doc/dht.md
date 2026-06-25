@@ -33,11 +33,24 @@ index — see [file-sharing.md](file-sharing.md) §6.)
 128 buckets (one per bit), each holding up to **k** contacts in
 least‑recently‑seen → most‑recently‑seen order. On a full bucket the existing,
 proven‑live contacts are kept and the newcomer is dropped (conservative under
-churn; stale eviction is a noted future refinement).
+churn).
+
+**Liveness eviction.** Callers report each RPC's outcome via
+`recordSuccess`/`recordFailure`; a contact that misses **`maxFailures` = 5**
+RPCs in a row is evicted, so lookups stop paying a dead/unreachable peer's
+timeout every round. Crucially, what counts as a failure is decided in
+`file_node._dhtSendRpc`, not here: only an **unanswered FIND to a peer we had a
+route to** counts. A no‑route skip (e.g. paths not yet warm at boot) is about
+*our* routing, not the peer's liveness — counting it would evict the whole table
+on startup before paths converge (observed, then fixed). A missing STORE ack
+doesn't count either (it's often lost over multi‑hop even when the record
+landed). Any reply resets the counter.
 
 > **k is sized to cover the whole overlay, not the Kademlia default (8).**
 > `FileTransferNode` constructs its `DhtNode` with **k = 96** and **α = 12**
-> (`file_node.dart`), for a reason specific to how this overlay runs in the wild:
+> (both now `dhtK`/`dhtAlpha` constructor params, so they can be staged down
+> without a library edit once the new‑code fleet is dense enough for replication —
+> see §9), for a reason specific to how this overlay runs in the wild:
 > replication STOREs to the k‑closest *routinely fail on public hubs* (§6), so a
 > provider record usually lives **only on its holder**, which always keeps its own
 > copy. A resolver therefore has to query the holder directly — but classic
@@ -281,8 +294,10 @@ announced destination name.
   confirmed landing on the live mesh.
 - **Reply size caps** (5 contacts / 2 records per packet) mean wide result sets
   take extra rounds; there is no multi‑packet framing yet.
-- **Stale eviction** is conservative — a dead contact lingers in its bucket until
-  displaced (skip‑fast, §4, keeps that cheap rather than fixing it).
+- **Stale eviction** now removes a contact after 5 unanswered FINDs to a routable
+  peer (§2), so the covered set trims to live nodes — but a peer we keep hearing
+  announces from is re‑added, so on a quiet node (few lookups) the trim is gradual
+  rather than aggressive; skip‑fast (§4) keeps the residual cost low.
 - **On a large *foreign* public testnet**, the XOR‑closest nodes to a file key
   are reference RNS nodes that don't run this overlay and ignore the STORE/FIND
   RPCs — another reason replication can't rely on "the k closest to the key" and

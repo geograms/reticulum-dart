@@ -79,10 +79,13 @@ sender's 64‑byte public key so the receiver can learn it as a contact:
 | `FIND_VALUE` | 0x03 | sha256 (32 B) | `VALUE` (0x83): provider records **or** nodes |
 | `STORE` | 0x04 | provider record | `STORE_OK` (0x84): bool |
 
-Replies are capped to fit **one ~450 B link‑encrypted packet** — at most 5
-contacts or 2 records per reply (`kDhtWireMaxContacts`, `kDhtWireMaxRecords`) —
-so no per‑RPC fragmentation is needed; the routing table holds the full k
-internally (§2) and just truncates what it puts on the wire.
+Replies fit **one link‑encrypted packet**, sized to the link's negotiated MTU:
+the floor is 5 contacts / 2 records (`kDhtWireMaxContacts`, `kDhtWireMaxRecords`,
+a 500‑MTU packet), but a large‑MTU chat/TCP link (the DHT link does MTU discovery,
+§4) carries up to 64 contacts / 16 records in one packet — fewer rounds on wide
+lookups (`file_node._onDhtServePacket` computes the cap from `link.mtu` and passes
+it to `handle`). No multi‑packet framing needed; the routing table still holds the
+full k internally (§2) and just truncates what it puts on the wire.
 
 ## 4. Transport binding — DHT over Reticulum links (`file_node.dart`)
 
@@ -92,9 +95,12 @@ By default that is `geogram/dht`, but `FileTransferNode` takes `rpcApp`/
 (`geogram/chat`) — because the dedicated dht announce is dropped by the hubs'
 announce budget, leaving no transport path to it, while the chat announce
 propagates reliably (§8, §9). The Kademlia node id is still derived from
-`geogram/dht` locally and is unaffected. Updated nodes also **dual‑accept** DHT
-links on the legacy dht dest for the mixed‑fleet migration. The shape below is
-the same regardless of which dest it targets:
+`geogram/dht` locally and is unaffected. We accept DHT links **only** on the RPC
+dest (the legacy dht dest is never dialled nor announced — this is a fresh
+deployment, no old-node interop). Every link frame carries a **1‑byte type tag**
+(`0x01` = DHT) so the chat dest can be shared with future tenants without
+collision: a non‑DHT frame is ignored. The shape below is the request/reply over
+that link:
 
 ```
 _dhtRpcRaw(peer, reqBytes):
@@ -230,9 +236,10 @@ peers can actually answer a DHT RPC?
 Reticulum announce advertises a *named destination* and is Ed25519‑signed; the
 destination hash cryptographically binds the name to the announcing identity
 (`dest_hash = sha256(name_hash || identity_hash)[:16]`, see
-[reticulum.md](reticulum.md) §2). An Aurora node announces a destination named
-**`geogram/dht`** (`_announceServiceDests` in `rns_service.dart`). No other software
-announces that name, so its `name_hash` is unique to our overlay.
+[reticulum.md](reticulum.md) §2). An Aurora node announces `geogram` destinations
+(`geogram/files`, `geogram/chat`, …) that no other software announces, so their
+`name_hash` is unique to our overlay. (We no longer announce `geogram/dht` itself —
+DHT RPC rides the chat dest, §4 — but the id is still derived from it locally.)
 
 So membership is a wire test, not a guess (`rns_service.dart`, `_onInbound`). A
 peer is added to the routing table when we hear **any** of its signed `geogram`
@@ -360,28 +367,24 @@ anchors hold records for many keys, so an indexer reaches the anti‑abuse
 `maxStoredKeys` cap (§9) sooner — a higher cap for indexers is a future knob (the
 caps are already constructor params).
 
-## 12. Remaining work (deferred — intentionally not built yet)
+## 12. Completed follow-ups (this is a fresh deployment — no old-node interop)
 
-The DHT is feature-complete for current needs; these are recorded follow-ups:
+The three items previously deferred are now done (no migration window to respect):
 
-- **Stop announcing `geogram/dht`.** Once the fleet has migrated to chat-routed
-  DHT (dual-accept everywhere, §4), the dedicated dht announce is redundant —
-  dropping it removes one of ~6 per-cycle service announces, helping the others
-  survive the hubs' announce budget. The Kademlia id needs no announce and
-  membership comes from the chat/files announces (§8). **Gated on migration:**
-  dropping it before dual-accept is universal would strand old nodes that still
-  dial the dht dest. Concrete change: drop `_aspectsDht` from the announce loop in
-  `rns_service._announceServiceDests` (keep the const + `dhtDestHash` for the id
-  and dual-accept).
+- **Stopped announcing `geogram/dht`** — DHT RPC rides the chat dest, so the dht
+  dest is never dialled; `_announceServiceDests` no longer sends it (one fewer
+  per-cycle announce → the others survive the hubs' budget more often). Membership
+  comes from the chat/files announces (§8); the Kademlia id is still derived from
+  `geogram/dht` locally. The legacy dual-accept and dht-dest fallback are removed —
+  we accept DHT links only on the RPC dest.
+- **MTU-aware reply sizing** (§3) — the DHT link does MTU discovery, and the FIND
+  reply caps scale from the 5/2 floor up to 64 contacts / 16 records on a large-MTU
+  link, cutting rounds on wide lookups.
+- **Chat-dest type discriminator** (§4) — link frames carry a 1-byte type tag
+  (`0x01` = DHT); non-DHT frames are ignored, reserving the chat dest for future
+  tenants.
 
-- **Reply fragmentation.** FIND replies are capped to one ~450 B packet (5
-  contacts / 2 records, §3), so wide result sets cost extra rounds. With link MTU
-  discovery in place ([reticulum.md](reticulum.md) §6), a reply could carry more,
-  or use multi-packet framing. **Minor** — the caps are adequate at this scale.
-
-- **Chat-dest type discriminator.** DHT RPC rides the chat destination's links
-  (§4); that is unambiguous today because chat itself uses no links, and
-  `handleEncoded` null-rejects any non-`DhtMessage` frame. Once migration is
-  complete (byte-identical payloads no longer needed for old-node interop),
-  reserve a 1-byte type tag on the first link frame so a future chat-over-links
-  feature can't collide with DHT traffic. **Gated on migration.**
+Residual: reply sizing only helps when the DHT link negotiates a large MTU (TCP
+paths); BLE/500-MTU links keep the small caps. Indexers (anchors) hold records for
+many keys, so they reach the `maxStoredKeys` cap (§9) sooner — a higher cap for
+indexers remains a future knob (the caps are constructor params).

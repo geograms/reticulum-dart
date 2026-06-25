@@ -94,21 +94,27 @@ class DhtNode {
   int providersDemoted = 0;
 
   // ── Responder side ───────────────────────────────────────────────────────
-  Future<DhtMessage> handle(DhtMessage req) async {
+  Future<DhtMessage> handle(DhtMessage req,
+      {int? maxContacts, int? maxRecords}) async {
+    // Reply sizes default to the one-small-packet caps, but the transport can
+    // raise them to fit a larger negotiated link MTU (fewer rounds on wide
+    // lookups). See file_node._onDhtServePacket.
+    final maxC = maxContacts ?? kDhtWireMaxContacts;
+    final maxR = maxRecords ?? kDhtWireMaxRecords;
     routing.add(req.sender); // learn whoever contacts us
     switch (req.op) {
       case DhtOp.ping:
         return DhtMessage.pong(myPub);
       case DhtOp.findNode:
         return DhtMessage.nodes(
-            myPub, _cap(routing.closest(req.target!, k), kDhtWireMaxContacts));
+            myPub, _cap(routing.closest(req.target!, k), maxC));
       case DhtOp.findValue:
         final key = dhtFileKey(req.sha!);
         final recs = _liveRecords(key, req.sha!);
         return recs.isNotEmpty
-            ? DhtMessage.valueRecords(myPub, _cap(recs, kDhtWireMaxRecords))
+            ? DhtMessage.valueRecords(myPub, _cap(recs, maxR))
             : DhtMessage.valueNodes(
-                myPub, _cap(routing.closest(key, k), kDhtWireMaxContacts));
+                myPub, _cap(routing.closest(key, k), maxC));
       case DhtOp.store:
         final r = req.records.first;
         // Anti-abuse: refuse over-cap STOREs BEFORE the signature verify so a
@@ -130,10 +136,12 @@ class DhtNode {
   }
 
   /// Wire entry point for the live transport.
-  Future<Uint8List?> handleEncoded(Uint8List raw) async {
+  Future<Uint8List?> handleEncoded(Uint8List raw,
+      {int? maxContacts, int? maxRecords}) async {
     final m = DhtMessage.decode(raw);
     if (m == null) return null;
-    return (await handle(m)).encode();
+    return (await handle(m, maxContacts: maxContacts, maxRecords: maxRecords))
+        .encode();
   }
 
   // ── Initiator side ─────────────────────────────────────────────────────────

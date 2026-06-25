@@ -98,8 +98,6 @@ class FileTransferNode {
   final List<String> rpcAspects;
   late final Uint8List rpcDestHash =
       RnsDestination.hash(identity, rpcApp, rpcAspects);
-  late final bool _rpcIsDht =
-      RnsCrypto.constantTimeEquals(rpcDestHash, dhtDestHash);
 
   final Map<String, _ServeEntry> _serve = {}; // link_id hex -> serve
   final Map<String, _FetchEntry> _fetch = {}; // link_id hex -> fetch
@@ -310,15 +308,12 @@ class FileTransferNode {
         await _acceptLink(p, arrivalHwMtu);
         return true;
       }
-      // Accept DHT links on the configured RPC dest (e.g. the chat dest) AND on
-      // the legacy geogram/dht dest, so a node updated to route DHT over chat is
-      // still reachable by peers still dialling the old dht dest (migration). The
-      // files dest is matched first above, and chat/files/dht are disjoint, so a
-      // real file link is never mis-accepted as DHT.
+      // Accept DHT links on the configured RPC dest (the chat dest in Aurora; the
+      // geogram/dht dest by default). The files dest is matched first above and
+      // the dests are disjoint, so a real file link is never mis-accepted as DHT.
       if (dht != null &&
-          (RnsCrypto.constantTimeEquals(p.destHash, rpcDestHash) ||
-              RnsCrypto.constantTimeEquals(p.destHash, dhtDestHash))) {
-        await _acceptDhtLink(p);
+          RnsCrypto.constantTimeEquals(p.destHash, rpcDestHash)) {
+        await _acceptDhtLink(p, arrivalHwMtu);
         return true;
       }
     }
@@ -705,7 +700,6 @@ class FileTransferNode {
   Future<DhtMessage?> _dhtSendRpc(DhtContact to, DhtMessage req) async {
     final reqBytes = req.encode();
     final rpcHash = RnsDestination.hash(to.identity, rpcApp, rpcAspects);
-    final dhtHash = RnsDestination.hash(to.identity, kDhtApp, kDhtAspects);
     // A STORE's ACK arrives a full extra round-trip after the data is already
     // stored, and publish fans out wide (contention), so its ACK routinely landed
     // just after the lookup-sized 6s wait — the publisher then logged the STORE
@@ -714,20 +708,8 @@ class FileTransferNode {
     final timeout = req.op == DhtOp.store
         ? const Duration(seconds: 12)
         : const Duration(seconds: 6);
-    // Primary: the configured RPC dest (e.g. the reliably-propagated chat dest),
-    // where a transport path actually exists.
-    var respBytes =
+    final respBytes =
         await _dhtRpcRaw(to.identity, reqBytes, rpcApp, rpcAspects, timeout: timeout);
-    // Free fallback to the legacy geogram/dht dest for peers running older code
-    // that only accept DHT links there — but ONLY if we already hold a cached
-    // path to it. We never pay a fresh path request for the dht dest: "no dht
-    // path" is the common failing case that moving RPC to chat exists to fix.
-    if (respBytes == null &&
-        !_rpcIsDht &&
-        (hasPathForDest?.call(dhtHash) ?? false)) {
-      respBytes = await _dhtRpcRaw(to.identity, reqBytes, kDhtApp, kDhtAspects,
-          timeout: timeout);
-    }
     // Routing-table liveness (eviction). A reply proves the contact is alive. A
     // failure is only a DEATH signal when we actually had a route to try AND it
     // was a lookup: a no-route skip is about OUR paths (e.g. unwarmed at boot,
@@ -740,8 +722,7 @@ class FileTransferNode {
       if (respBytes != null) {
         d.routing.recordSuccess(to);
       } else if (req.op != DhtOp.store &&
-          ((hasPathForDest?.call(rpcHash) ?? false) ||
-              (hasPathForDest?.call(dhtHash) ?? false))) {
+          (hasPathForDest?.call(rpcHash) ?? false)) {
         d.routing.recordFailure(to);
       }
     }
@@ -770,6 +751,10 @@ class FileTransferNode {
     if (!(hasPathForDest?.call(destHash) ?? (hop != null))) return null;
     final link = await RnsLink.initiator(peer, app, aspects);
     link.nextHop = hop;
+    // Offer the next-hop MTU so the link negotiates a larger size over TCP — lets
+    // FIND replies carry more contacts/records per packet (sized in
+    // _onDhtServePacket), fewer rounds. Falls back to 500 on BLE/old peers.
+    link.offerMtu(nextHopMtuForDest?.call(destHash) ?? kRnsMtu);
     final reqPkt = link.buildRequest();
     final id = _hex(link.linkId!);
     final e = _DhtRpcEntry(link, reqBytes);
@@ -780,9 +765,10 @@ class FileTransferNode {
     return resp;
   }
 
-  Future<void> _acceptDhtLink(RnsPacket request) async {
+  Future<void> _acceptDhtLink(RnsPacket request, int arrivalHwMtu) async {
     try {
-      final link = await RnsLink.responder(identity, request);
+      final link =
+          await RnsLink.responder(identity, request, arrivalHwMtu: arrivalHwMtu);
       final id = _hex(link.linkId!);
       _dhtServeLinks[id] = link;
       _dhtServeOrder.add(id);
@@ -801,16 +787,23 @@ class FileTransferNode {
       return;
     }
     if (p.context == RnsContext.none) {
-      final reqBytes = link.decrypt(p);
-      // Safe even though the RPC dest may be shared with chat: handleEncoded does
-      // DhtMessage.decode and returns null for anything that isn't a DHT op, so a
-      // non-DHT frame simply gets no reply (and the link ages out of the LRU map)
-      // rather than being misinterpreted. We deliberately keep the payload a bare
-      // DhtMessage (no type byte) so chat-routed and dht-routed RPCs stay
-      // byte-identical for the mixed-fleet migration.
-      final respBytes = await dht?.handleEncoded(reqBytes);
+      // The RPC dest is shared with chat, so every link frame carries a 1-byte
+      // type tag: we only treat DHT-tagged frames as DHT. Anything else is some
+      // other (future) tenant of the chat dest and is ignored here — the tag
+      // reserves the namespace so a chat-over-links feature can't collide.
+      final body = _untagDht(link.decrypt(p));
+      if (body == null) return;
+      // Size the FIND reply to the link's negotiated MTU: a large-MTU (TCP/chat)
+      // link carries far more contacts/records in one packet than the 500-MTU
+      // floor, cutting lookup rounds. ~162 B covers the msg header + token/packet
+      // overhead + type tag; 64 B per contact, ~185 B per record.
+      final budget = link.mtu - 162;
+      final maxC = (budget ~/ 64).clamp(kDhtWireMaxContacts, 64);
+      final maxR = (budget ~/ 185).clamp(kDhtWireMaxRecords, 16);
+      final respBytes =
+          await dht?.handleEncoded(body, maxContacts: maxC, maxRecords: maxR);
       if (respBytes != null) {
-        send(link.encrypt(respBytes, context: RnsContext.none).pack());
+        send(link.encrypt(_tagDht(respBytes), context: RnsContext.none).pack());
       }
     }
   }
@@ -824,15 +817,26 @@ class FileTransferNode {
           return;
         }
         send(rtt.pack());
-        send(e.link.encrypt(e.reqBytes, context: RnsContext.none).pack());
+        send(e.link.encrypt(_tagDht(e.reqBytes), context: RnsContext.none).pack());
         e.sent = true;
       }
       return;
     }
     if (p.context == RnsContext.none && !e.done.isCompleted) {
-      e.done.complete(e.link.decrypt(p));
+      e.done.complete(_untagDht(e.link.decrypt(p)));
     }
   }
+
+  // Chat-dest link frames are type-tagged so DHT can share the destination with
+  // future tenants: a DHT frame is [0x01, ...DhtMessage]. _untagDht returns the
+  // body for a DHT-tagged frame, or null for anything else.
+  static const int _kDhtFrame = 0x01;
+  static Uint8List _tagDht(Uint8List body) =>
+      Uint8List.fromList([_kDhtFrame, ...body]);
+  static Uint8List? _untagDht(Uint8List frame) =>
+      (frame.isNotEmpty && frame[0] == _kDhtFrame)
+          ? Uint8List.sublistView(frame, 1)
+          : null;
 
   static String _hex(List<int> b) =>
       b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();

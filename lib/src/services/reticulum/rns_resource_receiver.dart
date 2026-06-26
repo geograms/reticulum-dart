@@ -60,6 +60,21 @@ class RnsResourceReceiver {
   Uint8List _originalHash = Uint8List(0);
   final BytesBuilder _assembled = BytesBuilder(); // completed segments' plaintext
 
+  // Resume state (set by [preloadResume] before the first advertisement). On a
+  // resumed transfer the first advertisement we see is segment > 1, so we adopt
+  // its original_hash / total_segments instead of treating it as a fresh start,
+  // and we DON'T clear the preloaded [_assembled]. _resumeFromSegment is the
+  // number of segments already held (the 0-based index of the first segment we
+  // expect to receive); _expectedTotal is the full payload size we resumed from,
+  // used to reject a provider serving a different-length file.
+  int _resumeFromSegment = -1;
+  int _expectedTotal = 0;
+
+  // The plaintext of the just-completed segment + its 0-based index, surfaced so
+  // the owner can persist completed segments for resume (see takeJustCompletedSegment).
+  Uint8List? _lastSegData;
+  int _lastSegIndex = -1;
+
   // Current-segment state.
   int _n = 0; // parts in this segment
   int _transferSize = 0; // encrypted stream size
@@ -110,6 +125,36 @@ class RnsResourceReceiver {
     return n;
   }
 
+  /// The resource's TOTAL payload size (all segments), known from the first
+  /// advertisement's `d` field; 0 until then. Enables a real progress percentage.
+  int get totalBytes => _dataSize;
+
+  /// Seed a resumed transfer: [bytes] is the plaintext of the already-held
+  /// segments (exactly [segmentsComplete] * kMaxEfficientSize bytes), [total] the
+  /// full payload size we resumed from. Call BEFORE feeding the first (resumed)
+  /// advertisement; the receiver then appends segments [segmentsComplete]..end.
+  void preloadResume(
+      {required Uint8List bytes,
+      required int total,
+      required int segmentsComplete}) {
+    _assembled.clear();
+    _assembled.add(bytes);
+    _resumeFromSegment = segmentsComplete;
+    _expectedTotal = total;
+  }
+
+  /// The plaintext of the most recently completed NON-final segment and its
+  /// 0-based index, then clears it. Returns null when nothing new completed (or
+  /// the completed segment was the final one — that is exposed via [payload]).
+  /// Lets the owner persist completed segments for resume without this state
+  /// machine knowing about storage.
+  ({int index, Uint8List data})? takeJustCompletedSegment() {
+    final d = _lastSegData;
+    if (d == null) return null;
+    _lastSegData = null;
+    return (index: _lastSegIndex, data: d);
+  }
+
   /// Parse a link-decrypted RESOURCE_ADV and set up the next segment. Returns
   /// false on a malformed advertisement (the caller drops the resource). For an
   /// empty segment (n == 0) the segment completes immediately.
@@ -137,8 +182,24 @@ class RnsResourceReceiver {
         _originalHash = origin;
         _totalSegments = segTotal < 1 ? 1 : segTotal;
         _assembled.clear();
-      } else if (_originalHash.isNotEmpty &&
-          !RnsCrypto.constantTimeEquals(origin, _originalHash)) {
+      } else if (_originalHash.isEmpty) {
+        // First advertisement of a RESUMED transfer (segment > 1). Adopt the
+        // sender's original_hash / total_segments and KEEP the preloaded bytes,
+        // after verifying the provider continues the SAME file from where we left
+        // off. A mismatch fails the receiver, so the owner discards the partial
+        // and falls back to a full fetch from segment 0.
+        if (_resumeFromSegment < 0) {
+          return _fail('unexpected mid-stream segment without resume');
+        }
+        if (_expectedTotal > 0 && _dataSize != _expectedTotal) {
+          return _fail('resume total mismatch'); // different-length file
+        }
+        if (segIndex - 1 != _resumeFromSegment) {
+          return _fail('resume segment misaligned');
+        }
+        _originalHash = origin;
+        _totalSegments = segTotal < 1 ? 1 : segTotal;
+      } else if (!RnsCrypto.constantTimeEquals(origin, _originalHash)) {
         return _fail('segment original_hash mismatch');
       }
       _segIndex = segIndex - 1;
@@ -401,6 +462,11 @@ class RnsResourceReceiver {
       }
       _payload = full;
       _complete = true;
+    } else {
+      // Non-final segment: surface its plaintext so the owner can persist it for
+      // resume (the final segment is delivered whole via [payload] instead).
+      _lastSegData = Uint8List.fromList(segData);
+      _lastSegIndex = _segIndex;
     }
     return true;
   }

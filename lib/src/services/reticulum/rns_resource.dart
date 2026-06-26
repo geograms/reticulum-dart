@@ -80,6 +80,24 @@ class RnsResourceSender {
     _originalHash = _resourceHash;
   }
 
+  /// Prepare the resource starting at [startSegment] (resumed download — the
+  /// fetcher already holds segments 0..startSegment-1). Out-of-range starts fall
+  /// back to a whole-file [prepare]. The advertised `original_hash` is this
+  /// resume segment's own hash; it is per-session random and need not match the
+  /// original transfer's (the fetcher adopts it for intra-session segment-linking
+  /// only). [validateProof] then advances startSegment+1..end normally.
+  void prepareFrom(int startSegment) {
+    totalSegments =
+        payload.isEmpty ? 1 : ((payload.length - 1) ~/ kMaxEfficientSize) + 1;
+    if (startSegment <= 0 || startSegment >= totalSegments) {
+      _prepareSegment(0);
+      _originalHash = _resourceHash;
+      return;
+    }
+    _prepareSegment(startSegment);
+    _originalHash = _resourceHash;
+  }
+
   void _prepareSegment(int idx) {
     _segIndex = idx;
     _rmch = 0; // each segment's hashmap is requested from the start

@@ -9,8 +9,14 @@
  * DATA packet with context=none.
  *
  * Wire commands (plaintext of a context-none link DATA):
- *   0x01 GET_FILE   + fileHash(32)                 (fetch the whole file)
- *   0x81 NOT_FOUND  + fileHash(32)                 (provider -> fetcher)
+ *   0x01 GET_FILE      + fileHash(32)              (fetch the whole file)
+ *   0x02 GET_FILE_FROM + fileHash(32) + seg(2 BE)  (resume: serve from segment N)
+ *   0x81 NOT_FOUND     + fileHash(32)              (provider -> fetcher)
+ *
+ * GET_FILE_FROM lets a fetcher that already holds segments 0..N-1 (persisted to a
+ * PartialStore) ask the provider to start the Resource at segment N. A provider
+ * that predates this op simply ignores it; the fetcher detects the silence and
+ * falls back to a full GET_FILE (FileTransferNode drives that probe + fallback).
  *
  * A GET_FILE is answered with the file's bytes as a single Resource. Integrity:
  * the Resource verifies each part + each segment; the fetcher additionally checks
@@ -35,9 +41,11 @@ import '../reticulum/rns_link.dart';
 import '../reticulum/rns_packet.dart';
 import '../reticulum/rns_resource.dart';
 import '../reticulum/rns_resource_receiver.dart';
+import 'partial_store.dart';
 import 'serve_quota.dart';
 
 const int kOpGetFile = 0x01;
+const int kOpGetFileFrom = 0x02; // + fileHash(32) + startSegment(2 BE): resume
 const int kOpNotFound = 0x81;
 const int kOpPutOffer = 0x03;
 const int kOpPutReject = 0x82;
@@ -233,6 +241,16 @@ class FileServeSession {
       onServed?.call(Uint8List.fromList(fileHash));
       return _serveResource(bytes, fileHash);
     }
+    if (op == kOpGetFileFrom && cmd.length >= 1 + 32 + 2) {
+      // Resume: serve the Resource starting at segment N (the fetcher holds 0..N-1).
+      final fileHash = Uint8List.sublistView(cmd, 1, 33);
+      final startSeg = (cmd[33] << 8) | cmd[34];
+      final bytes = source.read(fileHash);
+      if (bytes == null) return [_notFound(fileHash)];
+      if (!_allow(fileHash, bytes.length)) return [_notFound(fileHash)];
+      onServed?.call(Uint8List.fromList(fileHash));
+      return _serveResource(bytes, fileHash, startSegment: startSeg);
+    }
     if (op == kOpPutOffer && cmd.length >= 1 + 32 + 8 + 1) {
       // [0x03][sha32][size8][extLen1][ext][pub32][sig64]
       final sha = Uint8List.sublistView(cmd, 1, 33);
@@ -286,11 +304,22 @@ class FileServeSession {
     return q.canServe(requesterId, fileHash, bytes);
   }
 
-  List<RnsPacket> _serveResource(Uint8List payload, Uint8List fileHash) {
+  List<RnsPacket> _serveResource(Uint8List payload, Uint8List fileHash,
+      {int startSegment = 0}) {
     final s = RnsResourceSender(link, payload);
-    s.prepare();
+    final total =
+        payload.isEmpty ? 1 : ((payload.length - 1) ~/ kMaxEfficientSize) + 1;
+    var from = startSegment;
+    if (from > 0 && from < total) {
+      s.prepareFrom(from); // resume from segment N
+    } else {
+      s.prepare();
+      from = 0; // out of range -> serve the whole file (client's d-guard catches a mismatch)
+    }
     _sender = s;
-    quota?.record(requesterId, fileHash, payload.length);
+    // Record only the bytes we actually serve (a resume sends fewer than the full file).
+    final served = payload.length - from * kMaxEfficientSize;
+    quota?.record(requesterId, fileHash, served < 0 ? 0 : served);
     return [s.advertisementPacket()];
   }
 
@@ -313,13 +342,25 @@ class FileFetchSession {
   final RnsLink link;
   final Uint8List wantHash; // requested file id (sha256, 32B)
 
+  /// Resume descriptor (already-held segment-aligned prefix). Null = fetch from 0.
+  final ResumeState? resume;
+
+  /// Called when a NON-final segment completes, with its 0-based index and
+  /// plaintext, so the owner can persist it to a PartialStore for resume.
+  final void Function(int index, Uint8List segData)? onSegment;
+
   FileFetchState state = FileFetchState.idle;
   String? error;
   Uint8List? result; // assembled, verified file bytes
 
+  /// Set when a resumed transfer was rejected by a resume-integrity guard
+  /// (provider serves a different/length-mismatched file, or doesn't honour the
+  /// resume) — the owner should discard the partial and retry from segment 0.
+  bool resumeRejected = false;
+
   late final RnsResourceReceiver _rx = RnsResourceReceiver(link);
 
-  FileFetchSession(this.link, this.wantHash);
+  FileFetchSession(this.link, this.wantHash, {this.resume, this.onSegment});
 
   /// Bytes received so far (for a progress display).
   int get receivedBytes => _rx.receivedBytes;
@@ -327,13 +368,18 @@ class FileFetchSession {
   /// Compact receiver state for stall diagnostics.
   String get debugState => _rx.debugState;
 
-  /// Total size is unknown until the transfer completes (segments are advertised
-  /// one at a time), so progress is indeterminate; returns 0.
-  int get totalBytes => 0;
+  /// Total payload size once the first advertisement arrives (0 before that).
+  int get totalBytes => _rx.totalBytes;
 
-  /// Begin: returns the GET_FILE packet to send.
+  /// Begin: returns the GET_FILE (or, when resuming, GET_FILE_FROM) packet to send.
   RnsPacket start() {
     state = FileFetchState.fetching;
+    final r = resume;
+    if (r != null && r.segmentsComplete >= 1) {
+      _rx.preloadResume(
+          bytes: r.bytes, total: r.total, segmentsComplete: r.segmentsComplete);
+      return _cmdGetFileFrom(wantHash, r.segmentsComplete);
+    }
     return _cmd(kOpGetFile, wantHash);
   }
 
@@ -352,7 +398,15 @@ class FileFetchSession {
     }
     // resourceAdv / resourceHmu / resource → the shared multi-segment driver.
     final out = _rx.handle(p);
-    if (_rx.error != null) return _fail('resource error: ${_rx.error}');
+    if (_rx.error != null) {
+      // A resume-integrity guard tripped → tell the owner to drop the partial and
+      // retry from 0 rather than abandon the file.
+      if (_rx.error!.contains('resume')) resumeRejected = true;
+      return _fail('resource error: ${_rx.error}');
+    }
+    // Persist each completed non-final segment for resume.
+    final seg = _rx.takeJustCompletedSegment();
+    if (seg != null) onSegment?.call(seg.index, seg.data);
     if (_rx.complete) _finish();
     return out;
   }
@@ -385,6 +439,15 @@ class FileFetchSession {
     final b = BytesBuilder()
       ..addByte(op)
       ..add(arg);
+    return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
+
+  RnsPacket _cmdGetFileFrom(Uint8List hash, int startSegment) {
+    final b = BytesBuilder()
+      ..addByte(kOpGetFileFrom)
+      ..add(hash)
+      ..addByte((startSegment >> 8) & 0xff)
+      ..addByte(startSegment & 0xff);
     return link.encrypt(b.toBytes(), context: RnsContext.none);
   }
 }

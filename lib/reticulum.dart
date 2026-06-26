@@ -77,6 +77,7 @@ export 'src/services/files/file_manifest.dart';
 export 'src/services/files/file_node.dart';
 export 'src/services/files/file_transfer.dart';
 export 'src/services/files/media_file_source.dart';
+export 'src/services/files/partial_store.dart';
 // provider_connection.dart removed — superseded by whole-file Resource transfer.
 export 'src/services/files/serve_quota.dart';
 export 'src/services/files/serve_stats.dart';

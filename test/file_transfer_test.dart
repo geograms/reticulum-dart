@@ -6,6 +6,7 @@
  * wire. A whole file rides ONE Resource (segmented/HMU/windowed by the Resource
  * layer), so large files (55 MB, 107 MB) transfer with no size cap.
  */
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
@@ -133,6 +134,158 @@ void main() {
       final got = await fetcher.fetch(realHash, provPub,
           timeout: const Duration(seconds: 10));
       expect(got, isNull, reason: 'tampered bytes must not verify as the id');
+    });
+  });
+
+  group('resumable downloads', () {
+    final M = kMaxEfficientSize; // segment size (1048575)
+
+    // Provider holding [providerSource] + fetcher whose downloads persist to
+    // [store] (so a fetch resumes from a pre-seeded partial). Loopback-wired.
+    Future<(FileTransferNode fetcher, RnsIdentity providerPub)> pairResumable(
+        FileSource providerSource, PartialStore store) async {
+      final provId = await RnsIdentity.generate();
+      final fetchId = await RnsIdentity.generate();
+      final loopProvider = _Loop();
+      final loopFetcher = _Loop();
+      loopProvider.node = FileTransferNode(
+        identity: provId,
+        source: providerSource,
+        send: (raw) => loopFetcher.deliver(raw),
+      );
+      loopFetcher.node = FileTransferNode(
+        identity: fetchId,
+        source: const EmptyFileSource(),
+        send: (raw) => loopProvider.deliver(raw),
+        partialStore: store,
+      );
+      return (loopFetcher.node, RnsIdentity.fromPublicKey(provId.getPublicKey()));
+    }
+
+    // Pre-seed the first [segs] complete segments of [file] into [store] — exactly
+    // what an interrupted download leaves behind.
+    Future<void> seed(PartialStore store, Uint8List hash, Uint8List file,
+        int segs, int total) async {
+      for (var i = 0; i < segs; i++) {
+        await store.appendSegment(
+            hash, i, Uint8List.sublistView(file, i * M, (i + 1) * M),
+            total: total);
+      }
+    }
+
+    late Directory tmp;
+    setUp(() => tmp = Directory.systemTemp.createTempSync('rns_partial'));
+    tearDown(() {
+      if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+    });
+
+    test('resumes from a pre-seeded partial (serves only the tail)', () async {
+      final file = _bytes(M * 2 + 40000, seed: 4242); // 3 segments, last short
+      final hash = _sha(file);
+      final store = FilePartialStore(tmp);
+      await seed(store, hash, file, 2, file.length); // first 2 segments held
+
+      final (fetcher, provPub) = await pairResumable(MemoryFileSource()..add(file), store);
+      final got =
+          await fetcher.fetch(hash, provPub, timeout: const Duration(minutes: 2));
+
+      expect(got, isNotNull);
+      expect(got!.length, file.length);
+      expect(_sha(got), equals(hash), reason: 'resumed assembly must verify');
+      // Partial dropped on success (give the fire-and-forget delete a moment).
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(await store.load(hash), isNull, reason: 'partial cleared on success');
+    }, timeout: const Timeout(Duration(minutes: 2)));
+
+    test('resume across an exact segment boundary (no short tail)', () async {
+      final file = _bytes(M * 4, seed: 7); // exactly 4 full segments
+      final hash = _sha(file);
+      final store = FilePartialStore(tmp);
+      await seed(store, hash, file, 2, file.length);
+      final (fetcher, provPub) = await pairResumable(MemoryFileSource()..add(file), store);
+      final got =
+          await fetcher.fetch(hash, provPub, timeout: const Duration(minutes: 2));
+      expect(got, isNotNull);
+      expect(_sha(got!), equals(hash));
+    }, timeout: const Timeout(Duration(minutes: 2)));
+
+    test('d-guard: a wrong total triggers fallback to a full fetch', () async {
+      final file = _bytes(M * 4 + 1000, seed: 11); // 5 segments
+      final hash = _sha(file);
+      final store = FilePartialStore(tmp);
+      // Valid prefix bytes, but claim a wrong total -> the first resumed
+      // advertisement's d != stored total -> resume rejected -> restart full.
+      await seed(store, hash, file, 2, file.length + 999999);
+      final (fetcher, provPub) = await pairResumable(MemoryFileSource()..add(file), store);
+      final got =
+          await fetcher.fetch(hash, provPub, timeout: const Duration(minutes: 2));
+      expect(got, isNotNull, reason: 'must recover via a full fetch');
+      expect(_sha(got!), equals(hash));
+    }, timeout: const Timeout(Duration(minutes: 2)));
+
+    test('safety net: a wrong-content prefix fails sha then recovers full', () async {
+      final file = _bytes(M * 3 + 5000, seed: 21); // 4 segments
+      final other = _bytes(M * 3 + 5000, seed: 22); // SAME length, different bytes
+      final hash = _sha(file);
+      final store = FilePartialStore(tmp);
+      // Seed a wrong prefix at the SAME total: d-guard passes, segments serve the
+      // real tail, but assembled (wrong prefix + real tail) fails the final sha
+      // -> partial discarded -> full re-fetch yields the real file.
+      await seed(store, hash, other, 2, file.length);
+      final (fetcher, provPub) = await pairResumable(MemoryFileSource()..add(file), store);
+      final got =
+          await fetcher.fetch(hash, provPub, timeout: const Duration(minutes: 2));
+      expect(got, isNotNull);
+      expect(_sha(got!), equals(hash), reason: 'final sha safety net recovers');
+    }, timeout: const Timeout(Duration(minutes: 2)));
+
+    test('sub-1MB file leaves no partial (nothing to resume)', () async {
+      final file = _bytes(300 * 1024, seed: 5);
+      final hash = _sha(file);
+      final store = FilePartialStore(tmp);
+      final (fetcher, provPub) = await pairResumable(MemoryFileSource()..add(file), store);
+      final got = await fetcher.fetch(hash, provPub);
+      expect(got, isNotNull);
+      expect(_sha(got!), equals(hash));
+      expect(await store.load(hash), isNull);
+    });
+
+    test('FilePartialStore: append, load, self-heal torn tail, delete', () async {
+      final store = FilePartialStore(tmp);
+      final file = _bytes(M * 3, seed: 33);
+      final hash = _sha(file);
+      await store.appendSegment(hash, 0, Uint8List.sublistView(file, 0, M),
+          total: file.length);
+      await store.appendSegment(hash, 1, Uint8List.sublistView(file, M, 2 * M),
+          total: file.length);
+      final rs = await store.load(hash);
+      expect(rs, isNotNull);
+      expect(rs!.segmentsComplete, 2);
+      expect(rs.total, file.length);
+      expect(rs.bytes.length, 2 * M);
+      expect(rs.bytes, equals(Uint8List.sublistView(file, 0, 2 * M)));
+
+      // Simulate a torn tail (a 3rd segment half-written, meta still says 2).
+      final sha = hash.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+      final raf = await File('${tmp.path}/$sha.part').open(mode: FileMode.writeOnlyAppend);
+      await raf.writeFrom(Uint8List(12345));
+      await raf.close();
+      final healed = await store.load(hash);
+      expect(healed, isNotNull);
+      expect(healed!.bytes.length, 2 * M, reason: 'torn tail truncated to boundary');
+
+      await store.delete(hash);
+      expect(await store.load(hash), isNull);
+    });
+
+    test('FilePartialStore.gc reclaims by age', () async {
+      final store = FilePartialStore(tmp);
+      final h = _sha(_bytes(10, seed: 1));
+      final file = _bytes(M, seed: 2);
+      await store.appendSegment(h, 0, file, total: M * 2);
+      expect(await store.load(h), isNotNull);
+      await store.gc(maxAge: Duration.zero); // everything is "stale"
+      expect(await store.load(h), isNull);
     });
   });
 }

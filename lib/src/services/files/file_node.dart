@@ -25,6 +25,7 @@ import 'dht/dht_message.dart';
 import 'dht/dht_node.dart';
 import 'dht/provider_record.dart';
 import 'file_transfer.dart';
+import 'partial_store.dart';
 import 'serve_quota.dart';
 
 const String kFilesApp = 'geogram';
@@ -44,6 +45,12 @@ class _FetchEntry {
   Timer? timeout;
   Timer? retry; // periodic stall-recovery (re-request missing parts)
   Duration baseTimeout = const Duration(minutes: 20);
+  // Resume bookkeeping: whether this attempt started in resume mode, whether we
+  // already fell back to a full fetch on this link, and a serial chain so
+  // completed segments persist to the PartialStore in order.
+  bool resumeUsed = false;
+  bool restartedFull = false;
+  Future<void> persist = Future.value();
   _FetchEntry(this.link, this.fileHash, this.done);
 }
 
@@ -99,8 +106,16 @@ class FileTransferNode {
   late final Uint8List rpcDestHash =
       RnsDestination.hash(identity, rpcApp, rpcAspects);
 
+  /// Persists segment-aligned partial downloads so a fetch resumes after a drop
+  /// or app restart (generic — every fetch consumer benefits). Null = no resume
+  /// (today's in-memory, all-or-nothing behaviour).
+  final PartialStore? partialStore;
+
   final Map<String, _ServeEntry> _serve = {}; // link_id hex -> serve
   final Map<String, _FetchEntry> _fetch = {}; // link_id hex -> fetch
+  // Coalesce concurrent fetches of the SAME file (content-addressed) so two
+  // callers can't race the same .part / open competing links.
+  final Map<String, Future<Uint8List?>> _inflightBySha = {};
   // DHT links: responder links we host, and in-flight outbound RPC links.
   final Map<String, RnsLink> _dhtServeLinks = {};
   final List<String> _dhtServeOrder = [];
@@ -193,6 +208,7 @@ class FileTransferNode {
     this.dhtK = 96,
     this.dhtAlpha = 12,
     this.stableAnchors,
+    this.partialStore,
   }) : serveQuota = serveQuota ?? ServeQuota() {
     if (enableDht) {
       // k is sized to COVER the whole (small, tens-of-nodes) overlay, not the
@@ -391,7 +407,24 @@ class FileTransferNode {
     Uint8List fileHash,
     RnsIdentity providerPublicIdentity, {
     Duration timeout = const Duration(minutes: 20),
-  }) async {
+  }) {
+    // Coalesce concurrent fetches of the SAME content-addressed file so callers
+    // can't race the same partial / open competing links. Any provider yields the
+    // same verified bytes.
+    final key = _hex(fileHash);
+    final existing = _inflightBySha[key];
+    if (existing != null) return existing;
+    final fut = _fetchWithRetries(fileHash, providerPublicIdentity, timeout)
+        .whenComplete(() => _inflightBySha.remove(key));
+    _inflightBySha[key] = fut;
+    return fut;
+  }
+
+  Future<Uint8List?> _fetchWithRetries(
+    Uint8List fileHash,
+    RnsIdentity providerPublicIdentity,
+    Duration timeout,
+  ) async {
     // The link handshake (request -> proof -> RTT) can be lost over a lossy,
     // high-RTT cross-network path: the responder's LRPROOF in particular is sent
     // on all interfaces and a copy can be dropped before it returns. Re-sending
@@ -444,6 +477,7 @@ class FileTransferNode {
     const maxTransferStalls = 75;
     var lastSeen = -1;
     var stalls = 0;
+    var probeTicks = 0;
     entry.retry = Timer.periodic(tick, (_) {
       final f = entry.fetch;
       if (f == null) {
@@ -451,6 +485,17 @@ class FileTransferNode {
           entry.done.complete(null); // handshake never completed -> retry
         }
         return;
+      }
+      // Resume probe: a provider that predates GET_FILE_FROM never advertises a
+      // segment for our resume request. After ~8s of silence, fall back to a full
+      // fetch on the same (still-active) link instead of stalling for minutes.
+      if (entry.resumeUsed && !entry.restartedFull && f.totalBytes == 0) {
+        if (++probeTicks >= 2) {
+          log?.call('files: resume not answered, full fetch ${_hex(fileHash)}');
+          // ignore: discarded_futures
+          _restartFull(entry);
+          return;
+        }
       }
       final got = f.receivedBytes;
       if (got != lastSeen) {
@@ -478,6 +523,15 @@ class FileTransferNode {
     entry.timeout?.cancel();
     entry.retry?.cancel();
     _fetch.remove(id);
+    if (result != null && partialStore != null) {
+      // Whole file in hand — drop any partial (after pending segment writes flush).
+      // ignore: discarded_futures
+      entry.persist
+          .then((_) => partialStore!.delete(fileHash))
+          .catchError((Object err) {
+        log?.call('files: partial delete failed: $err');
+      });
+    }
     return (result, entry.fetch != null);
   }
 
@@ -491,9 +545,7 @@ class FileTransferNode {
           return;
         }
         send(rtt.pack());
-        final f = FileFetchSession(e.link, e.fileHash);
-        e.fetch = f;
-        send(f.start().pack());
+        await _startSession(e); // loads any partial → GET_FILE_FROM, else GET_FILE
       }
       return;
     }
@@ -504,13 +556,73 @@ class FileTransferNode {
     }
     final got = f.receivedBytes;
     if (got > 0) {
-      _fetchProgress[_hex(e.fileHash)] = (received: got, total: 0);
+      _fetchProgress[_hex(e.fileHash)] = (received: got, total: f.totalBytes);
     }
     if (f.state == FileFetchState.done) {
       _finishFetch(e, f.result, null);
     } else if (f.state == FileFetchState.failed) {
+      // A resumed transfer rejected (unsupported / different file) or that failed
+      // the final sha → discard the partial and retry from segment 0 on this same
+      // link rather than abandoning the file.
+      if (e.resumeUsed && !e.restartedFull) {
+        await _restartFull(e);
+        return;
+      }
       _finishFetch(e, null, f.error);
     }
+  }
+
+  /// Build the fetch session once the link is active: load any persisted partial
+  /// and resume from it (GET_FILE_FROM), else fetch the whole file (GET_FILE).
+  Future<void> _startSession(_FetchEntry e) async {
+    ResumeState? resume;
+    final store = partialStore;
+    if (store != null) {
+      try {
+        resume = await store.load(e.fileHash);
+      } catch (err) {
+        log?.call('files: partial load failed: $err');
+      }
+    }
+    if (e.done.isCompleted) return; // a probe/timeout may have fired meanwhile
+    e.resumeUsed = resume != null;
+    final f = FileFetchSession(e.link, e.fileHash,
+        resume: resume, onSegment: _segmentPersister(e));
+    e.fetch = f;
+    send(f.start().pack());
+  }
+
+  /// Restart this fetch as a full (segment-0) transfer on the same active link —
+  /// after a resume was rejected or went unanswered. Drops the unusable partial.
+  Future<void> _restartFull(_FetchEntry e) async {
+    e.restartedFull = true;
+    e.resumeUsed = false;
+    final store = partialStore;
+    if (store != null) {
+      try {
+        await store.delete(e.fileHash);
+      } catch (_) {}
+    }
+    if (e.done.isCompleted) return;
+    final f =
+        FileFetchSession(e.link, e.fileHash, onSegment: _segmentPersister(e));
+    e.fetch = f;
+    send(f.start().pack());
+  }
+
+  /// A per-fetch callback that serially persists each completed non-final segment
+  /// to the partial store (in completion order); null when no store is configured.
+  void Function(int, Uint8List)? _segmentPersister(_FetchEntry e) {
+    final store = partialStore;
+    if (store == null) return null;
+    return (idx, seg) {
+      final total = e.fetch?.totalBytes ?? 0;
+      e.persist = e.persist
+          .then((_) => store.appendSegment(e.fileHash, idx, seg, total: total))
+          .catchError((Object err) {
+        log?.call('files: partial append failed: $err');
+      });
+    };
   }
 
   void _finishFetch(_FetchEntry e, Uint8List? result, String? err) {

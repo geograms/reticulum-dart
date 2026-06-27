@@ -29,6 +29,8 @@ class RnsLanInterface implements RnsInterface {
   // must never shadow a data-capable (hub) path (see RnsTransport.ingest).
   @override
   bool get announceOnly => true;
+  @override
+  bool get edge => false;
   // Announce-only; never carries a link, so MTU discovery is irrelevant.
   @override
   int get hardwareMtu => kRnsMtu;

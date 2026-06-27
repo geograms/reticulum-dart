@@ -20,6 +20,8 @@ import 'rns_transport.dart';
 class _RnsTcpServerConn implements RnsInterface {
   @override
   bool get announceOnly => false;
+  @override
+  bool get edge => false;
   // TCP/HDLC carries arbitrary-size frames (link MTU discovery).
   @override
   int get hardwareMtu => kRnsLinkMtuMax;

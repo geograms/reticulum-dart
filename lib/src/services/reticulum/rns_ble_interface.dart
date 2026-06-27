@@ -54,6 +54,11 @@ class RnsBleInterface implements RnsInterface {
   final RnsBleRadio radio;
   @override
   final String label;
+  // True when this BLE interface is the edge of an edge-bridge node (see
+  // RnsTransport.edgeBridge): announces are propagated edge→core but the core
+  // flood is never re-aired onto it.
+  @override
+  final bool edge;
   final void Function(Uint8List packetRaw) onPacket;
   final void Function(String msg)? log;
 
@@ -69,6 +74,7 @@ class RnsBleInterface implements RnsInterface {
     required this.radio,
     required this.onPacket,
     this.label = 'ble',
+    this.edge = false,
     this.log,
   }) {
     radio.onReceive((frame) {

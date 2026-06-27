@@ -44,6 +44,13 @@ abstract class RnsInterface {
   /// over this interface stay at the 500-byte protocol MTU. Interfaces that can
   /// carry larger frames (TCP) override this to negotiate bigger resource parts.
   int get hardwareMtu => kRnsMtu;
+
+  /// True for low-capacity EDGE interfaces (e.g. BLE) when this node is an
+  /// [RnsTransport.edgeBridge]. The bridge propagates announces heard on an edge
+  /// UP onto core interfaces, but never re-airs the core (internet) announce
+  /// flood back onto an edge — that would saturate BLE and starve APRS. Default
+  /// false.
+  bool get edge => false;
 }
 
 class RnsPathEntry {
@@ -80,6 +87,16 @@ class RnsTransport {
   /// announces onto its other interfaces, tagged with [transportId] (16-byte
   /// relay identity hash).
   Uint8List? transportId;
+
+  /// Scoped "edge bridge" relaying (e.g. a phone bridging BLE peers onto the
+  /// internet hubs). When true, [_rebroadcast] only propagates announces heard
+  /// on an [RnsInterface.edge] interface, and only onto NON-edge (core)
+  /// interfaces — so local BLE peers become reachable from the internet, but the
+  /// internet announce flood is never re-aired back onto BLE (which would
+  /// saturate it and starve APRS that shares the radio). Packet/link forwarding
+  /// ([_maybeForward]) is unaffected and bridges both directions. When false
+  /// (default) rebroadcast behaves like a normal transport node.
+  bool edgeBridge = false;
 
   final List<RnsInterface> _interfaces = [];
   final Map<String, RnsPathEntry> _paths = {};
@@ -630,8 +647,17 @@ class RnsTransport {
     final tid = transportId;
     if (tid == null) return;
     if (pathHops >= kRnsMaxHops) return;
-    final others = _interfaces.where((i) => i.label != via).toList();
-    if (others.isEmpty) return;
+    var others = _interfaces.where((i) => i.label != via);
+    if (edgeBridge) {
+      // Only carry announces heard on an edge (e.g. BLE local peers) and only
+      // onto core interfaces — never re-air the internet flood onto BLE, and
+      // never loop a hub announce across other hub uplinks.
+      final viaIface = _ifaceByLabel(via);
+      if (viaIface == null || !viaIface.edge) return;
+      others = others.where((i) => !i.edge);
+    }
+    final targets = others.toList();
+    if (targets.isEmpty) return;
 
     final relay = RnsPacket(
       destHash: ann.destHash,
@@ -646,7 +672,7 @@ class RnsTransport {
       hops: pathHops,
     );
     final raw = relay.pack();
-    for (final iface in others) {
+    for (final iface in targets) {
       iface.send(raw);
       log?.call(
           'rebroadcast ${_hex(ann.destHash)} -> ${iface.label} hops=$pathHops');

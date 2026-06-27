@@ -17,6 +17,8 @@ import 'rns_transport.dart';
 class RnsTcpInterface implements RnsInterface {
   @override
   bool get announceOnly => false;
+  @override
+  bool get edge => false;
 
   // TCP/HDLC carries arbitrary-size frames, so advertise the link-MTU-discovery
   // ceiling (matches reference RNS TCPInterface.HW_MTU) for big resource parts.

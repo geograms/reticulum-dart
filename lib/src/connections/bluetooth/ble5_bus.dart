@@ -52,6 +52,46 @@ class Ble5Bus {
   bool _scanning = false;
   bool? _supported;
 
+  // ── Scan self-healing ────────────────────────────────────────────────────
+  // Some devices (vendor power managers, BT adapter restarts) silently kill a
+  // long-running BLE scan — or deny the first registration — while both sides
+  // still believe they are scanning. Track the last delivered frame and force
+  // a full native stop+start re-registration after an implausible silence.
+  // Mesh beacons alone guarantee sub-30 s traffic whenever any peer is near,
+  // and a restart on a genuinely lonely device is harmless (well under
+  // Android's 5-starts/30 s throttle).
+  int _lastFrameMs = 0;
+  int _scanStartMs = 0;
+  bool _wantScan = false;
+  Timer? _scanWatchdog;
+  static const int _silenceRestartMs = 150 * 1000;
+
+  /// Optional log sink (the app wires this to its log service).
+  void Function(String msg)? onLog;
+
+  /// Force a full native re-registration of the scan.
+  Future<void> restartScan() async {
+    try {
+      await _method.invokeMethod('stopScan');
+    } catch (_) {}
+    _scanning = false;
+    await startScan();
+  }
+
+  void _armScanWatchdog() {
+    _scanWatchdog ??= Timer.periodic(const Duration(seconds: 60), (_) {
+      if (!_wantScan) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final lastSeen = _lastFrameMs > _scanStartMs ? _lastFrameMs : _scanStartMs;
+      if (now - lastSeen > _silenceRestartMs) {
+        onLog?.call(
+            'BLE5: scan silent ${(now - lastSeen) ~/ 1000}s — re-registering');
+        // ignore: discarded_futures
+        restartScan();
+      }
+    });
+  }
+
   // Native GATT callbacks. The whole GATT large-file path is native (server +
   // client + legacy connectable advert + legacy discovery scan) — one coordinated
   // stack, unlike the two Flutter plugins whose dual-role confused Android's GATT
@@ -101,9 +141,12 @@ class Ble5Bus {
 
   /// Begin the shared extended scan (idempotent). Demuxes by subtype.
   Future<void> startScan() async {
+    _wantScan = true;
+    _armScanWatchdog();
     if (_scanning) return;
-    _sub = _scan.receiveBroadcastStream().listen((event) {
+    _sub ??= _scan.receiveBroadcastStream().listen((event) {
       if (event is! Map) return;
+      _lastFrameMs = DateTime.now().millisecondsSinceEpoch;
       final subtype = (event['subtype'] as int?) ?? -1;
       final h = _handlers[subtype];
       if (h == null) return;
@@ -116,8 +159,12 @@ class Ble5Bus {
       h(Ble5Frame(addr, rssi, data));
     });
     try {
-      await _method.invokeMethod('startScan');
-      _scanning = true;
+      final ok = await _method.invokeMethod<bool>('startScan');
+      _scanning = ok ?? true;
+      _scanStartMs = DateTime.now().millisecondsSinceEpoch;
+      if (ok == false) {
+        onLog?.call('BLE5: native startScan refused — watchdog will retry');
+      }
     } catch (_) {}
   }
 

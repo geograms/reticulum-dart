@@ -75,8 +75,25 @@ class Ble5Bus {
       ok = false;
     }
     _supported = ok;
+    if (ok) {
+      // Learn THIS controller's true per-frame payload ceiling. Chips vary
+      // wildly (255 B is common vs the 1650 B spec max); an oversized frame is
+      // rejected by the stack, not truncated, so senders must route anything
+      // bigger over GATT instead of assuming the optimistic [maxFrame].
+      try {
+        final n = await _method.invokeMethod<int>('maxPayload');
+        if (n != null && n > 30) _maxPayload = n < maxFrame ? n : maxFrame;
+      } catch (_) {}
+    }
     return ok;
   }
+
+  int _maxPayload = maxFrame;
+
+  /// Largest payload one extended advert can carry ON THIS DEVICE — the
+  /// effective broadcast cap for the size router (≤ [maxFrame]). Valid after
+  /// [supported] resolves true; conservative default before that.
+  int get maxPayload => _maxPayload;
 
   /// Route inbound frames of [subtype] to [handler]. One handler per subtype.
   void onFrame(int subtype, void Function(Ble5Frame) handler) =>

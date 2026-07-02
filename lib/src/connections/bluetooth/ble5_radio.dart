@@ -26,8 +26,10 @@ class Ble5Radio implements RnsBleRadio {
   }
 
   // ── RnsBleRadio ──
+  // This controller's real advert ceiling (many chips carry ~247 B, not the
+  // spec-side 500) — an over-cap frame is rejected by the stack, not truncated.
   @override
-  int get broadcastCap => 500; // a whole RNS packet fits one extended advert
+  int get broadcastCap => Ble5Bus.instance.maxPayload;
 
   @override
   void broadcast(Uint8List frame) {

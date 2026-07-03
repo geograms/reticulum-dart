@@ -246,9 +246,10 @@ class Ble5Bus {
   }
 
   /// Open a GATT link to a peer by BLE address (learned from the scan).
-  Future<void> gattConnect(String address) async {
+  Future<void> gattConnect(String address, {bool auto = false}) async {
     try {
-      await _method.invokeMethod('gattConnect', {'address': address});
+      await _method.invokeMethod(
+          'gattConnect', {'address': address, 'auto': auto});
     } catch (_) {}
   }
 

@@ -254,15 +254,21 @@ class RnsTransport {
   /// inbound link-addressed packet).
   void noteLinkIface(Uint8List linkId, String via) {
     final k = _hex(linkId);
-    if (_linkIface[k] != via) {
-      if (!_linkIface.containsKey(k)) {
-        _linkIfaceOrder.add(k);
-        if (_linkIfaceOrder.length > _maxLinkIface) {
-          _linkIface.remove(_linkIfaceOrder.removeAt(0));
-        }
+    final cur = _linkIface[k];
+    if (cur == via) return;
+    // A link's setup packets (LRPROOF/LRRTT) can arrive on MORE than one
+    // interface — the request went out on all of them, so the peer may answer on
+    // each. Keep the FASTEST interface, not merely the last one seen: otherwise a
+    // slow/flaky hub copy arriving after the good LAN copy would flip subsequent
+    // link DATA (GET_FILE, resource) onto the hub and the transfer would stall.
+    if (cur != null && _speedRank(cur) > _speedRank(via)) return;
+    if (cur == null) {
+      _linkIfaceOrder.add(k);
+      if (_linkIfaceOrder.length > _maxLinkIface) {
+        _linkIface.remove(_linkIfaceOrder.removeAt(0));
       }
-      _linkIface[k] = via;
     }
+    _linkIface[k] = via;
   }
 
   /// Send a locally-produced packet, routing LINK-addressed traffic on the single
@@ -425,39 +431,11 @@ class RnsTransport {
     return false;
   }
 
-  // Per-(dest,via) link-handshake failure penalties. A via that keeps failing
-  // to complete a link for a dest is a silently one-way medium (asymmetric-LAN
-  // AP client isolation is the live example: we HEAR the peer's announces over
-  // the LAN but our packets never reach it), so it must stop out-ranking a
-  // working slower path. `noteLinkFailure` penalizes the current path's via and
-  // drops the entry so the next announce re-resolves — the penalized via loses
-  // the speedRank tie-break until the cooldown lapses, converging to the hub.
-  final Map<String, int> _viaPenaltyUntil = {};
-  static const int _viaPenaltyMs = 90000;
-
-  int _nowMs() => DateTime.now().millisecondsSinceEpoch;
-
-  bool _viaPenalized(String destHex, String via) {
-    final t = _viaPenaltyUntil['$destHex|$via'];
-    if (t == null) return false;
-    if (_nowMs() >= t) {
-      _viaPenaltyUntil.remove('$destHex|$via');
-      return false;
-    }
-    return true;
-  }
-
-  /// A link to [destHash] failed to complete its handshake — penalize the via
-  /// its path currently uses so a one-way medium falls back to a working one.
-  void noteLinkFailure(Uint8List destHash) {
-    final key = _hex(destHash);
-    final e = _paths[key];
-    if (e == null) return;
-    _viaPenaltyUntil['$key|${e.via}'] = _nowMs() + _viaPenaltyMs;
-    log?.call('path ${key.substring(0, 8)} via ${e.via} penalized '
-        '(link handshake failed)');
-    _paths.remove(key); // re-resolve; penalized via won't re-win until cooldown
-  }
+  // Fastest data-capable interface we've heard each identity's announces on
+  // (identityHex -> interface label). Lets a dest whose own (broadcast) announce
+  // was lost still route over the LAN when a SIBLING dest of the same node was
+  // heard there — co-located transfer no longer depends on every dest's beacon.
+  final Map<String, String> _identityFastVia = {};
 
   int _speedRank(String label) {
     for (final i in _interfaces) {
@@ -482,7 +460,7 @@ class RnsTransport {
   /// announces, updates the path table, and (if a transport node) rebroadcasts
   /// the announce onto the other interfaces. Returns the validated announce or
   /// null.
-  Future<RnsAnnounce?> ingest(RnsPacket p, String via) async {
+  Future<RnsAnnounce?> ingest(RnsPacket p, String viaArg) async {
     // Dedup by packet hash (RNS uses the same hashable-part scheme).
     final ph = _hex(p.packetHash());
     if (_seenPackets.contains(ph)) return null;
@@ -493,7 +471,7 @@ class RnsTransport {
 
     // As a transport node, forward link/resource traffic that isn't for us —
     // unless we've dropped to passive (leaf) mode to shed CPU load.
-    if (transportId != null && !_passive && _maybeForward(p, via)) return null;
+    if (transportId != null && !_passive && _maybeForward(p, viaArg)) return null;
 
     if (p.packetType != RnsPacketType.announce) return null;
 
@@ -534,11 +512,51 @@ class RnsTransport {
     });
     if (ann == null) return null;
 
-    final pathHops = p.hops + 1; // hop just taken to reach us
+    var pathHops = p.hops + 1; // hop just taken to reach us
     // If the announce arrived relayed (HEADER_2), the relayer's id is the next
     // hop toward this destination; a direct (HEADER_1) announce is a neighbour.
-    final nextHop =
+    var nextHop =
         p.headerType == RnsHeaderType.header2 ? p.transportId : null;
+    var via = viaArg;
+    // Identity-level LAN reachability. A node's per-destination announces ride
+    // unreliable Wi-Fi BROADCAST, so this specific dest's LAN announce may be
+    // lost while ANOTHER of the same node's dests (chat/lxmf) was heard over the
+    // LAN — leaving this dest stuck on a slow hub path even though the node is a
+    // direct LAN neighbour. If we've heard THIS identity over a fast direct
+    // medium, treat this dest as reachable there too: a direct 1-hop path on
+    // that interface (the LAN peer table already knows the node's address to
+    // unicast to). This is what makes co-located transfer use the LAN reliably
+    // instead of depending on every single dest's broadcast landing.
+    final idHex = _hex(ann.identity.hash);
+    final fast = _identityFastVia[idHex];
+    if (fast != null &&
+        _speedRank(fast) > _speedRank(via) &&
+        _ifaceByLabel(fast) != null) {
+      via = fast;
+      nextHop = null;
+      pathHops = 1;
+    }
+    // Record the fastest data-capable interface we've heard this identity on, so
+    // later announces of its OTHER dests can be upgraded to it (above). When it
+    // gets FASTER, proactively upgrade EVERY already-known path of this identity
+    // to that interface right now — otherwise a sibling dest whose own (rare,
+    // broadcast) announce already landed on the hub would stay stuck there until
+    // its next announce, and those are minutes apart / often dropped.
+    if (!_isAnnounceOnly(viaArg)) {
+      final cur = _identityFastVia[idHex];
+      if (cur == null || _speedRank(viaArg) > _speedRank(cur)) {
+        _identityFastVia[idHex] = viaArg;
+        for (final e in _paths.values) {
+          if (_hex(e.identity.hash) == idHex &&
+              _speedRank(viaArg) > _speedRank(e.via)) {
+            e.via = viaArg;
+            e.nextHop = null;
+            e.hops = 1;
+            e.updatedMs = DateTime.now().millisecondsSinceEpoch;
+          }
+        }
+      }
+    }
     final key = _hex(ann.destHash);
     final existing = _paths[key];
     // Path preference. A path's usefulness for DATA depends on whether the
@@ -568,9 +586,8 @@ class RnsTransport {
       // rank 0 for a cooldown, so a silently one-way medium (asymmetric-LAN AP
       // client isolation: announces heard but our packets never reach the peer)
       // stops shadowing a working slower path (the hub) — link-failure fallback.
-      final newRank = _viaPenalized(key, via) ? 0 : _speedRank(via);
-      final oldRank =
-          _viaPenalized(key, existing.via) ? 0 : _speedRank(existing.via);
+      final newRank = _speedRank(via);
+      final oldRank = _speedRank(existing.via);
       if (newRank != oldRank) {
         replace = newRank > oldRank;
       } else {

@@ -8,10 +8,10 @@
  *     then runs a FileFetchSession to pull + verify a file by its sha256.
  *
  * Transport-agnostic: the owner supplies a [send] callback (e.g.
- * transport.sendOnAll) and feeds inbound packets to [handlePacket]. Link/file
- * packets are addressed by link_id, so broadcasting replies on all interfaces is
- * correct (the wrong peer ignores them); transport-routed unicast is a later
- * optimization.
+ * transport.sendLinkAware) and feeds inbound packets to [handlePacket]. Link/file
+ * packets are addressed by link_id; the transport routes established-link traffic
+ * on the interface the link's proof arrived on (noteLinkIface), and the LAN lane
+ * unicasts to the learned peer.
  */
 import 'dart:async';
 import 'dart:typed_data';
@@ -167,6 +167,12 @@ class FileTransferNode {
   /// link MTU over TCP (link MTU discovery). Null → no discovery (500).
   final int Function(Uint8List destHash)? nextHopMtuForDest;
 
+  /// Called when we OPEN an outbound link to [destHash] (linkId, destHash), so
+  /// the host can pin the link's interface to that dest's path up front (the LAN)
+  /// — before the responder's proof, which arrives on every interface, can
+  /// mis-set it to a slow hub. Optional.
+  final void Function(Uint8List linkId, Uint8List destHash)? onLinkOpened;
+
   /// Pull a transport path to [destHash] (a PATH_REQUEST). Supplied by the host
   /// (RnsTransport.requestPath). Needed because we often know a peer's IDENTITY
   /// (e.g. a DHT contact learned from an incoming STORE) without having a cached
@@ -174,11 +180,6 @@ class FileTransferNode {
   /// asymmetric public hubs. A path request is a PULL the peer's attached hub
   /// answers on our direct link, so the DHT/file links below become routable.
   final void Function(Uint8List destHash)? requestPath;
-
-  /// Called when a link to [destHash] exhausts its handshake retries without
-  /// completing — lets the host penalize/demote that dest's current path so the
-  /// next attempt falls back to a working medium (a silently one-way LAN → hub).
-  final void Function(Uint8List destHash)? onLinkFailed;
 
   /// Called when we serve a file's manifest to another node (one download by a
   /// peer), with the 32-byte file hash. Drives the per-file download metric.
@@ -204,7 +205,7 @@ class FileTransferNode {
     this.nextHopForDest,
     this.hasPathForDest,
     this.requestPath,
-    this.onLinkFailed,
+    this.onLinkOpened,
     this.nextHopMtuForDest,
     this.onServed,
     this.onDepositOffer,
@@ -401,7 +402,8 @@ class FileTransferNode {
       e.link.handleRtt(p); // activate
       return;
     }
-    for (final out in e.serve.onPacket(p)) {
+    final outs = e.serve.onPacket(p);
+    for (final out in outs) {
       send(out.pack());
     }
   }
@@ -448,14 +450,6 @@ class FileTransferNode {
       log?.call('files: handshake attempt ${attempt + 1} failed, retrying '
           '${_hex(fileHash)}');
     }
-    // Every handshake attempt to this provider's files dest failed — tell the
-    // host so it can demote that dest's current path (a one-way LAN falls back
-    // to a hub route), and the NEXT fetch/retry can succeed over a working
-    // medium instead of hammering the dead one.
-    if (onLinkFailed != null) {
-      onLinkFailed!(RnsDestination.hash(
-          providerPublicIdentity, kFilesApp, kFilesAspects));
-    }
     return null;
   }
 
@@ -479,6 +473,12 @@ class FileTransferNode {
     entry.baseTimeout = timeout;
     final id = _hex(link.linkId!);
     _fetch[id] = entry;
+    // Pin this link to the SAME interface its dest's path uses (the LAN), before
+    // any packet flows. The responder answers the request on every interface (it
+    // has no link-iface record yet), so our proof can arrive over a slow hub
+    // copy and mis-set the link's interface — sending our GET_FILE there, where
+    // it's lost. Pinning up front keeps all our link DATA on the fast path.
+    onLinkOpened?.call(link.linkId!, link.destHash);
     const tick = Duration(seconds: 4);
     // Per-attempt handshake budget (~32s); [fetch] retries with a fresh link.
     const maxHandshakeStalls = 8;
@@ -553,6 +553,16 @@ class FileTransferNode {
     // Handshake: validate the responder's proof, send LRRTT, start the fetch.
     if (e.fetch == null) {
       if (p.packetType == RnsPacketType.proof && p.context == RnsContext.lrproof) {
+        // The link request is emitted on ALL interfaces (an asymmetric LAN may
+        // be one-way, so we can't pin it), so the responder can answer on more
+        // than one and we receive a DUPLICATE proof. The first completes the
+        // handshake (status leaves `pending`) and kicks off _startSession
+        // asynchronously; a duplicate arriving in that gap (e.fetch still null)
+        // would hit handleProof again, get null because the link is no longer
+        // pending, and — before this guard — call _finishFetch(null), killing
+        // the just-established session. Only a genuine failure of a STILL-pending
+        // link is a real validation failure; ignore duplicates.
+        if (e.link.status != RnsLinkStatus.pending) return;
         final rtt = await e.link.handleProof(p);
         if (rtt == null) {
           _finishFetch(e, null, 'proof validation failed');

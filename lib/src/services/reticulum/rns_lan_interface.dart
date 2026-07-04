@@ -12,12 +12,12 @@
  * as subnet BROADCAST would blast a busy hub\'s transit traffic across the
  * LAN and every node would re-process it. Instead:
  *   - send():   announces -> subnet broadcast (discovery, as before);
- *               everything else -> UNICAST, one copy per announce-known
- *               Aurora peer (bounded, typically 1-3 on a home LAN); with no
- *               known peers data is dropped exactly like the old behavior.
- *   - receive(): announces learn the sender\'s address (peer table, 10 min
- *               TTL) and pass up; unicast data passes up; nothing is
- *               re-broadcast.
+ *               data -> UNICAST, one copy per known Aurora peer (bounded,
+ *               typically 1-3 on a home LAN); with NO fresh peer it falls
+ *               back to a single broadcast so a preferred-LAN link can't
+ *               black-hole when the peer table lapses.
+ *   - receive(): learns the sender's address off any datagram (peer table,
+ *               10 min TTL) and passes the packet up; own loopback dropped.
  * One raw RNS packet per UDP datagram.
  */
 import 'dart:async';
@@ -93,11 +93,14 @@ class RnsLanInterface implements RnsInterface {
       final dg = s.receive();
       if (dg == null) return;
       final fromSelf = _selfAddrs.contains(dg.address.address);
-      if (_isAnnounce(dg.data)) {
-        // Discovery: learn the peer\'s address for the unicast data lane.
-        if (!fromSelf) _learnPeer(dg.address, dg.port);
-      } else if (fromSelf) {
-        return; // our own unicast echo (shouldn\'t happen, but cheap guard)
+      if (fromSelf) {
+        // Our own broadcast loopback — never re-process or self-register.
+        if (!_isAnnounce(dg.data)) return;
+      } else {
+        // Learn the peer address off ANY datagram (announce OR data), so the
+        // unicast table stays warm between the 30 s+ announce periods and a
+        // live link keeps its own return path fresh.
+        _learnPeer(dg.address, dg.port);
       }
       try {
         onPacket(Uint8List.fromList(dg.data));
@@ -112,7 +115,7 @@ class RnsLanInterface implements RnsInterface {
     final known = _peers.containsKey(key);
     _peers[key] = _LanPeer(addr, fromPort == 0 ? port : fromPort,
         DateTime.now().millisecondsSinceEpoch);
-    if (!known) log?.call('peer $key joined (\${_peers.length} on LAN)');
+    if (!known) log?.call('peer $key joined (${_peers.length} on LAN)');
     if (_peers.length > _maxPeers) {
       // Evict the stalest.
       String? oldest;
@@ -135,11 +138,23 @@ class RnsLanInterface implements RnsInterface {
       s.send(packetRaw, _broadcastAddr, port); // discovery, as always
       return;
     }
-    // Data: one unicast copy per known LAN peer. Never broadcast; with no
-    // known peers this drops the packet — identical to the old behavior.
-    if (_peers.isEmpty) return;
+    // Data: unicast to each fresh announce-known peer. But once a path is
+    // preferred over the LAN (speedRank), the transport single-homes traffic
+    // on THIS interface — so if the peer table has lapsed (its 10-min TTL
+    // expired between announces, or we prefer LAN before the first data-time
+    // announce landed) a silent drop here would black-hole the whole link,
+    // with no hub fallback. So when we have no fresh unicast target, BROADCAST
+    // the data: a co-located peer still gets it, and the cost is bounded — a
+    // home LAN has a handful of nodes and a normal node's own link/resource
+    // traffic is low-rate (the flood the announce-only design guarded against
+    // was a transport node relaying a busy hub's transit stream, which still
+    // reaches its peers by the unicast path below).
     final cutoff = DateTime.now().millisecondsSinceEpoch - _peerTtlMs;
     _peers.removeWhere((_, p) => p.lastMs < cutoff);
+    if (_peers.isEmpty) {
+      s.send(packetRaw, _broadcastAddr, port);
+      return;
+    }
     for (final p in _peers.values) {
       s.send(packetRaw, p.addr, p.port);
     }

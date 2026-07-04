@@ -147,19 +147,29 @@ class RnsLanInterface implements RnsInterface {
   void send(Uint8List packetRaw) {
     final s = _socket;
     if (s == null) return;
+    final cutoff = _nowMs() - _peerTtlMs;
+    _peers.removeWhere((_, p) => p.lastMs < cutoff);
     if (_isAnnounce(packetRaw)) {
-      // Discovery: broadcast to the limited + every subnet-directed address.
+      // Discovery: broadcast (limited + every subnet-directed address) AND
+      // unicast to every known peer. Wi-Fi drops broadcast heavily, so relying
+      // on it alone left the LAN PATH intermittent — a peer's announce (the only
+      // thing that establishes its LAN path) frequently never arrived. Once ANY
+      // datagram from a peer has been seen (a broadcast that DID get through, or
+      // any inbound unicast data), that peer is learned and every subsequent
+      // announce reaches it by reliable unicast, so the LAN path stays up. The
+      // broadcast keeps first-contact working; the unicast keeps it STABLE.
       s.send(packetRaw, _broadcastAddr, port);
       for (final d in _directedBcast) {
         s.send(packetRaw, d, port);
+      }
+      for (final p in _peers.values) {
+        s.send(packetRaw, p.addr, p.port);
       }
       return;
     }
     // Data: UNICAST to each fresh known peer — Wi-Fi delivers unicast reliably
     // where it drops broadcast. No peer yet → drop (the peer is learned from its
     // announce, then link retries land); never broadcast data.
-    final cutoff = _nowMs() - _peerTtlMs;
-    _peers.removeWhere((_, p) => p.lastMs < cutoff);
     for (final p in _peers.values) {
       s.send(packetRaw, p.addr, p.port);
     }

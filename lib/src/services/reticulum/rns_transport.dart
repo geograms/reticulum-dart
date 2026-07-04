@@ -425,6 +425,40 @@ class RnsTransport {
     return false;
   }
 
+  // Per-(dest,via) link-handshake failure penalties. A via that keeps failing
+  // to complete a link for a dest is a silently one-way medium (asymmetric-LAN
+  // AP client isolation is the live example: we HEAR the peer's announces over
+  // the LAN but our packets never reach it), so it must stop out-ranking a
+  // working slower path. `noteLinkFailure` penalizes the current path's via and
+  // drops the entry so the next announce re-resolves — the penalized via loses
+  // the speedRank tie-break until the cooldown lapses, converging to the hub.
+  final Map<String, int> _viaPenaltyUntil = {};
+  static const int _viaPenaltyMs = 90000;
+
+  int _nowMs() => DateTime.now().millisecondsSinceEpoch;
+
+  bool _viaPenalized(String destHex, String via) {
+    final t = _viaPenaltyUntil['$destHex|$via'];
+    if (t == null) return false;
+    if (_nowMs() >= t) {
+      _viaPenaltyUntil.remove('$destHex|$via');
+      return false;
+    }
+    return true;
+  }
+
+  /// A link to [destHash] failed to complete its handshake — penalize the via
+  /// its path currently uses so a one-way medium falls back to a working one.
+  void noteLinkFailure(Uint8List destHash) {
+    final key = _hex(destHash);
+    final e = _paths[key];
+    if (e == null) return;
+    _viaPenaltyUntil['$key|${e.via}'] = _nowMs() + _viaPenaltyMs;
+    log?.call('path ${key.substring(0, 8)} via ${e.via} penalized '
+        '(link handshake failed)');
+    _paths.remove(key); // re-resolve; penalized via won't re-win until cooldown
+  }
+
   int _speedRank(String label) {
     for (final i in _interfaces) {
       if (i.label == label) return i.speedRank;
@@ -529,9 +563,14 @@ class RnsTransport {
     } else {
       // Same capability class: prefer the faster medium first (a direct LAN
       // path beats the internet hub AND BLE for a co-located peer), then
-      // fewer/equal hops (equal = LRU refresh of the same-quality path).
-      final newRank = _speedRank(via);
-      final oldRank = _speedRank(existing.via);
+      // fewer/equal hops (equal = LRU refresh of the same-quality path). A via
+      // that recently FAILED a link handshake for this dest is penalized to
+      // rank 0 for a cooldown, so a silently one-way medium (asymmetric-LAN AP
+      // client isolation: announces heard but our packets never reach the peer)
+      // stops shadowing a working slower path (the hub) — link-failure fallback.
+      final newRank = _viaPenalized(key, via) ? 0 : _speedRank(via);
+      final oldRank =
+          _viaPenalized(key, existing.via) ? 0 : _speedRank(existing.via);
       if (newRank != oldRank) {
         replace = newRank > oldRank;
       } else {

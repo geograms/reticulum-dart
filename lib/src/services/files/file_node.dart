@@ -175,6 +175,11 @@ class FileTransferNode {
   /// answers on our direct link, so the DHT/file links below become routable.
   final void Function(Uint8List destHash)? requestPath;
 
+  /// Called when a link to [destHash] exhausts its handshake retries without
+  /// completing — lets the host penalize/demote that dest's current path so the
+  /// next attempt falls back to a working medium (a silently one-way LAN → hub).
+  final void Function(Uint8List destHash)? onLinkFailed;
+
   /// Called when we serve a file's manifest to another node (one download by a
   /// peer), with the 32-byte file hash. Drives the per-file download metric.
   final void Function(Uint8List fileHash)? onServed;
@@ -199,6 +204,7 @@ class FileTransferNode {
     this.nextHopForDest,
     this.hasPathForDest,
     this.requestPath,
+    this.onLinkFailed,
     this.nextHopMtuForDest,
     this.onServed,
     this.onDepositOffer,
@@ -441,6 +447,14 @@ class FileTransferNode {
       if (result != null || handshakeOk) return result;
       log?.call('files: handshake attempt ${attempt + 1} failed, retrying '
           '${_hex(fileHash)}');
+    }
+    // Every handshake attempt to this provider's files dest failed — tell the
+    // host so it can demote that dest's current path (a one-way LAN falls back
+    // to a hub route), and the NEXT fetch/retry can succeed over a working
+    // medium instead of hammering the dead one.
+    if (onLinkFailed != null) {
+      onLinkFailed!(RnsDestination.hash(
+          providerPublicIdentity, kFilesApp, kFilesAspects));
     }
     return null;
   }

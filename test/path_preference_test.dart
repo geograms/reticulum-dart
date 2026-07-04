@@ -88,4 +88,50 @@ void main() {
       expect(t.pathFor(a1.destHash)!.updatedMs, greaterThanOrEqualTo(first));
     });
   });
+
+  _demotionTests();
+}
+
+// ── Link-failure path demotion (asymmetric-LAN fallback) ──────────────────
+void _demotionTests() {
+  group('link-failure path demotion', () {
+    late RnsTransport t;
+    setUp(() {
+      t = RnsTransport();
+      t.addInterface(_FakeIface('lan', rank: 3));
+      t.addInterface(_FakeIface('tcp:hub', rank: 2));
+    });
+
+    test('a failed LAN link lets the hub path win until the penalty lapses',
+        () async {
+      final id = await RnsIdentity.generate();
+      final a1 = await RnsAnnounceBuilder.build(id, 'pathpref', const ['peer']);
+      // Learn hub first, then LAN wins by speedRank.
+      await t.ingest(a1, 'tcp:hub');
+      await t.ingest(
+          await RnsAnnounceBuilder.build(id, 'pathpref', const ['peer']), 'lan');
+      expect(t.pathFor(a1.destHash)!.via, 'lan');
+
+      // The LAN link keeps failing → demote it.
+      t.noteLinkFailure(a1.destHash);
+      expect(t.pathFor(a1.destHash), isNull, reason: 'entry dropped to re-resolve');
+
+      // Now both media re-announce. The penalized LAN must NOT reclaim the path
+      // over the hub.
+      await t.ingest(
+          await RnsAnnounceBuilder.build(id, 'pathpref', const ['peer']), 'lan');
+      await t.ingest(
+          await RnsAnnounceBuilder.build(id, 'pathpref', const ['peer']),
+          'tcp:hub');
+      expect(t.pathFor(a1.destHash)!.via, 'tcp:hub',
+          reason: 'demoted LAN loses to the working hub during the cooldown');
+    });
+
+    test('failure with no known path is a no-op (no throw)', () async {
+      final id = await RnsIdentity.generate();
+      final a = await RnsAnnounceBuilder.build(id, 'pathpref', const ['peer']);
+      t.noteLinkFailure(a.destHash); // never learned — must not throw
+      expect(t.pathFor(a.destHash), isNull);
+    });
+  });
 }

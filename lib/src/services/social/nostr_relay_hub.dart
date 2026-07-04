@@ -322,6 +322,95 @@ class NostrRelayHub {
     return true;
   }
 
+  // ── Engagement stats (likes + replies per visible post) ─────────────────────
+  final Map<String, Set<String>> _statReact = {}; // eventId → reactor pubkeys
+  final Map<String, Set<String>> _statReply = {}; // eventId → reply event ids
+  final List<String> _statTracked = []; // rolling set of ids we count for
+  String? _statSub;
+  Timer? _statDebounce;
+
+  /// Count reactions (kind-7) and replies (kind-1 with #e) for [ids] by
+  /// subscribing to events that reference them. The feed calls this with the
+  /// post ids currently on screen; a rolling window keeps the REQ bounded.
+  void trackStats(List<String> ids) {
+    var added = false;
+    for (final id in ids) {
+      if (id.length != 64 || _statReact.containsKey(id)) continue;
+      _statTracked.add(id);
+      _statReact[id] = <String>{};
+      _statReply[id] = <String>{};
+      added = true;
+    }
+    while (_statTracked.length > 300) {
+      final old = _statTracked.removeAt(0);
+      _statReact.remove(old);
+      _statReply.remove(old);
+    }
+    if (added) {
+      // Debounce: the feed adds ids in bursts as the user scrolls.
+      _statDebounce?.cancel();
+      _statDebounce = Timer(const Duration(milliseconds: 700), _statResub);
+    }
+  }
+
+  void _statResub() {
+    if (_statTracked.isEmpty) return;
+    final prev = _statSub;
+    if (prev != null) {
+      _subFilters.remove(prev);
+      _inbox.remove(prev);
+      _seen.remove(prev);
+      for (final c in _clients.values) {
+        c.unsubscribe(prev);
+      }
+    }
+    final ids = List<String>.from(_statTracked);
+    final sub = 'stat${_subSeq++}';
+    _statSub = sub;
+    final f = [
+      NostrFilter(kinds: const [7], tags: {'e': ids}),
+      NostrFilter(kinds: const [1], tags: {'e': ids}),
+    ];
+    _subFilters[sub] = f;
+    _inbox[sub] = Queue<NostrEvent>();
+    _seen[sub] = <String>{};
+    for (final e in _endpoints.values) {
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
+    }
+  }
+
+  /// Record a reaction/reply against a tracked post. Returns true if it was an
+  /// engagement event for a tracked post (so the caller skips normal handling).
+  bool _tallyStats(NostrEvent event) {
+    final ref = _firstETag(event);
+    if (ref == null) return false;
+    if (event.kind == NostrEventKind.reaction) {
+      final s = _statReact[ref];
+      if (s != null) s.add(event.pubkey);
+      return true; // reactions are never displayed
+    }
+    if (event.kind == NostrEventKind.textNote) {
+      final s = _statReply[ref];
+      if (s != null && event.id != null) s.add(event.id!);
+      // a reply is still a note; let it flow on for storage/threading
+    }
+    return false;
+  }
+
+  /// (likes, replies, likedByMe) for a post id.
+  (int, int, bool) statsOf(String id, String? selfPub) {
+    final r = _statReact[id];
+    final mine = selfPub != null && (r?.contains(selfPub) ?? false);
+    return (r?.length ?? 0, _statReply[id]?.length ?? 0, mine);
+  }
+
+  /// Optimistically record our own like so the count updates before it round-
+  /// trips back from a relay.
+  void recordReaction(String id, String pub) {
+    (_statReact[id] ??= <String>{}).add(pub);
+    if (!_statTracked.contains(id)) _statTracked.add(id);
+  }
+
   // Delivery rate cap: bounds the SQLite/dispatch work this (UI/engine) isolate
   // does per second, so a public firehose is SAMPLED instead of flooding the
   // main thread. A followed/web-of-trust feed is low-volume and never trips it.
@@ -332,10 +421,12 @@ class NostrRelayHub {
   int rateDropped = 0;
 
   void _onEvent(String subId, NostrEvent event) {
-    // Reactions drive the discovery tally only — never stored/buffered (they are
-    // high-volume and would just be main-thread noise). Do this BEFORE the rate
-    // cap so a busy reaction stream still feeds discovery.
+    // Engagement (likes/replies) is tallied for on-screen posts BEFORE the rate
+    // cap so counts stay accurate. Reactions are tally-only (never displayed).
+    final wasReaction = _tallyStats(event);
+    // Reactions also drive the discovery tally; both consume the reaction here.
     if (_discoTally(event)) return;
+    if (wasReaction) return;
 
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _rateWindowStart >= _rateWindowMs) {
@@ -404,6 +495,8 @@ class NostrRelayHub {
   Future<void> close() async {
     _discoTimer?.cancel();
     _discoTimer = null;
+    _statDebounce?.cancel();
+    _statDebounce = null;
     for (final c in _clients.values) {
       await c.close();
     }

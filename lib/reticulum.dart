@@ -49,6 +49,7 @@ export 'src/services/social/nostr_rns_client.dart';
 export 'src/services/social/nostr_local_client.dart';
 export 'src/services/social/nostr_relay_hub.dart';
 export 'src/services/social/nostr_ws_server.dart';
+export 'src/services/social/nostr_verify_pool.dart';
 export 'src/services/social/retention_tier.dart';
 export 'src/services/social/spam.dart';
 export 'src/services/social/store_forward.dart';

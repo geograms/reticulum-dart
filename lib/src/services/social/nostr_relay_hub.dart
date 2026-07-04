@@ -17,6 +17,7 @@ import 'dart:io';
 import '../../util/nostr_event.dart';
 import 'nostr_local_client.dart';
 import 'nostr_relay_client.dart';
+import 'nostr_wire.dart';
 import 'nostr_ws_client.dart';
 import 'relay_event_store.dart';
 
@@ -233,18 +234,31 @@ class NostrRelayHub {
     }
   }
 
+  // Delivery rate cap: bounds the SQLite/dispatch work this (UI/engine) isolate
+  // does per second, so a public firehose is SAMPLED instead of flooding the
+  // main thread. A followed/web-of-trust feed is low-volume and never trips it.
+  static const int _rateWindowMs = 250;
+  static const int _rateMaxPerWindow = 40; // ~160 events/s ceiling
+  int _rateWindowStart = 0;
+  int _rateCount = 0;
+  int rateDropped = 0;
+
   void _onEvent(String subId, NostrEvent event) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _rateWindowStart >= _rateWindowMs) {
+      _rateWindowStart = now;
+      _rateCount = 0;
+    }
+    if (_rateCount >= _rateMaxPerWindow) {
+      rateDropped++; // firehose overflow — dropped before any main-thread work
+      return;
+    }
+    _rateCount++;
     // Merge into the unified store (dedup + replaceable/deletion handled there).
     if (store.put(event)) onStored?.call(event);
-    final inbox = _inbox[subId];
+    _bufferForSub(subId, event);
     final seen = _seen[subId];
-    if (inbox == null || seen == null || event.id == null) return;
-    if (!seen.add(event.id!)) return; // already delivered on this sub
-    inbox.add(event);
-    while (inbox.length > _maxInbox) {
-      inbox.removeFirst();
-    }
-    if (seen.length > _maxInbox * 4) seen.clear();
+    if (seen != null && seen.length > _maxInbox * 4) seen.clear();
   }
 
   /// Pop up to [max] buffered events for a subscription (oldest first), as JSON.
@@ -259,13 +273,31 @@ class NostrRelayHub {
     return out;
   }
 
-  /// Publish an event to the local store + every enabled relay.
+  /// Publish an event to the local store + every enabled relay. Our own event
+  /// is also surfaced to matching open subscriptions so the feed shows it
+  /// immediately (it won't arrive back over a relay for a moment).
   Future<void> publish(NostrEvent event) async {
     if (store.put(event, tier: 0)) onStored?.call(event);
+    for (final e in _subFilters.entries) {
+      if (e.value.any((f) => NostrWire.matches(f, event))) {
+        _bufferForSub(e.key, event);
+      }
+    }
     for (final e in _endpoints.values) {
       if (!e.enabled) continue;
       // ignore: discarded_futures
       _clients[e.uri]?.publish(event);
+    }
+  }
+
+  void _bufferForSub(String subId, NostrEvent event) {
+    final inbox = _inbox[subId];
+    final seen = _seen[subId];
+    if (inbox == null || seen == null || event.id == null) return;
+    if (!seen.add(event.id!)) return;
+    inbox.add(event);
+    while (inbox.length > _maxInbox) {
+      inbox.removeFirst();
     }
   }
 

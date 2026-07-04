@@ -12,6 +12,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../util/nostr_event.dart';
 import 'nostr_relay_client.dart';
+import 'nostr_verify_pool.dart';
 import 'nostr_wire.dart';
 import 'relay_event_store.dart' show NostrFilter;
 
@@ -91,7 +92,9 @@ class NostrWsClient implements NostrRelayClient {
     if (msg == null) return;
     switch (msg) {
       case NostrEventMsg(:final subId, :final event):
-        if (event.verify()) onEvent?.call(subId, event);
+        // Verify OFF this isolate (Schnorr is the CPU hog under a firehose).
+        // The pool drops frames when saturated, so the UI thread never stalls.
+        NostrVerifyPool.instance.verify(raw, () => onEvent?.call(subId, event));
       case NostrEoseMsg(:final subId):
         onEose?.call(subId);
       case NostrNoticeMsg(:final message):

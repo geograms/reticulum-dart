@@ -21,6 +21,8 @@ class _RnsTcpServerConn implements RnsInterface {
   @override
   bool get announceOnly => false;
   @override
+  int get speedRank => 2;
+  @override
   bool get edge => false;
   // TCP/HDLC carries arbitrary-size frames (link MTU discovery).
   @override

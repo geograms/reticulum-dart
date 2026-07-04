@@ -19,6 +19,8 @@ class RnsUdpInterface implements RnsInterface {
   @override
   bool get announceOnly => false;
   @override
+  int get speedRank => 2;
+  @override
   bool get edge => false;
   @override
   int get hardwareMtu => kRnsMtu; // UDP datagrams: stay at the protocol MTU

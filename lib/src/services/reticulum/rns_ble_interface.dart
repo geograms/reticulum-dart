@@ -47,6 +47,8 @@ abstract class RnsBleRadio {
 class RnsBleInterface implements RnsInterface {
   @override
   bool get announceOnly => false;
+  @override
+  int get speedRank => 1; // BLE: slowest data medium
   // BLE can't carry large frames, so no MTU discovery — stay at protocol MTU.
   @override
   int get hardwareMtu => kRnsMtu;

@@ -39,6 +39,12 @@ abstract class RnsInterface {
   /// learned on a data-capable interface (the hub). Default false.
   bool get announceOnly => false;
 
+  /// Relative link speed for path preference among equally-capable paths:
+  /// a co-located peer reachable over BOTH the LAN and an internet hub (or
+  /// BLE) should be reached over the fastest medium. Higher = faster.
+  /// 3 = LAN, 2 = TCP/UDP (default), 1 = BLE.
+  int get speedRank => 2;
+
   /// The hardware MTU this interface can carry, used for link MTU discovery
   /// (RNS Interface.HW_MTU). The default [kRnsMtu] means "no discovery" — links
   /// over this interface stay at the 500-byte protocol MTU. Interfaces that can
@@ -409,6 +415,13 @@ class RnsTransport {
     return false;
   }
 
+  int _speedRank(String label) {
+    for (final i in _interfaces) {
+      if (i.label == label) return i.speedRank;
+    }
+    return 2;
+  }
+
   /// The next-hop transport for reaching [identity]'s destinations. A peer
   /// announces one destination (e.g. its chat dest), but every destination of
   /// that identity is reached via the same next hop, so we look up by identity.
@@ -504,9 +517,23 @@ class RnsTransport {
     } else if (!viaAnnounceOnly && existingAnnounceOnly) {
       replace = true;
     } else {
-      replace = pathHops <= existing.hops;
+      // Same capability class: prefer the faster medium first (a direct LAN
+      // path beats the internet hub AND BLE for a co-located peer), then
+      // fewer/equal hops (equal = LRU refresh of the same-quality path).
+      final newRank = _speedRank(via);
+      final oldRank = _speedRank(existing.via);
+      if (newRank != oldRank) {
+        replace = newRank > oldRank;
+      } else {
+        replace = pathHops <= existing.hops;
+      }
     }
     if (replace) {
+      if (existing != null && existing.via != via) {
+        log?.call('path ${_hex(ann.destHash).substring(0, 8)} '
+            '${existing.via} -> $via (rank ${_speedRank(existing.via)}'
+            '->${_speedRank(via)}, hops ${existing.hops}->$pathHops)');
+      }
       // Re-insert at the tail so recently-heard destinations are youngest —
       // the table is an LRU bounded by [_maxPaths] (below) so the network-wide
       // announce flood can't grow it without bound (the old OOM).

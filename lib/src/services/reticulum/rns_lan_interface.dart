@@ -1,23 +1,22 @@
 /*
- * RNS LAN interface — announce DISCOVERY by broadcast, DATA by unicast.
+ * RNS LAN interface — a subnet-broadcast shared medium (announces AND data).
  *
  * Same-network nodes find each other without a hub by exchanging ANNOUNCE
- * packets over the local subnet broadcast. Data (links, resources, DHT,
- * LXMF — anything) then flows DIRECTLY between the peers as UDP unicast at
- * LAN speed, so two co-located devices never route their traffic through an
- * internet hub just because they also see it.
+ * packets over the local subnet broadcast, and then their DATA (links,
+ * resources, DHT, LXMF — anything) flows over the same LAN at LAN speed, so two
+ * co-located devices never route their traffic through an internet hub just
+ * because they also see it.
  *
- * Flood safety (the reason this interface was once announce-only): the
- * transport fans some outbound packets onto every interface. Carrying data
- * as subnet BROADCAST would blast a busy hub\'s transit traffic across the
- * LAN and every node would re-process it. Instead:
- *   - send():   announces -> subnet broadcast (discovery, as before);
- *               data -> UNICAST, one copy per known Aurora peer (bounded,
- *               typically 1-3 on a home LAN); with NO fresh peer it falls
- *               back to a single broadcast so a preferred-LAN link can't
- *               black-hole when the peer table lapses.
- *   - receive(): learns the sender's address off any datagram (peer table,
- *               10 min TTL) and passes the packet up; own loopback dropped.
+ * This interface was once announce-only for flood safety: a TRANSPORT node
+ * relaying a busy hub's transit onto the LAN as broadcast would peg every
+ * node's CPU. A leaf node (edge-bridge off) only ever emits its own low-rate
+ * link traffic, so carrying data here is safe and bounded. Behaviour:
+ *   - send():   ONE subnet broadcast for everything (announces AND data),
+ *               like reference RNS shared-medium interfaces — the medium is a
+ *               broadcast bus and RNS dedup + addressing decide who keeps each
+ *               packet. (A prior per-peer unicast optimization black-holed
+ *               link replies and hung every fetch on 'handshake failed'.)
+ *   - receive(): passes every packet up; our own broadcast echo is dropped.
  * One raw RNS packet per UDP datagram.
  */
 import 'dart:async';
@@ -52,12 +51,6 @@ class RnsLanInterface implements RnsInterface {
   RawDatagramSocket? _socket;
   late final InternetAddress _broadcastAddr;
 
-  /// Announce-known peers: address-key -> (addr, port, last heard). Data is
-  /// unicast to these only. Bounded; stale entries age out.
-  final Map<String, _LanPeer> _peers = {};
-  static const int _peerTtlMs = 10 * 60 * 1000;
-  static const int _maxPeers = 16;
-
   RnsLanInterface({
     required this.port,
     required this.onPacket,
@@ -70,9 +63,16 @@ class RnsLanInterface implements RnsInterface {
   static bool _isAnnounce(Uint8List raw) =>
       raw.isNotEmpty && (raw[0] & 0x03) == RnsPacketType.announce;
 
-  /// Local addresses, so our own broadcast loopback never registers us as a
-  /// peer (we would unicast every packet to ourselves).
+  /// Our own IPv4 addresses, so our broadcast loopback (which we also receive)
+  /// is never re-processed as if it came from a peer.
   final Set<String> _selfAddrs = {};
+
+  /// Subnet-DIRECTED broadcast addresses (x.y.z.255 for each local /24), sent
+  /// IN ADDITION to the limited 255.255.255.255 — many Android/Wi-Fi setups
+  /// silently drop the limited broadcast (asymmetrically, per device) while
+  /// forwarding the subnet-directed one, which black-holed one direction of the
+  /// LAN and hung co-located fetches. Belt and suspenders: send to both.
+  final List<InternetAddress> _directedBcast = [];
 
   Future<void> bind() async {
     _broadcastAddr = InternetAddress(broadcastHost);
@@ -83,24 +83,31 @@ class RnsLanInterface implements RnsInterface {
       for (final ni in await NetworkInterface.list(
           type: InternetAddressType.IPv4)) {
         for (final a in ni.addresses) {
+          if (a.isLoopback) continue;
           _selfAddrs.add(a.address);
+          // Assume a /24 (the near-universal home-LAN mask; Dart's
+          // NetworkInterface exposes no netmask) → x.y.z.255.
+          final parts = a.address.split('.');
+          if (parts.length == 4) {
+            final directed = '${parts[0]}.${parts[1]}.${parts[2]}.255';
+            if (!_directedBcast.any((d) => d.address == directed)) {
+              _directedBcast.add(InternetAddress(directed));
+            }
+          }
         }
       }
     } catch (_) {}
-    log?.call('LAN on UDP $port (announce broadcast + unicast data)');
+    log?.call('LAN on UDP $port (broadcast + ${_directedBcast.length} '
+        'subnet-directed, announces + data)');
     s.listen((event) {
       if (event != RawSocketEvent.read) return;
       final dg = s.receive();
       if (dg == null) return;
-      final fromSelf = _selfAddrs.contains(dg.address.address);
-      if (fromSelf) {
-        // Our own broadcast loopback — never re-process or self-register.
-        if (!_isAnnounce(dg.data)) return;
-      } else {
-        // Learn the peer address off ANY datagram (announce OR data), so the
-        // unicast table stays warm between the 30 s+ announce periods and a
-        // live link keeps its own return path fresh.
-        _learnPeer(dg.address, dg.port);
+      // Drop our own broadcast echo (we receive what we send). An announce from
+      // self is harmless (the transport ignores it), but data would be
+      // re-processed, so gate on the source being one of our addresses.
+      if (_selfAddrs.contains(dg.address.address) && !_isAnnounce(dg.data)) {
+        return;
       }
       try {
         onPacket(Uint8List.fromList(dg.data));
@@ -110,53 +117,28 @@ class RnsLanInterface implements RnsInterface {
     });
   }
 
-  void _learnPeer(InternetAddress addr, int fromPort) {
-    final key = addr.address;
-    final known = _peers.containsKey(key);
-    _peers[key] = _LanPeer(addr, fromPort == 0 ? port : fromPort,
-        DateTime.now().millisecondsSinceEpoch);
-    if (!known) log?.call('peer $key joined (${_peers.length} on LAN)');
-    if (_peers.length > _maxPeers) {
-      // Evict the stalest.
-      String? oldest;
-      var oldestMs = 1 << 62;
-      for (final e in _peers.entries) {
-        if (e.value.lastMs < oldestMs) {
-          oldestMs = e.value.lastMs;
-          oldest = e.key;
-        }
-      }
-      if (oldest != null) _peers.remove(oldest);
-    }
-  }
-
   @override
   void send(Uint8List packetRaw) {
     final s = _socket;
     if (s == null) return;
-    if (_isAnnounce(packetRaw)) {
-      s.send(packetRaw, _broadcastAddr, port); // discovery, as always
-      return;
-    }
-    // Data: unicast to each fresh announce-known peer. But once a path is
-    // preferred over the LAN (speedRank), the transport single-homes traffic
-    // on THIS interface — so if the peer table has lapsed (its 10-min TTL
-    // expired between announces, or we prefer LAN before the first data-time
-    // announce landed) a silent drop here would black-hole the whole link,
-    // with no hub fallback. So when we have no fresh unicast target, BROADCAST
-    // the data: a co-located peer still gets it, and the cost is bounded — a
-    // home LAN has a handful of nodes and a normal node's own link/resource
-    // traffic is low-rate (the flood the announce-only design guarded against
-    // was a transport node relaying a busy hub's transit stream, which still
-    // reaches its peers by the unicast path below).
-    final cutoff = DateTime.now().millisecondsSinceEpoch - _peerTtlMs;
-    _peers.removeWhere((_, p) => p.lastMs < cutoff);
-    if (_peers.isEmpty) {
-      s.send(packetRaw, _broadcastAddr, port);
-      return;
-    }
-    for (final p in _peers.values) {
-      s.send(packetRaw, p.addr, p.port);
+    // Everything — announces AND data — goes out as ONE subnet broadcast, the
+    // way reference RNS shared-medium interfaces (UDP/Auto) work: the medium IS
+    // a broadcast bus, and RNS's own packet dedup + destination addressing sort
+    // out who keeps each packet. An earlier per-peer UNICAST optimization here
+    // silently black-holed link traffic — a link's reply (LRPROOF/LRRTT) is
+    // addressed to the link id and routed back on THIS interface, but the
+    // unicast target/port could be stale or wrong, so the proof never reached
+    // the initiator and every file/folder fetch hung on 'handshake attempt N
+    // failed'. Broadcast is loss-free of that failure mode. The flood the
+    // announce-only design once guarded against is a TRANSPORT node relaying a
+    // busy hub's transit onto the LAN; a leaf node (edge-bridge off) only emits
+    // its own low-rate link traffic, and a home LAN has a handful of nodes, so
+    // the cost is bounded. Our own broadcast loopback is dropped on receive.
+    // Send to BOTH the limited broadcast and every subnet-directed address, so
+    // a peer whose Wi-Fi drops one form still receives via the other.
+    s.send(packetRaw, _broadcastAddr, port);
+    for (final d in _directedBcast) {
+      s.send(packetRaw, d, port);
     }
   }
 
@@ -166,9 +148,3 @@ class RnsLanInterface implements RnsInterface {
   }
 }
 
-class _LanPeer {
-  final InternetAddress addr;
-  final int port;
-  final int lastMs;
-  _LanPeer(this.addr, this.port, this.lastMs);
-}

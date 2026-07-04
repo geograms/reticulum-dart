@@ -300,6 +300,16 @@ class RnsTransport {
           }
         }
       }
+      // NOTE: a HEADER_1 link REQUEST (destType single) is deliberately NOT
+      // pinned to its path's interface — it goes out on ALL of them (below).
+      // The handshake must round-trip, and a shared-medium LAN can be
+      // ASYMMETRIC (observed live: A's subnet broadcasts reach B but B's never
+      // reach A — AP broadcast filtering). Pinning the request to the LAN then
+      // black-holed it with no hub fallback. Redundant delivery lets the link
+      // form over whichever direction/medium actually works; once it does, the
+      // PROOF's arrival interface is recorded (noteLinkIface) and all further
+      // link DATA sticks to that proven-bidirectional interface (the block
+      // above), so only the tiny request packet is duplicated.
     }
     sendOnAll(raw);
   }

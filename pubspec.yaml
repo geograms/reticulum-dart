@@ -22,6 +22,7 @@ dependencies:
   bech32: ^0.2.2            # npub / nsec encoding
   hex: ^0.2.0               # hex <-> bytes
   sqlite3: ^2.4.0           # event store / media archive
+  web_socket_channel: ^3.0.0 # wss:// NOSTR relays (native + web)
   archive: ^3.6.1           # BLE parcel (de)compression
   bluetooth_low_energy: ^6.0.0   # BLE central + peripheral (GATT)
   ble_peripheral: ^2.4.0         # BLE advertising (peripheral)

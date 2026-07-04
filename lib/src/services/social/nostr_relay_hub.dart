@@ -10,6 +10,7 @@
  * The relay list is persisted as JSON so it survives restarts and is
  * pre-populated with common relays on first run.
  */
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
@@ -234,6 +235,93 @@ class NostrRelayHub {
     }
   }
 
+  // ── Discovery feed (for users who follow nobody) ────────────────────────────
+  // A raw kind-1 firehose is mostly spam/repeats. Instead we watch the kind-7
+  // REACTION firehose, tally distinct likers per event, and only surface a post
+  // once it has crossed a like threshold — then fetch that specific note by id.
+  // Spam gets no reactions, so it never appears.
+  String? _discoFeedSub; // the subId the wapp drains
+  String? _discoReactSub; // internal kind-7 subscription
+  int _discoMinLikes = 3;
+  final Map<String, Set<String>> _discoLikers = {}; // eventId → distinct likers
+  final Set<String> _discoWanted = {}; // ids past the threshold
+  final Set<String> _discoFetched = {}; // ids already requested
+  final List<String> _discoToFetch = []; // newly wanted, awaiting a REQ
+  Timer? _discoTimer;
+
+  /// Start (or return) the discovery feed: a subId that only receives kind-1
+  /// posts which have gathered at least [minLikes] distinct reactions.
+  String subscribeDiscovery({int minLikes = 3}) {
+    final existing = _discoFeedSub;
+    if (existing != null) return existing;
+    _discoMinLikes = minLikes;
+    final feed = 'disco${_subSeq++}';
+    _discoFeedSub = feed;
+    _inbox[feed] = Queue<NostrEvent>();
+    _seen[feed] = <String>{};
+    // Internal reactions subscription — tallied, never drained by the wapp.
+    final react = 'discoR${_subSeq++}';
+    _discoReactSub = react;
+    final rf = [const NostrFilter(kinds: [7], limit: 500)];
+    _subFilters[react] = rf;
+    _inbox[react] = Queue<NostrEvent>();
+    _seen[react] = <String>{};
+    for (final e in _endpoints.values) {
+      if (e.enabled) _clients[e.uri]?.subscribe(react, rf);
+    }
+    _discoTimer ??=
+        Timer.periodic(const Duration(seconds: 3), (_) => _discoFetch());
+    return feed;
+  }
+
+  void _discoFetch() {
+    if (_discoToFetch.isEmpty) return;
+    final batch = <String>[];
+    while (_discoToFetch.isNotEmpty && batch.length < 100) {
+      batch.add(_discoToFetch.removeAt(0));
+    }
+    final sub = 'discoF${_subSeq++}';
+    final f = [NostrFilter(ids: batch, kinds: const [1])];
+    _subFilters[sub] = f;
+    _inbox[sub] = Queue<NostrEvent>();
+    _seen[sub] = <String>{};
+    for (final e in _endpoints.values) {
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
+    }
+  }
+
+  static String? _firstETag(NostrEvent e) {
+    for (final t in e.tags) {
+      if (t.length >= 2 && t[0] == 'e') return t[1];
+    }
+    return null;
+  }
+
+  /// Fold a reaction into the like tally; returns true if this was a reaction
+  /// (so the caller skips normal store/buffer work for it).
+  bool _discoTally(NostrEvent event) {
+    if (_discoFeedSub == null || event.kind != NostrEventKind.reaction) {
+      return false;
+    }
+    final liked = _firstETag(event);
+    if (liked == null) return true;
+    final likers = _discoLikers.putIfAbsent(liked, () => <String>{});
+    likers.add(event.pubkey);
+    if (likers.length >= _discoMinLikes && _discoFetched.add(liked)) {
+      _discoWanted.add(liked);
+      _discoToFetch.add(liked);
+    }
+    // Bound the tally map: forget the least-liked once it grows too large.
+    if (_discoLikers.length > 8000) {
+      final weak =
+          _discoLikers.entries.where((e) => e.value.length < 2).map((e) => e.key).take(2000);
+      for (final k in weak.toList()) {
+        _discoLikers.remove(k);
+      }
+    }
+    return true;
+  }
+
   // Delivery rate cap: bounds the SQLite/dispatch work this (UI/engine) isolate
   // does per second, so a public firehose is SAMPLED instead of flooding the
   // main thread. A followed/web-of-trust feed is low-volume and never trips it.
@@ -244,6 +332,11 @@ class NostrRelayHub {
   int rateDropped = 0;
 
   void _onEvent(String subId, NostrEvent event) {
+    // Reactions drive the discovery tally only — never stored/buffered (they are
+    // high-volume and would just be main-thread noise). Do this BEFORE the rate
+    // cap so a busy reaction stream still feeds discovery.
+    if (_discoTally(event)) return;
+
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _rateWindowStart >= _rateWindowMs) {
       _rateWindowStart = now;
@@ -256,6 +349,13 @@ class NostrRelayHub {
     _rateCount++;
     // Merge into the unified store (dedup + replaceable/deletion handled there).
     if (store.put(event)) onStored?.call(event);
+    // A liked-enough post (fetched by id) goes to the discovery feed too.
+    if (_discoFeedSub != null &&
+        event.kind == NostrEventKind.textNote &&
+        event.id != null &&
+        _discoWanted.contains(event.id)) {
+      _bufferForSub(_discoFeedSub!, event);
+    }
     _bufferForSub(subId, event);
     final seen = _seen[subId];
     if (seen != null && seen.length > _maxInbox * 4) seen.clear();
@@ -302,6 +402,8 @@ class NostrRelayHub {
   }
 
   Future<void> close() async {
+    _discoTimer?.cancel();
+    _discoTimer = null;
     for (final c in _clients.values) {
       await c.close();
     }

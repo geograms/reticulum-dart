@@ -51,6 +51,7 @@ class NostrClient {
   List<Map<String, dynamic>> _relays = const [];
   final Map<String, List<Map<String, dynamic>>> _subEvents = {}; // subId → queue
   final Map<String, (int, int, bool)> _stats = {}; // eventId → (likes,replies,mine)
+  final Set<String> _likedLocally = {}; // ids we've liked (keep them filled)
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
   final Map<String, List<Map<String, dynamic>>> _replies = {}; // postId → replies
   static const int _subQueueMax = 800;
@@ -106,7 +107,13 @@ class NostrClient {
       case 'stats':
         (msg['entries'] as Map).forEach((k, v) {
           final l = (v as List);
-          _stats['$k'] = (l[0] as int, l[1] as int, l[2] as bool);
+          var likes = l[0] as int;
+          var mine = l[2] as bool;
+          if (_likedLocally.contains('$k')) {
+            mine = true; // keep our own like filled until the engine confirms
+            if (likes < 1) likes = 1;
+          }
+          _stats['$k'] = (likes, l[1] as int, mine);
         });
       case 'profiles':
         (msg['entries'] as Map).forEach((k, v) {
@@ -197,6 +204,7 @@ class NostrClient {
 
   void recordReaction(String id, String pub) {
     // Optimistic local bump so the heart fills before it round-trips.
+    _likedLocally.add(id);
     final cur = _stats[id] ?? (0, 0, false);
     if (!cur.$3) _stats[id] = (cur.$1 + 1, cur.$2, true);
     _send({'cmd': 'recordReaction', 'id': id, 'pub': pub});

@@ -321,6 +321,13 @@ class NostrRelayHub {
     if (likers.length >= _discoMinLikes && _discoFetched.add(liked)) {
       _discoWanted.add(liked);
       _discoToFetch.add(liked);
+      // Seed the on-screen like tally with the reactions that qualified this
+      // post, so it shows its real count (>=2) immediately instead of 0.
+      _statReact.putIfAbsent(liked, () => <String>{}).addAll(likers);
+      if (!_statTracked.contains(liked)) {
+        _statTracked.add(liked);
+        _statReply.putIfAbsent(liked, () => <String>{});
+      }
     }
     // Bound the tally map: forget the least-liked once it grows too large.
     if (_discoLikers.length > 8000) {

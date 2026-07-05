@@ -441,13 +441,18 @@ class NostrRelayHub {
   }
 
   void _profResub() {
-    // Only fetch profiles we DON'T already have cached in the store — the store
-    // is persistent, so a name we saw last session isn't downloaded again.
-    final missing = [
-      for (final p in _profTracked)
-        if (profileOf(p) == null) p
-    ];
-    if (missing.isEmpty) return;
+    if (_profTracked.isEmpty) return;
+    // Re-subscribe kind-0 for ALL tracked authors. The persistent store already
+    // avoids cross-session re-download (profileOf reads it); re-subscribing here
+    // keeps retrying authors whose kind-0 hasn't arrived yet, which matters for
+    // name coverage under a busy feed. Prioritise authors we DON'T yet have so a
+    // huge author list can't starve the un-resolved ones.
+    final have = <String>[];
+    final missing = <String>[];
+    for (final p in _profTracked) {
+      (profileOf(p) == null ? missing : have).add(p);
+    }
+    final authors = [...missing, ...have];
     final prev = _profSub;
     if (prev != null) {
       _subFilters.remove(prev);
@@ -459,7 +464,7 @@ class NostrRelayHub {
     }
     final sub = 'prof${_subSeq++}';
     _profSub = sub;
-    final f = [NostrFilter(kinds: const [0], authors: missing)];
+    final f = [NostrFilter(kinds: const [0], authors: authors)];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};

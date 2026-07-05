@@ -214,8 +214,12 @@ class NostrRelayHub {
 
   /// Open a subscription across every enabled relay. Returns a subId the wapp
   /// uses to [drainEvents]. Also answers immediately from the local store.
-  String subscribe(List<NostrFilter> filters) {
-    final subId = 'h${_subSeq++}';
+  String subscribe(List<NostrFilter> filters) =>
+      subscribeWithId('h${_subSeq++}', filters);
+
+  /// As [subscribe] but with a caller-supplied id (the off-isolate engine mints
+  /// ids on the main side and passes them through).
+  String subscribeWithId(String subId, List<NostrFilter> filters) {
     _subFilters[subId] = filters;
     _inbox[subId] = Queue<NostrEvent>();
     _seen[subId] = <String>{};
@@ -249,13 +253,20 @@ class NostrRelayHub {
   final List<String> _discoToFetch = []; // newly wanted, awaiting a REQ
   Timer? _discoTimer;
 
+  /// Ids of posts we count engagement for, and pubkeys we resolve profiles for
+  /// (the off-isolate engine polls these to build its snapshots).
+  Iterable<String> get trackedStatIds => _statTracked;
+  Iterable<String> get trackedProfilePubs => _profTracked;
+
   /// Start (or return) the discovery feed: a subId that only receives kind-1
   /// posts which have gathered at least [minLikes] distinct reactions.
-  String subscribeDiscovery({int minLikes = 3}) {
+  String subscribeDiscovery({int minLikes = 3}) =>
+      subscribeDiscoveryWithId('disco${_subSeq++}', minLikes: minLikes);
+
+  String subscribeDiscoveryWithId(String feed, {int minLikes = 3}) {
     final existing = _discoFeedSub;
     if (existing != null) return existing;
     _discoMinLikes = minLikes;
-    final feed = 'disco${_subSeq++}';
     _discoFeedSub = feed;
     _inbox[feed] = Queue<NostrEvent>();
     _seen[feed] = <String>{};

@@ -53,6 +53,7 @@ class NostrClient {
   final Map<String, (int, int, bool)> _stats = {}; // eventId → (likes,replies,mine)
   final Set<String> _likedLocally = {}; // ids we've liked (keep them filled)
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
+  final Map<String, Map<String, String>> _profByShort12 = {}; // pub[:12] → profile
   final Map<String, List<Map<String, dynamic>>> _replies = {}; // postId → replies
   static const int _subQueueMax = 800;
 
@@ -117,7 +118,9 @@ class NostrClient {
         });
       case 'profiles':
         (msg['entries'] as Map).forEach((k, v) {
-          _profiles['$k'] = (v as Map).cast<String, String>();
+          final m = (v as Map).cast<String, String>();
+          _profiles['$k'] = m;
+          if ('$k'.length >= 12) _profByShort12['$k'.substring(0, 12)] = m;
         });
       case 'replies':
         _replies['${msg['id']}'] =
@@ -222,6 +225,13 @@ class NostrClient {
     return _profiles[pub] ?? const {};
   }
 
+  /// Resolve a profile by the 12-char pubkey prefix the UI uses as a post's
+  /// `from`. Backed by the engine's PERSISTENT store (every kind-0 ever seen is
+  /// broadcast to this index at startup), so authors resolve even when they're
+  /// not in the current live feed (Saved tab, old threads). {} if unknown.
+  Map<String, String> profileByShort12(String short12) =>
+      _profByShort12[short12] ?? const {};
+
   // ── Replies ─────────────────────────────────────────────────────────────
   List<Map<String, dynamic>> replies(String postId) {
     _send({'cmd': 'fetchReplies', 'id': postId}); // refresh (lazy)
@@ -272,10 +282,34 @@ class _Engine {
       // ignore: discarded_futures
       _hub.init();
       _ok = true;
+      _sendStoredProfiles(); // hydrate the UI's profile index from disk
       _timer = Timer.periodic(const Duration(milliseconds: 400), (_) => _tick());
     } catch (_) {
       _ok = false;
     }
+  }
+
+  /// Broadcast EVERY kind-0 profile already in the persistent store to the main
+  /// isolate at startup, so authors resolve in every view (Saved, old threads,
+  /// profile page) without being in the current live feed.
+  void _sendStoredProfiles() {
+    try {
+      final evs = _store.query(const NostrFilter(kinds: [0], limit: 5000));
+      final seen = <String>{};
+      final entries = <String, Map<String, String>>{};
+      for (final e in evs) {
+        if (!seen.add(e.pubkey)) continue;
+        final m = _profileMap(e.pubkey);
+        if (m['name'] != null) {
+          entries[e.pubkey] = m;
+          _profSent.add(e.pubkey);
+        }
+        if (entries.length >= 4000) break;
+      }
+      if (entries.isNotEmpty) {
+        toMain.send({'snap': 'profiles', 'entries': entries});
+      }
+    } catch (_) {}
   }
 
   void handle(Map<String, dynamic> c) {

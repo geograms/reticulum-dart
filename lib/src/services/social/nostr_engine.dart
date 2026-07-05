@@ -55,6 +55,7 @@ class NostrClient {
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
   final Map<String, Map<String, String>> _profByShort12 = {}; // pub[:12] → profile
   final Map<String, List<Map<String, dynamic>>> _replies = {}; // postId → replies
+  List<String> _myFollows = const []; // my kind-3 contact list (hex pubkeys)
   static const int _subQueueMax = 800;
 
   /// Optional: notified (throttled) when caches change, so the UI can repaint.
@@ -125,6 +126,8 @@ class NostrClient {
       case 'replies':
         _replies['${msg['id']}'] =
             (msg['events'] as List).cast<Map<String, dynamic>>();
+      case 'myFollows':
+        _myFollows = (msg['pubs'] as List).cast<String>();
     }
     onChanged?.call();
   }
@@ -232,6 +235,9 @@ class NostrClient {
   Map<String, String> profileByShort12(String short12) =>
       _profByShort12[short12] ?? const {};
 
+  /// My kind-3 contact list (hex pubkeys), fetched from the relays.
+  List<String> myFollows() => _myFollows;
+
   // ── Replies ─────────────────────────────────────────────────────────────
   List<Map<String, dynamic>> replies(String postId) {
     _send({'cmd': 'fetchReplies', 'id': postId}); // refresh (lazy)
@@ -268,6 +274,8 @@ class _Engine {
   final Set<String> _drainSubs = {}; // wapp-facing subs to push to main
   final Map<String, (int, int, bool)> _statsSent = {};
   final Set<String> _profSent = {};
+  bool _myFollowsSub = false; // subscribed my kind-3 yet
+  Set<String>? _myFollowsSent; // last contact-list set sent to main
   Timer? _timer;
   bool _ok = false;
 
@@ -357,9 +365,43 @@ class _Engine {
             if (f is Map) NostrFilter.fromJson(f.cast<String, dynamic>())
       ];
 
+  /// The NOSTR way to know who I follow: subscribe my own kind-3 contact list
+  /// from the relays, parse its p-tags, and push the pubkeys to the main isolate
+  /// (so follows made on ANY client show up here, not just local follows).
+  void _syncMyFollows() {
+    final me = selfPub;
+    if (me == null || me.length != 64) return;
+    if (!_myFollowsSub) {
+      _myFollowsSub = true;
+      _hub.subscribeWithId(
+          'myfollows', [NostrFilter(kinds: const [3], authors: [me])]);
+    }
+    NostrEvent? latest;
+    for (final e in _store.query(NostrFilter(kinds: const [3], authors: [me]))) {
+      if (latest == null || e.createdAt > latest.createdAt) latest = e;
+    }
+    if (latest == null) return;
+    final pubs = <String>{};
+    for (final t in latest.tags) {
+      if (t.length >= 2 && t[0] == 'p' && t[1].length == 64) {
+        pubs.add(t[1].toLowerCase());
+      }
+    }
+    if (pubs.isEmpty) return;
+    if (_myFollowsSent != null &&
+        _myFollowsSent!.length == pubs.length &&
+        _myFollowsSent!.containsAll(pubs)) {
+      return; // unchanged
+    }
+    _myFollowsSent = pubs;
+    toMain.send({'snap': 'myFollows', 'pubs': pubs.toList()});
+  }
+
   void _tick() {
     // Relay statuses.
     toMain.send({'snap': 'relays', 'json': _hub.relaysJson()});
+
+    _syncMyFollows();
 
     // Drained events per wapp-facing sub.
     for (final sub in _drainSubs) {

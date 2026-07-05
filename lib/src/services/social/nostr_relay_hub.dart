@@ -246,7 +246,7 @@ class NostrRelayHub {
   // Spam gets no reactions, so it never appears.
   String? _discoFeedSub; // the subId the wapp drains
   String? _discoReactSub; // internal kind-7 subscription
-  int _discoMinLikes = 3;
+  int _discoMinLikes = 2;
   final Map<String, Set<String>> _discoLikers = {}; // eventId → distinct likers
   final Set<String> _discoWanted = {}; // ids past the threshold
   final Set<String> _discoFetched = {}; // ids already requested
@@ -260,10 +260,10 @@ class NostrRelayHub {
 
   /// Start (or return) the discovery feed: a subId that only receives kind-1
   /// posts which have gathered at least [minLikes] distinct reactions.
-  String subscribeDiscovery({int minLikes = 3}) =>
+  String subscribeDiscovery({int minLikes = 2}) =>
       subscribeDiscoveryWithId('disco${_subSeq++}', minLikes: minLikes);
 
-  String subscribeDiscoveryWithId(String feed, {int minLikes = 3}) {
+  String subscribeDiscoveryWithId(String feed, {int minLikes = 2}) {
     final existing = _discoFeedSub;
     if (existing != null) return existing;
     _discoMinLikes = minLikes;

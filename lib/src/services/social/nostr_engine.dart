@@ -173,7 +173,7 @@ class NostrClient {
     return subId;
   }
 
-  String subscribeDiscovery({int minLikes = 3}) {
+  String subscribeDiscovery({int minLikes = 2}) {
     final subId = 'd${_subSeq++}';
     _subEvents[subId] = [];
     _send({'cmd': 'discovery', 'subId': subId, 'minLikes': minLikes});
@@ -336,7 +336,7 @@ class _Engine {
           final subId = '${c['subId']}';
           _drainSubs.add(subId);
           _hub.subscribeDiscoveryWithId(subId,
-              minLikes: (c['minLikes'] as int?) ?? 3);
+              minLikes: (c['minLikes'] as int?) ?? 2);
         case 'unsubscribe':
           _drainSubs.remove('${c['subId']}');
           _hub.unsubscribe('${c['subId']}');

@@ -244,7 +244,7 @@ class NostrClient {
 /// The actual worker living on the background isolate.
 class _Engine {
   final SendPort toMain;
-  final String? selfPub;
+  String? selfPub; // learned from the first reaction if unset at spawn
   late final RelayEventStore _store;
   late final NostrRelayHub _hub;
   final Set<String> _drainSubs = {}; // wapp-facing subs to push to main
@@ -296,7 +296,9 @@ class _Engine {
         case 'trackStats':
           _hub.trackStats((c['ids'] as List).cast<String>());
         case 'recordReaction':
-          _hub.recordReaction('${c['id']}', '${c['pub']}');
+          final pub = '${c['pub']}';
+          selfPub ??= pub; // learn our pubkey so the mine-check works
+          _hub.recordReaction('${c['id']}', pub);
         case 'trackProfile':
           _hub.trackProfile('${c['pub']}');
         case 'fetchReplies':

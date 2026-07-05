@@ -352,7 +352,7 @@ class NostrRelayHub {
       _statReply[id] = <String>{};
       added = true;
     }
-    while (_statTracked.length > 120) {
+    while (_statTracked.length > 300) {
       final old = _statTracked.removeAt(0);
       _statReact.remove(old);
       _statReply.remove(old);
@@ -433,7 +433,7 @@ class NostrRelayHub {
   void trackProfile(String pub) {
     if (pub.length != 64 || !_profSeen.add(pub)) return;
     _profTracked.add(pub);
-    while (_profTracked.length > 120) {
+    while (_profTracked.length > 500) {
       _profSeen.remove(_profTracked.removeAt(0));
     }
     _profDebounce?.cancel();

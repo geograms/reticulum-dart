@@ -341,7 +341,7 @@ class NostrRelayHub {
       _statReply[id] = <String>{};
       added = true;
     }
-    while (_statTracked.length > 300) {
+    while (_statTracked.length > 120) {
       final old = _statTracked.removeAt(0);
       _statReact.remove(old);
       _statReply.remove(old);
@@ -422,7 +422,7 @@ class NostrRelayHub {
   void trackProfile(String pub) {
     if (pub.length != 64 || !_profSeen.add(pub)) return;
     _profTracked.add(pub);
-    while (_profTracked.length > 400) {
+    while (_profTracked.length > 120) {
       _profSeen.remove(_profTracked.removeAt(0));
     }
     _profDebounce?.cancel();
@@ -478,7 +478,7 @@ class NostrRelayHub {
   // does per second, so a public firehose is SAMPLED instead of flooding the
   // main thread. A followed/web-of-trust feed is low-volume and never trips it.
   static const int _rateWindowMs = 250;
-  static const int _rateMaxPerWindow = 40; // ~160 events/s ceiling
+  static const int _rateMaxPerWindow = 15; // ~60 events/s ceiling (main-thread SQLite)
   int _rateWindowStart = 0;
   int _rateCount = 0;
   int rateDropped = 0;

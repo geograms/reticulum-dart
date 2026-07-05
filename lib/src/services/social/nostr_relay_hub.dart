@@ -411,6 +411,69 @@ class NostrRelayHub {
     if (!_statTracked.contains(id)) _statTracked.add(id);
   }
 
+  // ── Profiles (kind-0 metadata for post authors) ─────────────────────────────
+  final List<String> _profTracked = []; // rolling set of author pubkeys
+  final Set<String> _profSeen = {};
+  String? _profSub;
+  Timer? _profDebounce;
+
+  /// Ensure we subscribe to (and thus store) the kind-0 profile for [pub]. Safe
+  /// to call repeatedly; a rolling window keeps the REQ bounded.
+  void trackProfile(String pub) {
+    if (pub.length != 64 || !_profSeen.add(pub)) return;
+    _profTracked.add(pub);
+    while (_profTracked.length > 400) {
+      _profSeen.remove(_profTracked.removeAt(0));
+    }
+    _profDebounce?.cancel();
+    _profDebounce = Timer(const Duration(milliseconds: 700), _profResub);
+  }
+
+  void _profResub() {
+    if (_profTracked.isEmpty) return;
+    final prev = _profSub;
+    if (prev != null) {
+      _subFilters.remove(prev);
+      _inbox.remove(prev);
+      _seen.remove(prev);
+      for (final c in _clients.values) {
+        c.unsubscribe(prev);
+      }
+    }
+    final sub = 'prof${_subSeq++}';
+    _profSub = sub;
+    final f = [
+      NostrFilter(kinds: const [0], authors: List<String>.from(_profTracked))
+    ];
+    _subFilters[sub] = f;
+    _inbox[sub] = Queue<NostrEvent>();
+    _seen[sub] = <String>{};
+    for (final e in _endpoints.values) {
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
+    }
+  }
+
+  /// Stored kind-1 replies to [postId] (events that #e it), oldest first.
+  List<NostrEvent> repliesTo(String postId) {
+    final evs = store.query(NostrFilter(kinds: const [1], tags: {'e': [postId]}));
+    final out = evs
+        .where((e) => e.tags
+            .any((t) => t.length >= 2 && t[0] == 'e' && t[1] == postId))
+        .toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    return out;
+  }
+
+  /// The latest stored kind-0 profile event for [pub], if any.
+  NostrEvent? profileOf(String pub) {
+    final evs = store.query(NostrFilter(kinds: const [0], authors: [pub]));
+    NostrEvent? best;
+    for (final e in evs) {
+      if (best == null || e.createdAt > best.createdAt) best = e;
+    }
+    return best;
+  }
+
   // Delivery rate cap: bounds the SQLite/dispatch work this (UI/engine) isolate
   // does per second, so a public firehose is SAMPLED instead of flooding the
   // main thread. A followed/web-of-trust feed is low-volume and never trips it.
@@ -497,6 +560,8 @@ class NostrRelayHub {
     _discoTimer = null;
     _statDebounce?.cancel();
     _statDebounce = null;
+    _profDebounce?.cancel();
+    _profDebounce = null;
     for (final c in _clients.values) {
       await c.close();
     }

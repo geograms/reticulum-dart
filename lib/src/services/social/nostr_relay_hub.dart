@@ -441,7 +441,13 @@ class NostrRelayHub {
   }
 
   void _profResub() {
-    if (_profTracked.isEmpty) return;
+    // Only fetch profiles we DON'T already have cached in the store — the store
+    // is persistent, so a name we saw last session isn't downloaded again.
+    final missing = [
+      for (final p in _profTracked)
+        if (profileOf(p) == null) p
+    ];
+    if (missing.isEmpty) return;
     final prev = _profSub;
     if (prev != null) {
       _subFilters.remove(prev);
@@ -453,9 +459,7 @@ class NostrRelayHub {
     }
     final sub = 'prof${_subSeq++}';
     _profSub = sub;
-    final f = [
-      NostrFilter(kinds: const [0], authors: List<String>.from(_profTracked))
-    ];
+    final f = [NostrFilter(kinds: const [0], authors: missing)];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};

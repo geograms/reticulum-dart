@@ -306,16 +306,26 @@ class RnsTransport {
           }
         }
       }
-      // NOTE: a HEADER_1 link REQUEST (destType single) is deliberately NOT
-      // pinned to its path's interface — it goes out on ALL of them (below).
-      // The handshake must round-trip, and a shared-medium LAN can be
-      // ASYMMETRIC (observed live: A's subnet broadcasts reach B but B's never
-      // reach A — AP broadcast filtering). Pinning the request to the LAN then
-      // black-holed it with no hub fallback. Redundant delivery lets the link
-      // form over whichever direction/medium actually works; once it does, the
-      // PROOF's arrival interface is recorded (noteLinkIface) and all further
-      // link DATA sticks to that proven-bidirectional interface (the block
-      // above), so only the tiny request packet is duplicated.
+      // A HEADER_1 link REQUEST (destType single) normally goes out on ALL
+      // interfaces (below): the handshake must round-trip, and a shared-medium
+      // LAN can be ASYMMETRIC (A's subnet broadcasts reach B but not vice-versa
+      // — AP broadcast filtering), so pinning to the LAN could black-hole it.
+      // EXCEPTION: a top-rank (≥4) interface is a dedicated point-to-point pipe
+      // — a WiFi-Direct P2P link — which is symmetric by construction and has no
+      // hub fallback to preserve. Pin the request to it so the RESPONDER hears
+      // it over that link and confirms the link's large MTU; otherwise the peer
+      // accepts a duplicate that arrived over a 500-MTU medium first and the two
+      // ends disagree on MTU, stalling the resource transfer.
+      if (p.destType == RnsDestType.single) {
+        final path = pathFor(p.destHash);
+        if (path != null && _speedRank(path.via) >= 4) {
+          final iface = _ifaceByLabel(path.via);
+          if (iface != null) {
+            iface.send(raw);
+            return;
+          }
+        }
+      }
     }
     sendOnAll(raw);
   }
@@ -444,6 +454,36 @@ class RnsTransport {
     return 2;
   }
 
+  /// A duplicate announce arrived on interface [via]. If we already track this
+  /// destination and [via] is a data-capable interface strictly faster than the
+  /// path's current via, repoint the path onto it (a WiFi-Direct link winning
+  /// over the shared LAN it duplicates). No signature re-verify (identical
+  /// signed packet) and no rebroadcast.
+  void _maybeUpgradePath(RnsPacket p, String via) {
+    if (p.packetType != RnsPacketType.announce) return;
+    if (_isAnnounceOnly(via)) return; // can't carry data — never a path
+    final key = _hex(p.destHash);
+    final existing = _paths[key];
+    if (existing == null || existing.via == via) return;
+    if (_isAnnounceOnly(existing.via)) return; // handled by the main path logic
+    if (_speedRank(via) <= _speedRank(existing.via)) return;
+    final nextHop =
+        p.headerType == RnsHeaderType.header2 ? p.transportId : null;
+    log?.call('path ${key.substring(0, 8)} ${existing.via} -> $via '
+        '(rank ${_speedRank(existing.via)}->${_speedRank(via)}, upgrade)');
+    _paths.remove(key);
+    _paths[key] = RnsPathEntry(
+      destHash: existing.destHash,
+      identity: existing.identity,
+      publicKey: existing.publicKey,
+      appData: existing.appData,
+      hops: p.hops + 1,
+      via: via,
+      nextHop: nextHop,
+      updatedMs: DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+
   /// The next-hop transport for reaching [identity]'s destinations. A peer
   /// announces one destination (e.g. its chat dest), but every destination of
   /// that identity is reached via the same next hop, so we look up by identity.
@@ -463,7 +503,17 @@ class RnsTransport {
   Future<RnsAnnounce?> ingest(RnsPacket p, String viaArg) async {
     // Dedup by packet hash (RNS uses the same hashable-part scheme).
     final ph = _hex(p.packetHash());
-    if (_seenPackets.contains(ph)) return null;
+    if (_seenPackets.contains(ph)) {
+      // A node sends the SAME announce packet on all of its interfaces. The
+      // first copy to arrive (often a slow shared LAN/hub) sets the path and
+      // caches the hash; without this, a later copy on a FASTER interface (a
+      // WiFi-Direct P2P link) would be dropped here and the path could never
+      // repoint to it. So a duplicate announce may still UPGRADE the path's via
+      // to a higher-rank, data-capable interface — no re-verify (same signed
+      // packet) and no rebroadcast.
+      _maybeUpgradePath(p, viaArg);
+      return null;
+    }
     _seenPackets.add(ph);
     if (_seenPackets.length > 8192) {
       _seenPackets.remove(_seenPackets.first);

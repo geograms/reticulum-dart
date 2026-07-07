@@ -17,8 +17,10 @@ import 'rns_transport.dart';
 class RnsTcpInterface implements RnsInterface {
   @override
   bool get announceOnly => false;
+  // Path preference. Default 2 (internet TCP); a WiFi-Direct link passes 4 so
+  // the dedicated P2P pipe beats even a shared LAN (3).
   @override
-  int get speedRank => 2;
+  final int speedRank;
   @override
   bool get edge => false;
 
@@ -49,6 +51,7 @@ class RnsTcpInterface implements RnsInterface {
     required this.onPacket,
     this.log,
     this.onDisconnect,
+    this.speedRank = 2,
     String? label,
   }) : label = label ?? '$host:$port';
 

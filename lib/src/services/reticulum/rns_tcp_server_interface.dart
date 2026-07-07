@@ -20,8 +20,9 @@ import 'rns_transport.dart';
 class _RnsTcpServerConn implements RnsInterface {
   @override
   bool get announceOnly => false;
+  // Path preference (from the owning server: 2 = internet TCP, 4 = WiFi Direct).
   @override
-  int get speedRank => 2;
+  final int speedRank;
   @override
   bool get edge => false;
   // TCP/HDLC carries arbitrary-size frames (link MTU discovery).
@@ -32,7 +33,7 @@ class _RnsTcpServerConn implements RnsInterface {
   final Socket socket;
   final RnsHdlcDeframer _deframer = RnsHdlcDeframer();
 
-  _RnsTcpServerConn(this.label, this.socket);
+  _RnsTcpServerConn(this.label, this.socket, {this.speedRank = 2});
 
   @override
   void send(Uint8List packetRaw) {
@@ -49,9 +50,20 @@ class RnsTcpServerInterface {
   final void Function(Uint8List packetRaw, String via) onPacket;
   final void Function(String msg)? log;
 
+  /// Fired when a new client connects. The WiFi-Direct GO uses this to
+  /// re-announce its destinations over the fresh link so the just-joined client
+  /// learns a rank-4 path (RNS routes per-destination — an announce sent before
+  /// the client joined never reached it).
+  final void Function()? onConnect;
+
   /// When false, the port is bound exclusively so a second listener fails
   /// (surfacing conflicts) instead of silently co-binding via SO_REUSEPORT.
   final bool shared;
+
+  /// Path preference + label prefix stamped on every accepted connection
+  /// (defaults = internet TCP hub; a WiFi-Direct server passes 4 + 'wfd').
+  final int connSpeedRank;
+  final String labelPrefix;
 
   ServerSocket? _server;
   final List<_RnsTcpServerConn> _conns = [];
@@ -64,6 +76,9 @@ class RnsTcpServerInterface {
     this.bindHost = '0.0.0.0',
     this.log,
     this.shared = true,
+    this.connSpeedRank = 2,
+    this.labelPrefix = 'tcps',
+    this.onConnect,
   });
 
   int get connectionCount => _conns.length;
@@ -77,11 +92,15 @@ class RnsTcpServerInterface {
 
   void _onClient(Socket socket) {
     socket.setOption(SocketOption.tcpNoDelay, true);
-    final label = 'tcps#${_seq++}:${socket.remoteAddress.address}:${socket.remotePort}';
-    final conn = _RnsTcpServerConn(label, socket);
+    final label =
+        '$labelPrefix#${_seq++}:${socket.remoteAddress.address}:${socket.remotePort}';
+    final conn = _RnsTcpServerConn(label, socket, speedRank: connSpeedRank);
     _conns.add(conn);
     transport.addInterface(conn);
     log?.call('client connected $label (${_conns.length} total)');
+    try {
+      onConnect?.call();
+    } catch (_) {}
 
     socket.listen(
       (data) {

@@ -55,6 +55,10 @@ class RnsContext {
   static const int resourceReq = 0x03;
   static const int resourceHmu = 0x04;
   static const int resourcePrf = 0x05;
+  // Application requests/responses over a link (RNS Link.request). REQUEST/
+  // RESPONSE carry a msgpack payload; large ones ride a Resource instead.
+  static const int request = 0x09;
+  static const int response = 0x0A;
   static const int pathResponse = 0x0B;
   static const int keepalive = 0xFA;
   static const int linkClose = 0xFC;

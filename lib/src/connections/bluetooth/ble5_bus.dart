@@ -20,6 +20,7 @@ class Ble5Subtype {
   static const int aprs = 0x41; // APRS broadcast parcel ('A')
   static const int presence = 0x47; // GATT presence beacon ('G'): callsign
   static const int mesh = 0x4D; // street-mesh route beacon ('M'), doc/mesh.md
+  static const int wfd = 0x57; // WiFi-Direct negotiation ('W'): ADVERT/REQ/OFFER
 }
 
 /// One inbound connectionless frame, already demuxed to a single subtype.

@@ -454,6 +454,9 @@ class RnsTransport {
     return 2;
   }
 
+  /// Public speed-rank of the interface labelled [label] (2 if unknown).
+  int speedRankOf(String label) => _speedRank(label);
+
   /// A duplicate announce arrived on interface [via]. If we already track this
   /// destination and [via] is a data-capable interface strictly faster than the
   /// path's current via, repoint the path onto it (a WiFi-Direct link winning

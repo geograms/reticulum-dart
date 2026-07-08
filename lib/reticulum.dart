@@ -50,6 +50,7 @@ export 'src/services/social/nostr_rns_client.dart';
 export 'src/services/social/nostr_local_client.dart';
 export 'src/services/social/nostr_relay_hub.dart';
 export 'src/services/social/nostr_ws_server.dart';
+export 'src/services/social/blossom_server.dart';
 export 'src/services/social/nostr_engine.dart';
 export 'src/services/social/retention_tier.dart';
 export 'src/services/social/spam.dart';

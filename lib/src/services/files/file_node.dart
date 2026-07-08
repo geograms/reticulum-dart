@@ -42,6 +42,7 @@ class _FetchEntry {
   final Uint8List fileHash;
   final Completer<Uint8List?> done;
   FileFetchSession? fetch; // null until the link is active
+  Uint8List? rttRaw; // our LRRTT (re-sent if the responder re-proofs)
   Timer? timeout;
   Timer? retry; // periodic stall-recovery (re-request missing parts)
   Duration baseTimeout = const Duration(minutes: 20);
@@ -422,8 +423,16 @@ class FileTransferNode {
     final key = _hex(fileHash);
     final existing = _inflightBySha[key];
     if (existing != null) return existing;
+    // NOTE: the cleanup MUST be a statement body, not `() => _inflightBySha
+    // .remove(key)`. Map.remove returns the removed value — which here IS this
+    // very whenComplete future — and an arrow makes the callback RETURN it, so
+    // whenComplete awaits its own result: a circular deadlock. The future then
+    // never completes even though the fetch finished, and the caller hangs
+    // forever. A block body returns void and breaks the cycle.
     final fut = _fetchWithRetries(fileHash, providerPublicIdentity, timeout)
-        .whenComplete(() => _inflightBySha.remove(key));
+        .whenComplete(() {
+      _inflightBySha.remove(key);
+    });
     _inflightBySha[key] = fut;
     return fut;
   }
@@ -568,8 +577,27 @@ class FileTransferNode {
           _finishFetch(e, null, 'proof validation failed');
           return;
         }
-        send(rtt.pack());
+        e.rttRaw = rtt.pack();
+        send(e.rttRaw!);
         await _startSession(e); // loads any partial → GET_FILE_FROM, else GET_FILE
+      }
+      return;
+    }
+    // A duplicate LRPROOF after our link is already active means the responder
+    // never received our LRRTT (it can be lost / arrive on an interface the
+    // responder didn't pin its link to), so it keeps re-proofing and never
+    // starts serving — the transfer stalls with recv=0. Re-send the RTT so the
+    // responder's half of the link completes and it begins serving.
+    // CRITICAL: only while the transfer has NOT started (receivedBytes == 0).
+    // Once data is flowing the link is proven both-ways; continuing to re-send
+    // the RTT makes the responder re-proof, and since _fetch[id] isn't cleared
+    // until the fetch's completion microtask runs, that microtask gets starved
+    // by an endless RTT↔proof ping-pong — the transfer completes but the fetch
+    // future never resolves.
+    if (p.packetType == RnsPacketType.proof &&
+        p.context == RnsContext.lrproof) {
+      if (e.rttRaw != null && (e.fetch?.receivedBytes ?? 0) == 0) {
+        send(e.rttRaw!);
       }
       return;
     }

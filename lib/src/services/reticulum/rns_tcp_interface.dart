@@ -60,6 +60,7 @@ class RnsTcpInterface implements RnsInterface {
   Future<void> connect({Duration timeout = const Duration(seconds: 10)}) async {
     final s = await Socket.connect(host, port, timeout: timeout);
     s.setOption(SocketOption.tcpNoDelay, true);
+    _enableKeepalive(s);
     _socket = s;
     _connected = true;
     log?.call('TCP connected to $host:$port');
@@ -85,6 +86,31 @@ class RnsTcpInterface implements RnsInterface {
       },
       cancelOnError: true,
     );
+  }
+
+  /// Turn on TCP keepalive and (on Linux/Android) tune it aggressively so a
+  /// half-open socket — the network changed under us and the peer's FIN/RST
+  /// never arrived — is detected by the kernel in ~2 min instead of the ~2 h
+  /// default. Without this a wedged uplink looks alive forever: no onDone/onError
+  /// fires, the owner never reconnects, and announces silently stop flowing.
+  /// Best-effort and non-fatal — unsupported platforms just keep SO_KEEPALIVE off.
+  static void _enableKeepalive(Socket s) {
+    // Linux/Android socket-option numbers (stable in the kernel ABI).
+    const solSocket = 1, soKeepalive = 9; // SOL_SOCKET, SO_KEEPALIVE
+    const ipprotoTcp = 6; // IPPROTO_TCP
+    const tcpKeepidle = 4, tcpKeepintvl = 5, tcpKeepcnt = 6;
+    void opt(int level, int option, int value) {
+      try {
+        s.setRawOption(RawSocketOption.fromInt(level, option, value));
+      } catch (_) {/* option not supported on this platform — skip */}
+    }
+
+    opt(solSocket, soKeepalive, 1); // enable keepalive probes
+    if (Platform.isLinux || Platform.isAndroid) {
+      opt(ipprotoTcp, tcpKeepidle, 60); // idle 60s before first probe
+      opt(ipprotoTcp, tcpKeepintvl, 15); // 15s between probes
+      opt(ipprotoTcp, tcpKeepcnt, 4); // 4 failed probes → dead (~2 min total)
+    }
   }
 
   void _notifyDown() {

@@ -15,6 +15,7 @@ export 'src/services/reticulum/rns_resource.dart';
 export 'src/services/reticulum/rns_resource_receiver.dart';
 export 'src/services/reticulum/rns_announce.dart';
 export 'src/services/reticulum/rns_transport.dart';
+export 'src/services/reticulum/rns_transport_engine.dart';
 export 'src/services/reticulum/rns_tcp_interface.dart';
 export 'src/services/reticulum/rns_tcp_server_interface.dart';
 export 'src/services/reticulum/rns_udp_interface.dart';

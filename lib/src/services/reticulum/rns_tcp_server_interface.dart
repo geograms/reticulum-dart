@@ -46,7 +46,7 @@ class _RnsTcpServerConn implements RnsInterface {
 class RnsTcpServerInterface {
   final int port;
   final String bindHost;
-  final RnsTransport transport;
+  final RnsInterfaceRegistry transport;
   final void Function(Uint8List packetRaw, String via) onPacket;
   final void Function(String msg)? log;
 

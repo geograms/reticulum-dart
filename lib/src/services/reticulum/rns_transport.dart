@@ -86,7 +86,16 @@ class RnsPathEntry {
   });
 }
 
-class RnsTransport {
+/// The narrow capability a connection-spawning interface (TCP server/gateway)
+/// needs: registering each accepted connection as an interface. Implemented by
+/// both the in-process [RnsTransport] and the isolate-hosted
+/// RnsTransportClient, so servers work identically against either.
+abstract class RnsInterfaceRegistry {
+  void addInterface(RnsInterface iface);
+  void removeInterface(RnsInterface iface);
+}
+
+class RnsTransport implements RnsInterfaceRegistry {
   final void Function(String msg)? log;
 
   /// When set, this node acts as a TRANSPORT node and rebroadcasts inbound
@@ -247,12 +256,18 @@ class RnsTransport {
   RnsTransport({this.log, this.transportId});
 
   int get pathCount => _paths.length;
+
+  /// Read-only view of every path entry — the transport engine's mirror sweep
+  /// iterates this to push recently-updated entries to its client.
+  Iterable<RnsPathEntry> get pathsView => _paths.values;
   Iterable<RnsPathEntry> get paths => _paths.values;
   // A relaying transport node only when it has a relay id AND isn't shedding
   // load. In passive mode it still announces/receives its own traffic.
   bool get isTransportNode => transportId != null && !_passive;
 
+  @override
   void addInterface(RnsInterface iface) => _interfaces.add(iface);
+  @override
   void removeInterface(RnsInterface iface) =>
       _interfaces.removeWhere((i) => identical(i, iface));
 

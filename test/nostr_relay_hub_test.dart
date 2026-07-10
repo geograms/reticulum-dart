@@ -12,6 +12,7 @@ import 'package:reticulum/reticulum.dart';
 /// In-memory store so the hub is testable without the sqlite native library.
 class _FakeStore implements NostrStore {
   final Map<String, NostrEvent> byId = {};
+  final Map<String, Set<String>> reactions = {};
   @override
   bool put(NostrEvent e, {int tier = 2}) {
     if (e.id == null || byId.containsKey(e.id)) return false;
@@ -22,6 +23,23 @@ class _FakeStore implements NostrStore {
   @override
   List<NostrEvent> query(NostrFilter f) =>
       byId.values.where((e) => NostrWire.matches(f, e)).toList();
+
+  @override
+  bool addReaction(String eventId, String pubkey) =>
+      reactions.putIfAbsent(eventId, () => <String>{}).add(pubkey);
+
+  @override
+  List<String> reactionPubkeys(String eventId) =>
+      reactions[eventId]?.toList() ?? const [];
+
+  @override
+  List<String> replyIdsFor(String eventId) => [
+        for (final e in byId.values)
+          if (e.kind == 1 &&
+              e.tags
+                  .any((t) => t.length >= 2 && t[0] == 'e' && t[1] == eventId))
+            e.id!,
+      ];
 }
 
 class _FakeClient implements NostrRelayClient {

@@ -140,6 +140,20 @@ class RelayEventStore {
     db.execute('CREATE INDEX IF NOT EXISTS idx_tag_nv ON tags(name, value);');
     db.execute('CREATE INDEX IF NOT EXISTS idx_tag_ev ON tags(event_id);');
 
+    // Reaction receipts: one row per (post, reactor). Kind-7 events are
+    // deliberately NOT kept in the events table (they'd dwarf it and are
+    // worthless individually) — but their COUNT is what every feed shows, so
+    // losing it on restart made like totals crawl back over the network.
+    // Insert-or-ignore keeps redelivered reactions from double counting, and
+    // the primary key doubles as the per-post lookup index.
+    db.execute('''
+      CREATE TABLE IF NOT EXISTS reactions(
+        event_id TEXT NOT NULL,
+        pubkey   TEXT NOT NULL,
+        PRIMARY KEY(event_id, pubkey)
+      ) WITHOUT ROWID;
+    ''');
+
     // Full-text index: post content + a `meta` column holding searchable tag
     // values (file names, topics, etc.). event_id is carried UNINDEXED so we can
     // map matches back and delete on replace.
@@ -466,6 +480,50 @@ class RelayEventStore {
       for (final r in rows)
         PopularPost(_fromRaw(r['raw'] as String)!, r['score'] as int)
     ];
+  }
+
+  // ── Persisted engagement (likes / replies) ─────────────────────────────
+
+  /// Record one reactor for a post. Idempotent — a reaction redelivered by
+  /// another relay (or another session) is one row. Returns true if new.
+  bool addReaction(String eventId, String pubkey) {
+    if (eventId.length != 64 || pubkey.isEmpty) return false;
+    try {
+      _db.execute(
+          'INSERT OR IGNORE INTO reactions(event_id, pubkey) VALUES(?,?)',
+          [eventId, pubkey]);
+      return _db.updatedRows > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Everyone who reacted to [eventId] (bounded — feeds a session tally set).
+  List<String> reactionPubkeys(String eventId, {int limit = 2000}) {
+    try {
+      final rows = _db.select(
+          'SELECT pubkey FROM reactions WHERE event_id = ? LIMIT ?',
+          [eventId, limit]);
+      return [for (final r in rows) r['pubkey'] as String];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Ids of stored kind-1 replies referencing [eventId] via an #e tag. Reply
+  /// EVENTS are already persisted in `events`; this recovers the reply tally
+  /// after a restart without waiting for relay redelivery.
+  List<String> replyIdsFor(String eventId, {int limit = 2000}) {
+    try {
+      final rows = _db.select('''
+        SELECT e.id AS id FROM tags t
+        JOIN events e ON e.id = t.event_id AND e.kind = 1 AND e.deleted = 0
+        WHERE t.name = 'e' AND t.value = ? LIMIT ?
+      ''', [eventId, limit]);
+      return [for (final r in rows) r['id'] as String];
+    } catch (_) {
+      return const [];
+    }
   }
 
   // ── Profile / follows lookups ───────────────────────────────────────────

@@ -29,6 +29,13 @@ abstract class NostrStore {
   bool put(NostrEvent e, {int tier});
   List<NostrEvent> query(NostrFilter f);
 
+  // Persisted engagement — reaction receipts survive restarts so like/reply
+  // tallies load instantly instead of crawling back over the network. The
+  // defaults are no-ops so in-memory test fakes need not care.
+  bool addReaction(String eventId, String pubkey) => false;
+  List<String> reactionPubkeys(String eventId) => const [];
+  List<String> replyIdsFor(String eventId) => const [];
+
   factory NostrStore.of(RelayEventStore s) = _RelayEventStoreAdapter;
 }
 
@@ -39,6 +46,14 @@ class _RelayEventStoreAdapter implements NostrStore {
   bool put(NostrEvent e, {int tier = 2}) => store.put(e, tier: tier);
   @override
   List<NostrEvent> query(NostrFilter f) => store.query(f);
+  @override
+  bool addReaction(String eventId, String pubkey) =>
+      store.addReaction(eventId, pubkey);
+  @override
+  List<String> reactionPubkeys(String eventId) =>
+      store.reactionPubkeys(eventId);
+  @override
+  List<String> replyIdsFor(String eventId) => store.replyIdsFor(eventId);
 }
 
 /// Common public relays pre-populated on first run, plus the device itself.
@@ -355,8 +370,11 @@ class NostrRelayHub {
     for (final id in ids) {
       if (id.length != 64 || _statReact.containsKey(id)) continue;
       _statTracked.add(id);
-      _statReact[id] = <String>{};
-      _statReply[id] = <String>{};
+      // Seed from the store so counts are correct IMMEDIATELY (persisted
+      // reaction receipts + already-stored kind-1 replies) instead of zero
+      // until the relays redeliver. Live events then dedup into these sets.
+      _statReact[id] = store.reactionPubkeys(id).toSet();
+      _statReply[id] = store.replyIdsFor(id).toSet();
       added = true;
     }
     while (_statTracked.length > 300) {
@@ -511,6 +529,14 @@ class NostrRelayHub {
   int rateDropped = 0;
 
   void _onEvent(String subId, NostrEvent event) {
+    // Persist every reaction receipt (post id + reactor) BEFORE the tallies
+    // consume the event. Kind-7s themselves are throwaway, but their count is
+    // what every feed shows — without this row the like totals reset on every
+    // restart and crawled back over the network instead of loading instantly.
+    if (event.kind == NostrEventKind.reaction) {
+      final liked = _firstETag(event);
+      if (liked != null) store.addReaction(liked, event.pubkey);
+    }
     // Engagement (likes/replies) is tallied for on-screen posts BEFORE the rate
     // cap so counts stay accurate. Reactions are tally-only (never displayed).
     final wasReaction = _tallyStats(event);

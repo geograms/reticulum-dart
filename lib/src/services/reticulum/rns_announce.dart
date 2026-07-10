@@ -112,6 +112,34 @@ class RnsAnnounceBuilder {
 /// to avoid re-verifying an unchanged re-announce of a destination we already
 /// verified once. The dest-hash↔key binding is always enforced, so a skipped
 /// verify can only ever reuse trust in the *same* key the caller already holds.
+/// Would [validateAnnounce] take the trust fast-path for [p]? Structural parse
+/// only — extracts the same (destHash, publicKey, appData) the trustIf callback
+/// receives and evaluates [trusted] on them. Zero crypto, so callers can decide
+/// whether a packet will cost a REAL Ed25519 verify (and budget accordingly)
+/// before committing to it. Malformed announces return false (they'll be
+/// rejected structurally by validateAnnounce anyway).
+bool wouldTrustAnnounce(
+  RnsPacket p,
+  bool Function(Uint8List destHash, Uint8List publicKey, Uint8List appData)
+      trusted,
+) {
+  if (p.packetType != RnsPacketType.announce) return false;
+  final data = p.data;
+  final hasRatchet = p.contextFlag == RnsFlag.set;
+  final minLen = _keysize +
+      _nameHashLen +
+      _randomHashLen +
+      _sigLen +
+      (hasRatchet ? _ratchetSize : 0);
+  if (data.length < minLen) return false;
+  final publicKey = Uint8List.sublistView(data, 0, _keysize);
+  var off = _keysize + _nameHashLen + _randomHashLen;
+  if (hasRatchet) off += _ratchetSize;
+  off += _sigLen;
+  final appData = Uint8List.sublistView(data, off);
+  return trusted(p.destHash, publicKey, appData);
+}
+
 Future<RnsAnnounce?> validateAnnounce(
   RnsPacket p, {
   bool Function(Uint8List destHash, Uint8List publicKey, Uint8List appData)?

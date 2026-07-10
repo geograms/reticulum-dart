@@ -300,7 +300,27 @@ class NostrRelayHub {
     return feed;
   }
 
+  // Live discoF fetch subs → created-at ms. These are one-shot id fetches; the
+  // relays answer within seconds. They used to be created every 3s and NEVER
+  // unsubscribed — after hours the filter set grew unbounded and every inbound
+  // event paid an O(subs) match against it (a measured hot engine isolate).
+  final Map<String, int> _discoFetchSubs = {};
+  static const int _discoFetchTtlMs = 30 * 1000;
+
   void _discoFetch() {
+    // Reap fetch subs past their TTL — their ids either arrived long ago or
+    // aren't coming; keeping the filter only taxes every future event.
+    if (_discoFetchSubs.isNotEmpty) {
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final expired = [
+        for (final e in _discoFetchSubs.entries)
+          if (nowMs - e.value > _discoFetchTtlMs) e.key,
+      ];
+      for (final sub in expired) {
+        _discoFetchSubs.remove(sub);
+        unsubscribe(sub);
+      }
+    }
     if (_discoToFetch.isEmpty) return;
     final batch = <String>[];
     while (_discoToFetch.isNotEmpty && batch.length < 100) {
@@ -311,6 +331,7 @@ class NostrRelayHub {
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};
+    _discoFetchSubs[sub] = DateTime.now().millisecondsSinceEpoch;
     for (final e in _endpoints.values) {
       if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
     }

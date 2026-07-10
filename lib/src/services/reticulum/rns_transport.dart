@@ -113,12 +113,35 @@ class RnsTransport {
   /// talks to while keeping memory bounded.
   static const int _maxPaths = 2048;
 
-  // Per-second budget for verifying announces from *new* destinations, so the
-  // live network's announce flood can't saturate the UI isolate. Re-announces of
-  // known destinations are exempt (cheap, and keep active paths fresh).
-  static const int _annBudgetPerSec = 20;
+  // Budget for verifying announces from *new* destinations, so a public hub's
+  // network-wide flood can't build an endless crypto backlog on phone hardware.
+  // Re-announces of known destinations are exempt (cheap, and keep active paths
+  // fresh). Our own overlay's announces are priority-exempt below.
+  static const int _annBudgetPerWindow = 1;
+  static const int _annBudgetWindowMs = 3000;
   int _annWindowStart = 0;
   int _annCount = 0;
+  // Global ceiling on REAL Ed25519 verifications per window, across every
+  // announce class — including known-destination re-announces and priority
+  // announces, which bypass the new-destination budget above. A re-announce
+  // whose app_data changed (uptime fields churn every announce) misses the
+  // trustIf fast-path and costs a full verify, so without this ceiling a busy
+  // hub's known-dest flood keeps the crypto pipeline saturated forever.
+  static const int _verifyBudgetPerWindow = 8;
+  int _verifyWindowStart = 0;
+  int _verifyCount = 0;
+
+  bool _takeVerifyToken() {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _verifyWindowStart >= _annBudgetWindowMs) {
+      _verifyWindowStart = nowMs;
+      _verifyCount = 0;
+    }
+    if (_verifyCount >= _verifyBudgetPerWindow) return false;
+    _verifyCount++;
+    return true;
+  }
+
   // Announce name_hashes (10-byte, hex) that must NEVER be shed by the budget —
   // our OWN overlay's destinations (e.g. Aurora chat/files/dht/relay). They're
   // rare in the public-hub flood but essential for peer discovery; the host
@@ -536,7 +559,7 @@ class RnsTransport {
     // Connected to a busy transport hub, a phone leaf hears the WHOLE network's
     // announce stream — hundreds of new destinations a second. Verifying an
     // Ed25519 signature for each on the UI isolate pegs a core and ANRs the app.
-    // So budget the verification of *new* destinations per second (the flood);
+    // So budget the verification of *new* destinations over a small window;
     // re-announces of destinations we already track are cheap (see trustIf) and
     // never throttled, so paths we actually use keep refreshing. A dropped new
     // announce costs nothing — that destination re-announces periodically and
@@ -549,20 +572,29 @@ class RnsTransport {
         !_isPriorityAnnounce(p) &&
         p.context != RnsContext.pathResponse) {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
-      if (nowMs - _annWindowStart >= 1000) {
+      if (nowMs - _annWindowStart >= _annBudgetWindowMs) {
         _annWindowStart = nowMs;
         _annCount = 0;
       }
-      if (_annCount >= _annBudgetPerSec) return null; // shed the flood
+      if (_annCount >= _annBudgetPerWindow) return null; // shed the flood
       _annCount++;
     }
 
     // Skip re-verifying an unchanged re-announce of a destination we already
     // verified (same key + app_data) — the common case once the table is warm.
-    final ann = await validateAnnounce(p, trustIf: (dh, pk, ad) {
+    bool trusted(Uint8List dh, Uint8List pk, Uint8List ad) {
       final e = _paths[_hex(dh)];
       return e != null && _eq(e.publicKey, pk) && _eq(e.appData, ad);
-    });
+    }
+
+    // Anything that will need REAL crypto (trust fast-path miss) draws from the
+    // global verify budget — known-dest re-announces with churned app_data and
+    // priority announces included. Exhausted budget = shed the packet; the
+    // destination re-announces periodically, nothing is lost but freshness.
+    final needsCrypto = !wouldTrustAnnounce(p, trusted);
+    if (needsCrypto && !_takeVerifyToken()) return null;
+
+    final ann = await validateAnnounce(p, trustIf: trusted);
     if (ann == null) return null;
 
     var pathHops = p.hops + 1; // hop just taken to reach us

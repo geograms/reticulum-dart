@@ -12,6 +12,8 @@
  * All pure Dart, no native binaries: X25519/Ed25519 from `cryptography`,
  * SHA-256/HMAC from `crypto`, AES from `pointycastle`.
  */
+import 'dart:async';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -108,8 +110,19 @@ class RnsCrypto {
 
   // ---- X25519 (RNS Curve25519 ECDH) ----
 
+  /// Generate an X25519 keypair, off the UI isolate. Every inbound link
+  /// request makes the responder generate an EPHEMERAL keypair — live stacks
+  /// caught the main isolate pegged inside this exact call under a LAN
+  /// link-request flood. Falls back inline if the worker cannot start.
   static Future<({Uint8List priv, Uint8List pub})> x25519Generate(
       [Uint8List? seed]) async {
+    final out = await _CryptoWorker.instance.request(
+      _CryptoOp.x25519Gen,
+      a: seed != null ? Uint8List.fromList(seed) : Uint8List(0),
+    );
+    if (out is List && out.length == 2) {
+      return (priv: out[0] as Uint8List, pub: out[1] as Uint8List);
+    }
     final kp = seed != null
         ? await _x25519.newKeyPairFromSeed(seed)
         : await _x25519.newKeyPair();
@@ -119,12 +132,28 @@ class RnsCrypto {
   }
 
   static Future<Uint8List> x25519PublicFromPrivate(Uint8List priv) async {
+    final out = await _CryptoWorker.instance.request(
+      _CryptoOp.x25519Pub,
+      a: Uint8List.fromList(priv),
+    );
+    if (out is Uint8List) return out;
+    // Worker unavailable — fall back inline (rare path, correctness first).
     final kp = await _x25519.newKeyPairFromSeed(priv);
     return Uint8List.fromList((await kp.extractPublicKey()).bytes);
   }
 
+  /// X25519 ECDH, off the UI isolate — one scalar multiplication per link
+  /// handshake in pure Dart is far too slow to run inline under a
+  /// link-request flood (live stacks caught the main isolate inside the
+  /// curve math). Falls back inline if the worker cannot start.
   static Future<Uint8List> x25519Shared(
       Uint8List ourPriv, Uint8List theirPub) async {
+    final out = await _CryptoWorker.instance.request(
+      _CryptoOp.x25519Shared,
+      a: Uint8List.fromList(ourPriv),
+      b: Uint8List.fromList(theirPub),
+    );
+    if (out is Uint8List) return out;
     final kp = await _x25519.newKeyPairFromSeed(ourPriv);
     final shared = await _x25519.sharedSecretKey(
       keyPair: kp,
@@ -137,6 +166,13 @@ class RnsCrypto {
 
   static Future<({Uint8List priv, Uint8List pub})> ed25519Generate(
       [Uint8List? seed]) async {
+    final out = await _CryptoWorker.instance.request(
+      _CryptoOp.edGen,
+      a: seed != null ? Uint8List.fromList(seed) : Uint8List(0),
+    );
+    if (out is List && out.length == 2) {
+      return (priv: out[0] as Uint8List, pub: out[1] as Uint8List);
+    }
     final kp = seed != null
         ? await _ed25519.newKeyPairFromSeed(seed)
         : await _ed25519.newKeyPair();
@@ -146,22 +182,237 @@ class RnsCrypto {
   }
 
   static Future<Uint8List> ed25519PublicFromSeed(Uint8List seed) async {
+    final out = await _CryptoWorker.instance.request(
+      _CryptoOp.edPub,
+      a: Uint8List.fromList(seed),
+    );
+    if (out is Uint8List) return out;
     final kp = await _ed25519.newKeyPairFromSeed(seed);
     return Uint8List.fromList((await kp.extractPublicKey()).bytes);
   }
 
+  /// Sign off the UI isolate. Pure-Dart signing derives the keypair from the
+  /// seed EVERY call (two point multiplications) — live stacks caught the main
+  /// isolate pegged inside that derivation. The worker caches keypairs by
+  /// seed, so our identity signs with one point-mul and zero main-isolate
+  /// curve math. Falls back inline if the worker cannot start.
   static Future<Uint8List> ed25519Sign(
       Uint8List seed, List<int> message) async {
+    final out = await _CryptoWorker.instance.request(
+      _CryptoOp.edSign,
+      a: Uint8List.fromList(seed),
+      b: Uint8List.fromList(message),
+    );
+    if (out is Uint8List) return out;
     final kp = await _ed25519.newKeyPairFromSeed(seed);
     final sig = await _ed25519.sign(message, keyPair: kp);
     return Uint8List.fromList(sig.bytes);
   }
 
+  /// Verify off the UI isolate. Pure-Dart Ed25519 is CPU-heavy enough that a
+  /// busy Reticulum hub's announce flood ANRs Flutter if verified inline — but
+  /// spawning an isolate PER verification is worse: the spawn/teardown churn
+  /// saturates the main isolate and an unbounded backlog of waiting futures
+  /// eats the heap (observed as a multi-hour app wedge). So: ONE persistent
+  /// worker isolate, request/response over ports, and a BOUNDED queue — when
+  /// more than [_verifyQueueCap] verifications are already waiting, new ones
+  /// are shed (returned as failed, dropping that announce), the same
+  /// availability-over-completeness semantics the transport's announce budget
+  /// already applies. A shed can never make a forged signature pass.
   static Future<bool> ed25519Verify(
       Uint8List pub, List<int> message, Uint8List sig) async {
-    return _ed25519.verify(message,
-        signature: c.Signature(sig,
-            publicKey: c.SimplePublicKey(pub, type: c.KeyPairType.ed25519)));
+    // Verifies are attacker-controlled volume: shed under backlog (fail
+    // closed — the packet is dropped, a forged signature can never pass).
+    final out = await _CryptoWorker.instance.request(
+      _CryptoOp.edVerify,
+      a: Uint8List.fromList(pub),
+      b: Uint8List.fromList(message),
+      c2: Uint8List.fromList(sig),
+      shedUnderLoad: true,
+    );
+    return out == true;
+  }
+}
+
+enum _CryptoOp { edVerify, edSign, edPub, x25519Shared, x25519Pub, x25519Gen, edGen }
+
+/// One long-lived crypto isolate for every hot Curve25519 operation. Pure-Dart
+/// point multiplication costs tens of ms on phone hardware; inline it and any
+/// packet/link/announce flood pegs the UI isolate (observed live). Requests are
+/// (id, op, args) tuples over ports; the worker caches keypairs by seed so our
+/// own identity never re-derives. The pending map is bounded — beyond the cap,
+/// sheddable ops (inbound verifies) fail closed, while our OWN operations
+/// (signs, ECDH — self-limited rates) still queue.
+class _CryptoWorker {
+  _CryptoWorker._();
+  static final _CryptoWorker instance = _CryptoWorker._();
+
+  static const int _shedCap = 64; // pending beyond this → shed verifies
+  static const int _hardCap = 512; // absolute pending bound
+
+  SendPort? _toWorker;
+  Future<void>? _starting;
+  final Map<int, Completer<Object?>> _pending = {};
+  int _seq = 0;
+  int shed = 0; // dropped-op count, for diagnostics
+
+  /// Run [op] on the worker. Returns null when the op was shed or the worker
+  /// is unavailable — callers treat that as failure (or fall back inline for
+  /// rare non-hot paths).
+  Future<Object?> request(
+    _CryptoOp op, {
+    required Uint8List a,
+    Uint8List? b,
+    Uint8List? c2,
+    bool shedUnderLoad = false,
+  }) async {
+    final cap = shedUnderLoad ? _shedCap : _hardCap;
+    if (_pending.length >= cap) {
+      shed++;
+      return null;
+    }
+    if (_toWorker == null) {
+      _starting ??= _spawn();
+      try {
+        await _starting;
+      } catch (_) {
+        _starting = null;
+        return null;
+      }
+    }
+    final port = _toWorker;
+    if (port == null) return null;
+    final id = _seq++;
+    final done = Completer<Object?>();
+    _pending[id] = done;
+    port.send([id, op.index, a, b, c2]);
+    return done.future;
+  }
+
+  Future<void> _spawn() async {
+    final fromWorker = ReceivePort();
+    final ready = Completer<void>();
+    fromWorker.listen((msg) {
+      if (msg is SendPort) {
+        _toWorker = msg;
+        if (!ready.isCompleted) ready.complete();
+        return;
+      }
+      if (msg is List && msg.length == 2) {
+        _pending.remove(msg[0] as int)?.complete(msg[1]);
+      }
+    });
+    try {
+      final iso = await Isolate.spawn(
+        _cryptoWorkerMain,
+        fromWorker.sendPort,
+        debugName: 'rns-crypto',
+      );
+      // If the worker dies, fail the backlog and allow a lazy respawn.
+      final exit = ReceivePort();
+      iso.addOnExitListener(exit.sendPort);
+      exit.listen((_) {
+        exit.close();
+        fromWorker.close();
+        _toWorker = null;
+        _starting = null;
+        for (final c in _pending.values) {
+          if (!c.isCompleted) c.complete(null);
+        }
+        _pending.clear();
+      });
+    } catch (e) {
+      fromWorker.close();
+      if (!ready.isCompleted) ready.completeError(e);
+      rethrow;
+    }
+    return ready.future;
+  }
+}
+
+Future<void> _cryptoWorkerMain(SendPort toMain) async {
+  final ed = c.Ed25519();
+  final x = c.X25519();
+  // Keypair caches keyed by seed hex — our identity signs constantly with the
+  // SAME seed; deriving the keypair once turns two point-muls per sign into
+  // one. Bounded: an RNS node touches a handful of own keys, never thousands.
+  final edKeys = <String, c.SimpleKeyPair>{};
+  final xKeys = <String, c.SimpleKeyPair>{};
+  const cacheCap = 64;
+  String hex(Uint8List b) =>
+      b.map((v) => v.toRadixString(16).padLeft(2, '0')).join();
+  Future<c.SimpleKeyPair> edFor(Uint8List seed) async {
+    final k = hex(seed);
+    final hit = edKeys[k];
+    if (hit != null) return hit;
+    if (edKeys.length >= cacheCap) edKeys.remove(edKeys.keys.first);
+    return edKeys[k] = await ed.newKeyPairFromSeed(seed);
+  }
+
+  Future<c.SimpleKeyPair> xFor(Uint8List seed) async {
+    final k = hex(seed);
+    final hit = xKeys[k];
+    if (hit != null) return hit;
+    if (xKeys.length >= cacheCap) xKeys.remove(xKeys.keys.first);
+    return xKeys[k] = await x.newKeyPairFromSeed(seed);
+  }
+
+  final inbox = ReceivePort();
+  toMain.send(inbox.sendPort);
+  await for (final msg in inbox) {
+    if (msg is! List || msg.length != 5) continue;
+    final id = msg[0] as int;
+    final op = _CryptoOp.values[msg[1] as int];
+    final a = msg[2] as Uint8List;
+    final b = msg[3] as Uint8List?;
+    final c2 = msg[4] as Uint8List?;
+    Object? out;
+    try {
+      switch (op) {
+        case _CryptoOp.edVerify:
+          out = await ed.verify(
+            b!,
+            signature: c.Signature(
+              c2!,
+              publicKey: c.SimplePublicKey(a, type: c.KeyPairType.ed25519),
+            ),
+          );
+        case _CryptoOp.edSign:
+          final kp = await edFor(a);
+          final sig = await ed.sign(b!, keyPair: kp);
+          out = Uint8List.fromList(sig.bytes);
+        case _CryptoOp.edPub:
+          final kp = await edFor(a);
+          out = Uint8List.fromList((await kp.extractPublicKey()).bytes);
+        case _CryptoOp.x25519Shared:
+          final kp = await xFor(a);
+          final shared = await x.sharedSecretKey(
+            keyPair: kp,
+            remotePublicKey:
+                c.SimplePublicKey(b!, type: c.KeyPairType.x25519),
+          );
+          out = Uint8List.fromList(await shared.extractBytes());
+        case _CryptoOp.x25519Pub:
+          final kp = await xFor(a);
+          out = Uint8List.fromList((await kp.extractPublicKey()).bytes);
+        case _CryptoOp.x25519Gen:
+          final kp = a.isEmpty ? await x.newKeyPair() : await x.newKeyPairFromSeed(a);
+          out = [
+            Uint8List.fromList(await kp.extractPrivateKeyBytes()),
+            Uint8List.fromList((await kp.extractPublicKey()).bytes),
+          ];
+        case _CryptoOp.edGen:
+          final kp =
+              a.isEmpty ? await ed.newKeyPair() : await ed.newKeyPairFromSeed(a);
+          out = [
+            Uint8List.fromList(await kp.extractPrivateKeyBytes()),
+            Uint8List.fromList((await kp.extractPublicKey()).bytes),
+          ];
+      }
+    } catch (_) {
+      out = op == _CryptoOp.edVerify ? false : null;
+    }
+    toMain.send([id, out]);
   }
 }
 

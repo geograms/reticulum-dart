@@ -49,6 +49,12 @@ class NostrClient {
 
   // ── Caches (refreshed by engine snapshots) ─────────────────────────────────
   List<Map<String, dynamic>> _relays = const [];
+
+  /// Inbound-event rates from the engine isolate (seen/stored/reactions/
+  /// dropped per push window). The relay firehose IS this isolate's workload,
+  /// so this is how the host attributes its CPU. Reset each engine push.
+  Map<String, int> _eventStats = const {};
+  Map<String, int> get eventStats => _eventStats;
   final Map<String, List<Map<String, dynamic>>> _subEvents = {}; // subId → queue
   final Map<String, (int, int, bool)> _stats = {}; // eventId → (likes,replies,mine)
   final Set<String> _likedLocally = {}; // ids we've liked (keep them filled)
@@ -99,6 +105,8 @@ class NostrClient {
     switch (msg['snap']) {
       case 'relays':
         _relays = (msg['json'] as List).cast<Map<String, dynamic>>();
+      case 'evstats':
+        _eventStats = (msg['stats'] as Map).cast<String, int>();
       case 'events':
         final sub = msg['subId'] as String;
         final q = _subEvents.putIfAbsent(sub, () => []);
@@ -286,6 +294,13 @@ class _Engine {
         store: NostrStore.of(_store),
         persistPath: persistPath,
         rnsClientFactory: null, // RNS lives on the main isolate; wss + local here
+        // Only a newly-stored contact list can change our follow set, so that
+        // is the only thing that makes _syncMyFollows do its (expensive) work.
+        onStored: (e) {
+          if (e.kind == NostrEventKind.contacts && e.pubkey == selfPub) {
+            _myFollowsDirty = true;
+          }
+        },
       );
       // ignore: discarded_futures
       _hub.init();
@@ -368,6 +383,16 @@ class _Engine {
   /// The NOSTR way to know who I follow: subscribe my own kind-3 contact list
   /// from the relays, parse its p-tags, and push the pubkeys to the main isolate
   /// (so follows made on ANY client show up here, not just local follows).
+  // Our own contact list changes when a new kind-3 arrives — which is rare and
+  // which the hub tells us about. Recomputing it on every 400ms tick meant a
+  // sqlite query plus a re-parse of every p-tag (a contact list routinely has
+  // thousands) 2.5 times a second, forever: a whole pegged core, for a value
+  // that had not changed. The dedup guard below only ever suppressed the port
+  // message, never the work. Gate on the STORED EVENT instead, and only re-read
+  // when the hub has stored something new.
+  int _myFollowsAt = 0; // createdAt of the kind-3 we last parsed
+  bool _myFollowsDirty = true; // a new event landed — re-read on next tick
+
   void _syncMyFollows() {
     final me = selfPub;
     if (me == null || me.length != 64) return;
@@ -376,11 +401,17 @@ class _Engine {
       _hub.subscribeWithId(
           'myfollows', [NostrFilter(kinds: const [3], authors: [me])]);
     }
+    if (!_myFollowsDirty) return; // nothing new since we last parsed
+    _myFollowsDirty = false;
+
     NostrEvent? latest;
     for (final e in _store.query(NostrFilter(kinds: const [3], authors: [me]))) {
       if (latest == null || e.createdAt > latest.createdAt) latest = e;
     }
     if (latest == null) return;
+    if (latest.createdAt <= _myFollowsAt) return; // same list as last time
+    _myFollowsAt = latest.createdAt;
+
     final pubs = <String>{};
     for (final t in latest.tags) {
       if (t.length >= 2 && t[0] == 'p' && t[1].length == 64) {
@@ -411,6 +442,12 @@ class _Engine {
       }
     }
 
+    // Inbound-event rates — the firehose is this isolate's whole CPU cost.
+    final ev = _hub.drainEventStats();
+    if (ev.values.any((v) => v > 0)) {
+      toMain.send({'snap': 'evstats', 'stats': ev});
+    }
+
     // Changed engagement stats.
     final statEntries = <String, List<Object>>{};
     for (final id in _hub.trackedStatIds) {
@@ -426,19 +463,42 @@ class _Engine {
     }
 
     // New profiles.
+    //
+    // A MISS must be remembered, not just a hit. _profSent only records pubkeys
+    // whose kind-0 we found, so every author we've seen but whose profile never
+    // arrives (most of a public firehose) was re-queried against sqlite on
+    // EVERY 400ms tick, forever — hundreds of queries a second, no events, one
+    // core pegged. Re-check a miss only occasionally: the profile can still
+    // show up later, but it costs one query per pubkey per window, not 150.
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
     final profEntries = <String, Map<String, String>>{};
+    var looked = 0;
     for (final pub in _hub.trackedProfilePubs) {
       if (_profSent.contains(pub)) continue;
+      final retryAt = _profMissAt[pub];
+      if (retryAt != null && nowMs - retryAt < _profMissRetryMs) continue;
+      // Bound the work of any single tick, so a big backlog is spread out
+      // instead of stalling the engine in one go.
+      if (looked >= _profLookupsPerTick) break;
+      looked++;
       final p = _profileMap(pub);
       if (p.isNotEmpty && p['name'] != null) {
         _profSent.add(pub);
+        _profMissAt.remove(pub);
         profEntries[pub] = p;
+      } else {
+        _profMissAt[pub] = nowMs;
       }
     }
     if (profEntries.isNotEmpty) {
       toMain.send({'snap': 'profiles', 'entries': profEntries});
     }
   }
+
+  // pubkey -> when we last looked for its (absent) kind-0 profile.
+  final Map<String, int> _profMissAt = {};
+  static const int _profMissRetryMs = 5 * 60 * 1000;
+  static const int _profLookupsPerTick = 8;
 
   void _sendReplies(String postId) {
     final out = [

@@ -28,6 +28,12 @@ class RnsCrypto {
   static final _x25519 = c.X25519();
   static final _ed25519 = c.Ed25519();
 
+  /// Crypto ops dispatched to the worker isolate since the last call, by op
+  /// name (plus `shed`). The worker can burn a whole core under a busy hub, so
+  /// this is how the host attributes that CPU — and proves any reduction.
+  static Map<String, int> drainCryptoStats() =>
+      _CryptoWorker.instance.drainStats();
+
   // ---- hashing (RNS/Identity.py) ----
 
   /// SHA-256 of [data] (RNS `full_hash`).
@@ -256,6 +262,22 @@ class _CryptoWorker {
   int _seq = 0;
   int shed = 0; // dropped-op count, for diagnostics
 
+  /// Ops dispatched since the last [drainStats], by op name. The worker is a
+  /// whole CPU core's worth of curve math under a busy hub — knowing WHICH op
+  /// dominates (inbound verifies vs our own signs vs link ECDH) is what tells
+  /// you whether to shed harder or announce less. Read by the host's perf log.
+  final Map<String, int> _opCounts = {};
+
+  Map<String, int> drainStats() {
+    final out = Map<String, int>.from(_opCounts);
+    _opCounts.clear();
+    if (shed > 0) {
+      out['shed'] = shed;
+      shed = 0;
+    }
+    return out;
+  }
+
   /// Run [op] on the worker. Returns null when the op was shed or the worker
   /// is unavailable — callers treat that as failure (or fall back inline for
   /// rare non-hot paths).
@@ -271,6 +293,7 @@ class _CryptoWorker {
       shed++;
       return null;
     }
+    _opCounts[op.name] = (_opCounts[op.name] ?? 0) + 1;
     if (_toWorker == null) {
       _starting ??= _spawn();
       try {

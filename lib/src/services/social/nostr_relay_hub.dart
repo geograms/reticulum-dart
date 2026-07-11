@@ -531,7 +531,12 @@ class NostrRelayHub {
   }
 
   /// The latest stored kind-0 profile event for [pub], if any.
+  /// Sqlite profile lookups performed — counted because an unbounded re-query
+  /// of absent profiles once pegged an entire core with nothing to show for it.
+  int profileLookups = 0;
+
   NostrEvent? profileOf(String pub) {
+    profileLookups++;
     final evs = store.query(NostrFilter(kinds: const [0], authors: [pub]));
     NostrEvent? best;
     for (final e in evs) {
@@ -549,14 +554,45 @@ class NostrRelayHub {
   int _rateCount = 0;
   int rateDropped = 0;
 
+  /// Inbound-event accounting. The relay firehose is the engine isolate's whole
+  /// workload, so these are what attribute (and bound) its CPU.
+  int eventsSeen = 0;
+  int eventsStored = 0;
+  int reactionsStored = 0;
+
+  Map<String, int> drainEventStats() {
+    final out = {
+      'seen': eventsSeen,
+      'stored': eventsStored,
+      'reactions': reactionsStored,
+      'dropped': rateDropped,
+      'profileLookups': profileLookups,
+    };
+    eventsSeen = 0;
+    eventsStored = 0;
+    reactionsStored = 0;
+    rateDropped = 0;
+    profileLookups = 0;
+    return out;
+  }
+
   void _onEvent(String subId, NostrEvent event) {
-    // Persist every reaction receipt (post id + reactor) BEFORE the tallies
-    // consume the event. Kind-7s themselves are throwaway, but their count is
-    // what every feed shows — without this row the like totals reset on every
-    // restart and crawled back over the network instead of loading instantly.
+    eventsSeen++;
+    // Persist reaction receipts (post id + reactor) so like totals survive a
+    // restart instead of crawling back over the network.
+    //
+    // ONLY for posts we actually track. The discovery subscription is a kind-7
+    // firehose across every public relay, and persisting all of it meant one
+    // unbatched sqlite INSERT per inbound reaction — thousands a minute, ahead
+    // of the rate cap, burning the engine isolate for rows no one would ever
+    // read. Tracked posts are exactly the ones the UI displays (trackStats
+    // registers them, and seeds their tallies back from these rows), so this is
+    // the whole set the persistence was ever for.
     if (event.kind == NostrEventKind.reaction) {
       final liked = _firstETag(event);
-      if (liked != null) store.addReaction(liked, event.pubkey);
+      if (liked != null && _statReact.containsKey(liked)) {
+        if (store.addReaction(liked, event.pubkey)) reactionsStored++;
+      }
     }
     // Engagement (likes/replies) is tallied for on-screen posts BEFORE the rate
     // cap so counts stay accurate. Reactions are tally-only (never displayed).
@@ -576,7 +612,10 @@ class NostrRelayHub {
     }
     _rateCount++;
     // Merge into the unified store (dedup + replaceable/deletion handled there).
-    if (store.put(event)) onStored?.call(event);
+    if (store.put(event)) {
+      eventsStored++;
+      onStored?.call(event);
+    }
     // A liked-enough post (fetched by id) goes to the discovery feed too.
     if (_discoFeedSub != null &&
         event.kind == NostrEventKind.textNote &&

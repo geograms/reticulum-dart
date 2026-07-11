@@ -145,12 +145,57 @@ class AprxSign {
   // is parity-independent, so ecdh(a, B) == ecdh(b, A) without any y handling.
   // Confidentiality only; APRX signs the ciphertext separately for integrity.
 
+  // The ECDH secret is between two LONG-TERM keys (our scalar, their pubkey), so
+  // it never changes for a given peer — unlike Reticulum's link ECDH, which uses
+  // ephemeral keys and therefore can never be cached. Computing it is a
+  // secp256k1 scalar multiplication: tens of milliseconds of pure-Dart curve
+  // math, and it was being redone on EVERY encrypt/decrypt call. Cache it and a
+  // peer costs one multiplication ever; every later message is symmetric-only.
+  //
+  // Keyed by (our scalar, their pubkey) so a profile switch cannot cross-wire
+  // keys. Bounded LRU — a node talks to a bounded set of peers, and an unbounded
+  // map here would be a memory leak fed by strangers.
+  static final Map<String, Uint8List> _ecdhCache = {};
+  static const int _ecdhCacheMax = 256;
+
+  /// Number of real scalar multiplications performed (cache misses). Exposed so
+  /// the host can prove the cache is working instead of assuming it.
+  static int ecdhComputed = 0;
+
   static Uint8List? _ecdhKey(BigInt d, Uint8List pubXonly) {
+    // Discriminate our scalar by a DIGEST, never by hashCode: a hashCode
+    // collision between two different private keys would silently cross-wire
+    // encryption keys. The digest also keeps the raw scalar out of a long-lived
+    // map key.
+    final ck = '${_scalarTag(d)}:${_hexOf(pubXonly)}';
+    final hit = _ecdhCache[ck];
+    if (hit != null) {
+      // Refresh recency (insertion order = age).
+      _ecdhCache.remove(ck);
+      _ecdhCache[ck] = hit;
+      return hit;
+    }
     final p = _liftX(_toBig(pubXonly));
     if (p == null) return null;
     final s = p * d;
     if (s == null || s.isInfinity) return null;
-    return _toBytes(s.x!.toBigInteger()!, 32);
+    final key = _toBytes(s.x!.toBigInteger()!, 32);
+    ecdhComputed++;
+    _ecdhCache[ck] = key;
+    while (_ecdhCache.length > _ecdhCacheMax) {
+      _ecdhCache.remove(_ecdhCache.keys.first);
+    }
+    return key;
+  }
+
+  static String _hexOf(Uint8List b) =>
+      b.map((v) => v.toRadixString(16).padLeft(2, '0')).join();
+
+  /// SHA-256 of our private scalar, truncated — a collision-resistant cache
+  /// discriminator that does not retain the key itself.
+  static String _scalarTag(BigInt d) {
+    final tag = sha256.convert(_toBytes(d, 32)).bytes.sublist(0, 8);
+    return _hexOf(Uint8List.fromList(tag));
   }
 
   static Uint8List _aesCbc(bool encrypt, Uint8List key, Uint8List iv, Uint8List data) {

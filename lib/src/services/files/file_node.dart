@@ -120,6 +120,9 @@ class FileTransferNode {
   // DHT links: responder links we host, and in-flight outbound RPC links.
   final Map<String, RnsLink> _dhtServeLinks = {};
   final List<String> _dhtServeOrder = [];
+  // Packed LRPROOF per served link-id, so a duplicate LINKREQUEST is answered
+  // from cache instead of re-signing. Evicted alongside _dhtServeLinks.
+  final Map<String, Uint8List> _dhtServeProofs = {};
   final Map<String, _DhtRpcEntry> _dhtRpcByLink = {};
   static const int _maxDhtServeLinks = 128;
   // Live download progress for the UI: file sha hex -> (received, total) bytes,
@@ -930,6 +933,16 @@ class FileTransferNode {
   }
 
   Future<void> _acceptDhtLink(RnsPacket request, int arrivalHwMtu) async {
+    // Dedup before the crypto — see the note in RelayNode._accept. The link-id
+    // is a cheap hash; the handshake is two Curve25519 mults plus a signature.
+    // A duplicate LINKREQUEST (same request, another interface) re-sends the
+    // cached proof rather than signing a new one.
+    final dupId = _hex(RnsLink.linkIdFromRequest(request));
+    final cached = _dhtServeProofs[dupId];
+    if (cached != null) {
+      send(cached);
+      return;
+    }
     try {
       final link =
           await RnsLink.responder(identity, request, arrivalHwMtu: arrivalHwMtu);
@@ -937,9 +950,13 @@ class FileTransferNode {
       _dhtServeLinks[id] = link;
       _dhtServeOrder.add(id);
       if (_dhtServeOrder.length > _maxDhtServeLinks) {
-        _dhtServeLinks.remove(_dhtServeOrder.removeAt(0));
+        final evicted = _dhtServeOrder.removeAt(0);
+        _dhtServeLinks.remove(evicted);
+        _dhtServeProofs.remove(evicted);
       }
-      send((await link.buildProof()).pack());
+      final proof = (await link.buildProof()).pack();
+      _dhtServeProofs[id] = proof;
+      send(proof);
     } catch (e) {
       log?.call('dht: accept link failed: $e');
     }

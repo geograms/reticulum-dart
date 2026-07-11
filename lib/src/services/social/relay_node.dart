@@ -278,11 +278,27 @@ class RelayNode {
   // ── Responder side ────────────────────────────────────────────────────────
 
   Future<void> _accept(RnsPacket request) async {
+    // Dedup BEFORE the crypto. The link-id is a cheap truncated hash of the
+    // request, while RnsLink.responder costs two Curve25519 scalar mults and
+    // buildProof costs an Ed25519 signature. The SAME LINKREQUEST reaches us
+    // once per interface it arrives on (and this runs ahead of the transport's
+    // packet dedup), so without this check one peer's single request bought N
+    // full handshakes. Re-send the CACHED proof bytes instead — re-calling
+    // buildProof would sign again, which is the very cost we are avoiding.
+    final id = _hex(RnsLink.linkIdFromRequest(request));
+    final known = _in[id];
+    if (known != null) {
+      final proof = known.proof;
+      if (proof != null) send(proof);
+      return;
+    }
     try {
       final link = await RnsLink.responder(identity, request);
       final rl = _RelayLink(link, send, (msg) => _serve(link, msg));
-      _in[_hex(link.linkId!)] = rl;
-      send((await link.buildProof()).pack());
+      _in[id] = rl;
+      final proof = (await link.buildProof()).pack();
+      rl.proof = proof;
+      send(proof);
     } catch (err) {
       log?.call('relay: accept link failed: $err');
     }
@@ -425,6 +441,11 @@ class _RelayLink {
 
   RnsResourceSender? _tx; // our outbound Resource (if the message is large)
   RnsResourceReceiver? _rx; // inbound Resource being assembled
+
+  /// The packed LRPROOF we already sent. Cached so a duplicate LINKREQUEST
+  /// (same request arriving on another interface) is answered without signing
+  /// it again.
+  Uint8List? proof;
 
   _RelayLink(this.link, this.send, this.onMessage);
 

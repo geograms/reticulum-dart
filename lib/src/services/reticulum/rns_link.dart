@@ -40,12 +40,36 @@ class RnsLink {
   // Default [kRnsMtu] (500) for peers/interfaces that don't do discovery.
   int mtu = kRnsMtu;
 
-  // Our ephemeral keys for this link. The ephemeral Ed25519 public key is sent
-  // in the request (its private half is only needed for the optional, not-yet-
-  // implemented link identify step).
+  // Our ephemeral keys for this link. The X25519 pair MUST be fresh per link —
+  // it is the ECDH half, and reuse would destroy forward secrecy.
   late final Uint8List _xPrv;
   late final Uint8List _xPub;
+
+  // The ephemeral Ed25519 PUBLIC key is only placed in the request/proof; its
+  // private half is never used (it would only matter for the optional,
+  // unimplemented link-identify step), so minting a fresh keypair per link was
+  // a full Curve25519 scalar multiplication spent on a key we never sign with.
+  // On a node answering a stream of inbound relay queries that was one of the
+  // hottest things the CPU did. Share one rotating pair instead: rotated
+  // periodically so it stays a short-lived value rather than a permanent
+  // cross-link identifier, at ~zero cost.
   late final Uint8List _edPub;
+
+  static Uint8List? _sharedEdPub;
+  static int _sharedEdPubAt = 0;
+  static const int _sharedEdPubTtlMs = 10 * 60 * 1000;
+
+  static Future<Uint8List> _ephemeralEdPub() async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final cached = _sharedEdPub;
+    if (cached != null && now - _sharedEdPubAt < _sharedEdPubTtlMs) {
+      return cached;
+    }
+    final e = await RnsCrypto.ed25519Generate();
+    _sharedEdPub = e.pub;
+    _sharedEdPubAt = now;
+    return e.pub;
+  }
 
   Uint8List? linkId;
   Uint8List? _derivedKey;
@@ -103,8 +127,7 @@ class RnsLink {
     final x = await RnsCrypto.x25519Generate();
     link._xPrv = x.priv;
     link._xPub = x.pub;
-    final e = await RnsCrypto.ed25519Generate();
-    link._edPub = e.pub;
+    link._edPub = await _ephemeralEdPub();
     final shared = await RnsCrypto.x25519Shared(x.priv, link._peerXPub!);
     link._derivedKey = RnsCrypto.hkdf(64, shared, salt: link.linkId, context: null);
     link._token = RnsToken(link._derivedKey!);
@@ -166,10 +189,9 @@ class RnsLink {
     final destHash = RnsDestination.hash(destinationIdentity, appName, aspects);
     final link = RnsLink._(destinationIdentity, destHash);
     final x = await RnsCrypto.x25519Generate();
-    final e = await RnsCrypto.ed25519Generate();
     link._xPrv = x.priv;
     link._xPub = x.pub;
-    link._edPub = e.pub;
+    link._edPub = await _ephemeralEdPub();
     return link;
   }
 

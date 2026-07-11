@@ -57,6 +57,22 @@ class RelayNode {
   final void Function(Uint8List destHash)? requestPath;
   final void Function(String msg)? log;
 
+  /// Ask [peer] a query WITHOUT a link, via a connectionless NOSTR probe.
+  ///
+  /// Supplied by the host, which owns the NOSTR keys and the PLAIN transport, so
+  /// this library stays free of app concepts. Tri-state on purpose:
+  ///   supported=false          -> peer is an older node; use a link
+  ///   supported=true, body=null-> the peer answered with SILENCE: it holds
+  ///                               nothing. Do NOT open a link — that is the
+  ///                               entire saving.
+  ///   supported=true, body!=null-> a RESULT (or a HAVE hint, if too big)
+  ///
+  /// Distinguishing "has nothing" from "cannot probe" is what keeps the win on
+  /// the querier's side too; collapsing them would send us back to a link on
+  /// every empty query.
+  final Future<({bool supported, Uint8List? body})> Function(
+      RnsIdentity peer, Uint8List reqBytes)? probeQuery;
+
   /// Optional anti-spam acceptance policy applied to inbound EVENTs (PoW / rate
   /// / size). Null = accept anything with a valid signature.
   final SpamPolicy? spam;
@@ -110,6 +126,7 @@ class RelayNode {
     this.tierOfPub,
     this.admitEvent,
     this.selfPubHex,
+    this.probeQuery,
   });
 
   /// Feed an inbound packet; true if it belonged to the relay.
@@ -162,11 +179,44 @@ class RelayNode {
   }
 
   /// Run a NIP-01 filter (set [NostrFilter.search] for NIP-50) against [relay].
+  ///
+  /// Tries the connectionless probe first when the host offers one and the peer
+  /// advertises [RelayCap.probe]. A probe costs neither side a handshake, and a
+  /// peer holding nothing answers with SILENCE — so the common empty query
+  /// completes without a single Curve25519 operation anywhere.
+  ///
+  /// Falls back to a link when the peer is an older node, when the probe says
+  /// the result is too big for a datagram, or when the query itself does not fit.
   Future<List<NostrEvent>> query(RnsIdentity relay, NostrFilter filter,
       {Duration timeout = const Duration(seconds: 30)}) async {
     final sub = 's${_subSeq++}';
-    final r = await _request(relay, RelayProtocol.req(sub, filter),
-        timeout: timeout);
+    final reqBytes = RelayProtocol.req(sub, filter);
+
+    final p = probeQuery;
+    if (p != null && reqBytes.length <= kNpdMaxPlaintext) {
+      final r = await p(relay, reqBytes);
+      if (r.supported) {
+        final body = r.body;
+        if (body == null) {
+          // Silence. The peer holds nothing — and told us so for free.
+          //
+          // Honest caveat: a dropped packet is indistinguishable from "nothing".
+          // We accept that here because these queries are re-run on the feed's
+          // refresh cycle, so a lost probe costs freshness, not correctness — and
+          // never a wrong answer.
+          return const [];
+        }
+        final f = RelayProtocol.decode(body);
+        if (f != null && f.op == RelayOp.result) {
+          return f.events ?? const [];
+        }
+        // HAVE: the peer has data but it will not fit a datagram. NOW a link is
+        // worth its cost — there is something real to move.
+        log?.call('relay: probe says HAVE — opening a link for the payload');
+      }
+    }
+
+    final r = await _request(relay, reqBytes, timeout: timeout);
     return r?.events ?? const [];
   }
 

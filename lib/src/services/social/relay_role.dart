@@ -32,6 +32,12 @@ class RelayCap {
   static const int firehose = 1 << 1; // keeps a recent firehose window
   static const int storeForward = 1 << 2; // holds offline messages (propagation)
   static const int archive = 1 << 3; // attempts wide/full replication
+
+  /// Answers connectionless NOSTR probes (NPD) — a query needs no link, and a
+  /// node with nothing to say answers with silence. Advertised so a querier
+  /// never has to guess or wait on a timeout: peers without this bit keep
+  /// getting links exactly as before, so old and new nodes interoperate.
+  static const int probe = 1 << 4;
 }
 
 // Wire caps so a single relay announce stays well within the ~350B app_data
@@ -103,7 +109,11 @@ class RelayAnnouncement {
       return RelayAnnouncement(
           role: RelayRole.leaf,
           capacity: profile.capacity,
-          caps: 0,
+          // A leaf serves nothing to the network, but it DOES answer queries
+          // about its own posts — that is why it accepts inbound links today.
+          // Advertising probe support is what makes peers stop opening those
+          // links: exactly the node that can least afford handshakes.
+          caps: RelayCap.probe,
           pubkey: pubkey);
     }
     // Only unlimited (charger + WiFi/Ethernet) nodes take the indexer role.
@@ -111,10 +121,17 @@ class RelayAnnouncement {
       return RelayAnnouncement(
           role: RelayRole.leaf,
           capacity: profile.capacity,
-          caps: 0,
+          // A leaf serves nothing to the network, but it DOES answer queries
+          // about its own posts — that is why it accepts inbound links today.
+          // Advertising probe support is what makes peers stop opening those
+          // links: exactly the node that can least afford handshakes.
+          caps: RelayCap.probe,
           pubkey: pubkey);
     }
-    var caps = RelayCap.search | RelayCap.firehose | RelayCap.storeForward;
+    var caps = RelayCap.search |
+        RelayCap.firehose |
+        RelayCap.storeForward |
+        RelayCap.probe;
     // Top-tier (pinned archive / home fiber) widen toward a full archive.
     final wide = interests.wide || profile.capacity <= kCapHomeFiber;
     if (wide) caps |= RelayCap.archive;
@@ -236,6 +253,17 @@ class RelayDirectory {
     if (ann == null) return null;
     final e = RelayEntry(peer, ann, hops, _now);
     _entries[e.idHex] = e;
+    return e;
+  }
+
+  /// The announcement we last heard from [peer], or null. Used to decide whether
+  /// a peer can be queried with a connectionless probe (RelayCap.probe) and to
+  /// get the NOSTR pubkey the probe is encrypted to — both come from the same
+  /// announcement, so a querier never has to guess or wait out a timeout.
+  RelayEntry? byIdentity(RnsIdentity peer) {
+    final e = _entries[peer.hexHash];
+    if (e == null) return null;
+    if (_now - e.lastSeenMs > entryTtl.inMilliseconds) return null;
     return e;
   }
 

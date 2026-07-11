@@ -59,6 +59,21 @@ abstract class RnsInterface {
   bool get edge => false;
 }
 
+/// Where we last heard an identity, and how confident we still are about it.
+class _FastVia {
+  _FastVia(this.label, this.heardMs);
+
+  /// Interface label the identity was heard on.
+  final String label;
+
+  /// When we last heard the identity ON [label] — not merely when we last heard
+  /// the identity at all, which is what makes this an expiry and not an LRU.
+  int heardMs;
+
+  /// Consecutive announces heard on a slower medium instead of [label].
+  int misses = 0;
+}
+
 class RnsPathEntry {
   final Uint8List destHash;
   final RnsIdentity identity;
@@ -502,7 +517,27 @@ class RnsTransport implements RnsInterfaceRegistry {
   // (identityHex -> interface label). Lets a dest whose own (broadcast) announce
   // was lost still route over the LAN when a SIBLING dest of the same node was
   // heard there — co-located transfer no longer depends on every dest's beacon.
-  final Map<String, String> _identityFastVia = {};
+  // The fastest data-capable interface we have RECENTLY heard an identity on.
+  // This is a claim about where a peer *is*, so it must expire: a peer that
+  // leaves the LAN (phone moves to cellular / another AP) is no longer reachable
+  // there, and a stale pin silently black-holes every packet we send it — the
+  // rank rule in the path logic refuses to replace a "fast" LAN path with the
+  // slower hub path we can actually reach it on, so the pin never self-heals and
+  // the peer stays unreachable until the app restarts.
+  final Map<String, _FastVia> _identityFastVia = {};
+
+  /// A pin is trusted only while the peer keeps being heard on that interface.
+  /// Must comfortably exceed the slowest announce cadence (5 min on battery /
+  /// cellular) so a quiet-but-present LAN peer is not demoted for merely being
+  /// slow to re-announce.
+  static const int _fastViaTtlMs = 12 * 60 * 1000;
+
+  /// Announces of this identity heard on a SLOWER medium with not one on the
+  /// pinned interface in between. The peer has almost certainly left that
+  /// medium. Heals faster than the wall-clock TTL when announces are frequent.
+  /// A false demote is cheap (traffic takes the hub — slower but WORKING) while
+  /// a false pin is a black hole, so this deliberately errs toward demoting.
+  static const int _fastViaMaxMisses = 4;
 
   int _speedRank(String label) {
     for (final i in _interfaces) {
@@ -513,6 +548,28 @@ class RnsTransport implements RnsInterfaceRegistry {
 
   /// Public speed-rank of the interface labelled [label] (2 if unknown).
   int speedRankOf(String label) => _speedRank(label);
+
+  /// Repoint every path of [idHex] that a now-stale pin had aimed at
+  /// [staleVia] onto [newVia] — the interface we are actually still hearing the
+  /// peer on.
+  ///
+  /// Dropping the pin is NOT sufficient on its own: the path entries it already
+  /// wrote still say `via: <fast medium>`, and the same-capability rank rule
+  /// below refuses to replace a faster-ranked entry with a slower-ranked one. So
+  /// the dead LAN path would outrank — and keep shadowing — the live hub path
+  /// forever. Every destination of an identity shares one next hop (see
+  /// [nextHopForIdentity]), so repointing them all is sound.
+  void _demoteIdentityPaths(String idHex, String staleVia, String newVia,
+      Uint8List? newNextHop, int newHops, int nowMs) {
+    for (final e in _paths.values) {
+      if (e.via != staleVia) continue;
+      if (_hex(e.identity.hash) != idHex) continue;
+      e.via = newVia;
+      e.nextHop = newNextHop;
+      e.hops = newHops;
+      e.updatedMs = nowMs;
+    }
+  }
 
   /// A duplicate announce arrived on interface [via]. If we already track this
   /// destination and [via] is a data-capable interface strictly faster than the
@@ -646,12 +703,34 @@ class RnsTransport implements RnsInterfaceRegistry {
     // that interface (the LAN peer table already knows the node's address to
     // unicast to). This is what makes co-located transfer use the LAN reliably
     // instead of depending on every single dest's broadcast landing.
+    //
+    // The pin is EVIDENCE, not a fact: it says "we heard this peer there", and
+    // a peer can leave. Age it against the announces we keep hearing, and when
+    // it goes stale, demote the paths it pinned (see [_demoteIdentityPaths] for
+    // why removing the pin alone is not enough).
     final idHex = _hex(ann.identity.hash);
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final pin = _identityFastVia[idHex];
+    if (pin != null) {
+      if (viaArg == pin.label) {
+        pin.heardMs = nowMs; // still there — refresh liveness
+        pin.misses = 0;
+      } else if (_speedRank(viaArg) < _speedRank(pin.label)) {
+        pin.misses++; // heard only on a slower medium: it may have moved
+      }
+      if (nowMs - pin.heardMs > _fastViaTtlMs ||
+          pin.misses >= _fastViaMaxMisses) {
+        _identityFastVia.remove(idHex);
+        log?.call('path pin ${idHex.substring(0, 8)} ${pin.label} -> $viaArg '
+            '(stale: peer no longer heard on ${pin.label})');
+        _demoteIdentityPaths(idHex, pin.label, viaArg, nextHop, pathHops, nowMs);
+      }
+    }
     final fast = _identityFastVia[idHex];
     if (fast != null &&
-        _speedRank(fast) > _speedRank(via) &&
-        _ifaceByLabel(fast) != null) {
-      via = fast;
+        _speedRank(fast.label) > _speedRank(via) &&
+        _ifaceByLabel(fast.label) != null) {
+      via = fast.label;
       nextHop = null;
       pathHops = 1;
     }
@@ -663,15 +742,15 @@ class RnsTransport implements RnsInterfaceRegistry {
     // its next announce, and those are minutes apart / often dropped.
     if (!_isAnnounceOnly(viaArg)) {
       final cur = _identityFastVia[idHex];
-      if (cur == null || _speedRank(viaArg) > _speedRank(cur)) {
-        _identityFastVia[idHex] = viaArg;
+      if (cur == null || _speedRank(viaArg) > _speedRank(cur.label)) {
+        _identityFastVia[idHex] = _FastVia(viaArg, nowMs);
         for (final e in _paths.values) {
           if (_hex(e.identity.hash) == idHex &&
               _speedRank(viaArg) > _speedRank(e.via)) {
             e.via = viaArg;
             e.nextHop = null;
             e.hops = 1;
-            e.updatedMs = DateTime.now().millisecondsSinceEpoch;
+            e.updatedMs = nowMs;
           }
         }
       }

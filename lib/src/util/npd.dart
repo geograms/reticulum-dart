@@ -79,6 +79,15 @@ class NpdType {
 
   /// "Yes — and here it is" (only when it fits; see the size budget).
   static const int result = 0x03;
+
+  /// The type travels in CLEARTEXT so the kind of traffic on the wire stays
+  /// classifiable; name it so it is readable in a log too.
+  static String name(int t) => switch (t) {
+        req => 'req',
+        have => 'have',
+        result => 'result',
+        _ => 'type$t',
+      };
 }
 
 const int _magic0 = 0x4E; // 'N'

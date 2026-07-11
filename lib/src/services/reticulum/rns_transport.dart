@@ -394,7 +394,26 @@ class RnsTransport implements RnsInterfaceRegistry {
   /// rendezvous join request) WITHOUT a link handshake — one packet, so it
   /// survives an asymmetric inbound far better than a 3-way link setup.
   void sendDataTo(Uint8List destHash, Uint8List data,
-      {int context = RnsContext.none}) {
+          {int context = RnsContext.none}) =>
+      _sendConnectionless(destHash, data,
+          context: context, destType: RnsDestType.single);
+
+  /// Send one connectionless PLAIN packet to [destHash] — no link, no handshake,
+  /// no Reticulum-layer encryption (the payload carries its own, e.g. an NPD
+  /// probe encrypted to the peer's NOSTR key).
+  ///
+  /// Routes multi-hop exactly like any other packet: when we hold a path with a
+  /// next hop, this goes out HEADER_2 transport-addressed, and a transport node's
+  /// [_maybeForward] relays it while [_forwardToward] preserves the dest type.
+  /// With no known path it falls back to a HEADER_1 broadcast, which only
+  /// reaches directly-attached neighbours.
+  void sendPlainTo(Uint8List destHash, Uint8List data,
+          {int context = RnsContext.none}) =>
+      _sendConnectionless(destHash, data,
+          context: context, destType: RnsDestType.plain);
+
+  void _sendConnectionless(Uint8List destHash, Uint8List data,
+      {required int context, required int destType}) {
     final path = _paths[_hex(destHash)];
     final toTransport = path?.nextHop != null;
     final pkt = RnsPacket(
@@ -405,7 +424,7 @@ class RnsTransport implements RnsInterfaceRegistry {
       transportType: toTransport
           ? RnsTransportType.transport
           : RnsTransportType.broadcast,
-      destType: RnsDestType.single,
+      destType: destType,
       packetType: RnsPacketType.data,
       context: context,
       transportId: toTransport ? path!.nextHop : null,

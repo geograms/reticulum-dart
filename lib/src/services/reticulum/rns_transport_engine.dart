@@ -210,6 +210,11 @@ class RnsTransportClient implements RnsInterfaceRegistry {
           {int context = RnsContext.none}) =>
       _send(['sendDataTo', destHash, data, context]);
 
+  /// Connectionless PLAIN packet — see [RnsTransport.sendPlainTo].
+  void sendPlainTo(Uint8List destHash, Uint8List data,
+          {int context = RnsContext.none}) =>
+      _send(['sendPlainTo', destHash, data, context]);
+
   // ── path reads (mirror) ───────────────────────────────────────────────────
 
   RnsPathEntry? pathFor(Uint8List destHash) => _pathMirror[_hex(destHash)];
@@ -374,6 +379,9 @@ Future<void> _engineMain(SendPort toMain) async {
           transport.requestPath(msg[1] as Uint8List);
         case 'sendDataTo':
           transport.sendDataTo(msg[1] as Uint8List, msg[2] as Uint8List,
+              context: msg[3] as int);
+        case 'sendPlainTo':
+          transport.sendPlainTo(msg[1] as Uint8List, msg[2] as Uint8List,
               context: msg[3] as int);
         case 'setPassive':
           transport.setPassive(msg[1] as bool, auto: msg[2] as bool);

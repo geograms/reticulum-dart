@@ -26,6 +26,7 @@ import 'dht/dht_node.dart';
 import 'dht/provider_record.dart';
 import 'file_transfer.dart';
 import 'partial_store.dart';
+import '../../util/npd.dart';
 import 'serve_quota.dart';
 
 const String kFilesApp = 'geogram';
@@ -930,6 +931,36 @@ class FileTransferNode {
     final resp = await e.done.future.timeout(timeout, onTimeout: () => null);
     _dhtRpcByLink.remove(id);
     return resp;
+  }
+
+  /// Answer a connectionless DHT probe (NPD) — no link, no handshake.
+  ///
+  /// Unlike the relay, a DHT FIND always HAS an answer (at minimum the closest
+  /// contacts we know), so this normally replies. The win here is not silence,
+  /// it is that the reply costs no asymmetric crypto: the pairwise NOSTR key is
+  /// cached, so both the decrypt and the encrypt are symmetric-only, where a
+  /// link handshake cost two Curve25519 mults plus a signature EVERY time.
+  ///
+  /// Replies are sized to fit one datagram; a peer that needs more opens a link.
+  Future<({int type, Uint8List body})?> answerProbe(Uint8List body) async {
+    final d = dht;
+    if (d == null) return null;
+    final inner = _untagDht(body);
+    if (inner == null) return null;
+    // Fit the answer inside one PLAIN packet: ~64 B per contact, ~185 B per
+    // record (same accounting the link path uses, against a smaller budget).
+    final budget = kNpdMaxPlaintext - 24;
+    final maxC = (budget ~/ 64).clamp(1, kDhtWireMaxContacts);
+    final maxR = (budget ~/ 185).clamp(1, kDhtWireMaxRecords);
+    final resp =
+        await d.handleEncoded(inner, maxContacts: maxC, maxRecords: maxR);
+    if (resp == null) return null;
+    final tagged = _tagDht(resp);
+    if (tagged.length > kNpdMaxPlaintext) {
+      // Too big for a datagram — tell the peer to come back over a link.
+      return (type: NpdType.have, body: Uint8List(0));
+    }
+    return (type: NpdType.result, body: tagged);
   }
 
   Future<void> _acceptDhtLink(RnsPacket request, int arrivalHwMtu) async {

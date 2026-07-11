@@ -162,6 +162,12 @@ class AprxSign {
   /// the host can prove the cache is working instead of assuming it.
   static int ecdhComputed = 0;
 
+  /// The cached ECDH secret between our scalar [d] and a peer's x-only pubkey.
+  /// Public so other transports (the NOSTR probe datagram) reuse this ONE cache
+  /// rather than each keeping their own — the cache is the whole point.
+  static Uint8List? ecdhShared(BigInt d, Uint8List pubXonly) =>
+      _ecdhKey(d, pubXonly);
+
   static Uint8List? _ecdhKey(BigInt d, Uint8List pubXonly) {
     // Discriminate our scalar by a DIGEST, never by hashCode: a hashCode
     // collision between two different private keys would silently cross-wire

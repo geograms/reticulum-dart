@@ -95,6 +95,7 @@ export 'src/services/files/serve_stats.dart';
 
 // ── APRX signatures (compact secp256k1 Schnorr) ─────────────────────────
 export 'src/util/aprx_sign.dart';
+export 'src/util/npd.dart';
 
 // ── BLE transport primitives (Flutter) ──────────────────────────────────
 export 'src/services/reticulum/rns_ble_interface.dart';

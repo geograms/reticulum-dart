@@ -33,6 +33,7 @@ import '../../util/nostr_event.dart';
 import '../../util/nostr_crypto.dart';
 import 'relay_event_store.dart';
 import 'relay_protocol.dart';
+import '../../util/npd.dart';
 import 'spam.dart';
 
 const String kRelayApp = 'geogram';
@@ -273,6 +274,54 @@ class RelayNode {
       return;
     }
     e.rl.handleData(p);
+  }
+
+  // ── Connectionless probe (NPD) ────────────────────────────────────────────
+
+  /// Answer a connectionless probe carrying a REQ, WITHOUT a link.
+  ///
+  /// Returns null when we hold nothing — the caller then sends no packet at all,
+  /// which is the entire point: that case was 98 of 98 inbound queries and each
+  /// one was buying a full Curve25519 handshake to say "I have nothing".
+  ///
+  /// Query semantics are identical to the link path ([_serve], RelayOp.req),
+  /// self-scoping included, so a probe and a link answer the same question the
+  /// same way.
+  Future<({int type, Uint8List body})?> answerProbe(Uint8List body) async {
+    final f = RelayProtocol.decode(body);
+    if (f == null || f.op != RelayOp.req || f.filter == null) return null;
+    if (!_answersQueries) return null;
+
+    var filter = f.filter!;
+    if (!serve) {
+      final self = selfPubHex?.call();
+      if (self == null) return null; // nothing of ours to offer -> silence
+      filter = NostrFilter(
+        authors: [self.toLowerCase()],
+        kinds: filter.kinds,
+        tags: filter.tags,
+        since: filter.since,
+        until: filter.until,
+        limit: filter.limit,
+      );
+    }
+
+    final events = store.query(filter);
+    if (events.isEmpty) return null; // <- silence. no reply, no crypto.
+
+    // We have something. Send it inline if it fits one datagram; otherwise just
+    // say HOW MANY and let the peer open a link for the bulk (the link is worth
+    // paying for when there is actually data to move).
+    final full = RelayProtocol.result(f.subId ?? '', events, true);
+    if (full.length <= kNpdMaxPlaintext) {
+      log?.call('relay: probe answered inline -> ${events.length} event(s)');
+      return (type: NpdType.result, body: full);
+    }
+    log?.call('relay: probe -> HAVE ${events.length} (open a link)');
+    return (
+      type: NpdType.have,
+      body: RelayProtocol.countResult(f.subId ?? '', events.length),
+    );
   }
 
   // ── Responder side ────────────────────────────────────────────────────────

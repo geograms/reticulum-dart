@@ -204,14 +204,58 @@ class RelayEventStore {
   /// 1 followed / 2 stranger) and [receivedAtMs] are recorded for the hosting
   /// quota/eviction; they default to stranger / now when not supplied (e.g. our
   /// own local publishes pass tier 0).
-  bool put(NostrEvent e, {int tier = 2, int? receivedAtMs}) {
+  bool put(NostrEvent e, {int tier = 2, int? receivedAtMs}) =>
+      _put(e, tier: tier, receivedAtMs: receivedAtMs, verify: true);
+
+  /// Ingest a batch of events that a **trusted in-process producer has already
+  /// verified** — one transaction, no Schnorr.
+  ///
+  /// This exists for exactly one caller: the follows mirror, which copies events
+  /// the `nostr-engine` isolate has already verified out of its buffer and into
+  /// this store so we can serve them to peers. Verifying them again would run
+  /// secp256k1 on the isolate that owns this store — the main/UI isolate — which
+  /// is the pattern that once froze the app for hours (docs/performance.md §3.1).
+  ///
+  /// Everything arriving off the wire must keep going through [put], which
+  /// verifies. Never call this with events from an untrusted source: a forged
+  /// signature would be stored and then re-served to the network as if it were
+  /// ours to vouch for.
+  ///
+  /// Returns the number actually stored (new, not duplicate/superseded).
+  int putAllVerified(List<NostrEvent> events, {int tier = 2, int? receivedAtMs}) {
+    if (events.isEmpty) return 0;
+    var stored = 0;
+    _db.execute('BEGIN');
+    _inTx = true;
+    try {
+      for (final e in events) {
+        if (_put(e, tier: tier, receivedAtMs: receivedAtMs, verify: false)) {
+          stored++;
+        }
+      }
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    } finally {
+      _inTx = false;
+    }
+    return stored;
+  }
+
+  bool _put(
+    NostrEvent e, {
+    required int tier,
+    required int? receivedAtMs,
+    required bool verify,
+  }) {
     _pendingTier = tier;
     _pendingReceivedSec =
         (receivedAtMs ?? DateTime.now().millisecondsSinceEpoch) ~/ 1000;
     final id = e.id;
     final sig = e.sig;
     if (id == null || sig == null || id.isEmpty || sig.isEmpty) return false;
-    if (!e.verify()) return false; // recomputes id + checks Schnorr
+    if (verify && !e.verify()) return false; // recomputes id + checks Schnorr
 
     // Duplicate?
     final dup = _db.select('SELECT 1 FROM events WHERE id = ? LIMIT 1', [id]);
@@ -255,34 +299,46 @@ class RelayEventStore {
   int _pendingTier = 2;
   int _pendingReceivedSec = 0;
 
+  // True while putAllVerified holds an outer transaction: sqlite has no nested
+  // BEGIN, so _insert must not open its own.
+  bool _inTx = false;
+
   void _insert(NostrEvent e) {
+    if (_inTx) {
+      _insertRows(e);
+      return;
+    }
     _db.execute('BEGIN');
     try {
-      _db.execute(
-        'INSERT INTO events(id, pubkey, created_at, kind, content, raw, received_at, tier) '
-        'VALUES(?,?,?,?,?,?,?,?)',
-        [e.id, e.pubkey, e.createdAt, e.kind, e.content, jsonEncode(e.toJson()),
-         _pendingReceivedSec, _pendingTier],
-      );
-      final metaParts = <String>[];
-      for (final t in e.tags) {
-        if (t.length < 2) continue;
-        _db.execute('INSERT INTO tags(event_id, name, value) VALUES(?,?,?)',
-            [e.id, t[0], t[1]]);
-        // Make tag values (file names, topics, mime, etc.) full-text searchable.
-        for (final v in t.skip(1)) {
-          if (v.isNotEmpty) metaParts.add(v);
-        }
-      }
-      _db.execute(
-        'INSERT INTO events_fts(content, meta, event_id) VALUES(?,?,?)',
-        [e.content, metaParts.join(' '), e.id],
-      );
+      _insertRows(e);
       _db.execute('COMMIT');
     } catch (err) {
       _db.execute('ROLLBACK');
       rethrow;
     }
+  }
+
+  void _insertRows(NostrEvent e) {
+    _db.execute(
+      'INSERT INTO events(id, pubkey, created_at, kind, content, raw, received_at, tier) '
+      'VALUES(?,?,?,?,?,?,?,?)',
+      [e.id, e.pubkey, e.createdAt, e.kind, e.content, jsonEncode(e.toJson()),
+       _pendingReceivedSec, _pendingTier],
+    );
+    final metaParts = <String>[];
+    for (final t in e.tags) {
+      if (t.length < 2) continue;
+      _db.execute('INSERT INTO tags(event_id, name, value) VALUES(?,?,?)',
+          [e.id, t[0], t[1]]);
+      // Make tag values (file names, topics, mime, etc.) full-text searchable.
+      for (final v in t.skip(1)) {
+        if (v.isNotEmpty) metaParts.add(v);
+      }
+    }
+    _db.execute(
+      'INSERT INTO events_fts(content, meta, event_id) VALUES(?,?,?)',
+      [e.content, metaParts.join(' '), e.id],
+    );
   }
 
   void _deleteById(String id) {

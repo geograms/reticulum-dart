@@ -101,13 +101,14 @@ class MediaRef {
     return base64Url.encode(bytes).replaceAll('=', '');
   }
 
-  // Keep in sync with the table in APRX.md §16.3. gif is classified as video
-  // (animated playback), matching the protocol spec.
+  // Keep in sync with the table in APRX.md §16.3. gif is classified as image
+  // (Flutter's image codec animates it natively — no video decoder needed).
   static const Map<String, MediaKind> _kinds = {
     // image
     'png': MediaKind.image,
     'jpg': MediaKind.image,
     'jpeg': MediaKind.image,
+    'gif': MediaKind.image,
     'webp': MediaKind.image,
     'bmp': MediaKind.image,
     'svg': MediaKind.image,
@@ -116,8 +117,7 @@ class MediaRef {
     'tif': MediaKind.image,
     'tiff': MediaKind.image,
     'ico': MediaKind.image,
-    // video (gif rides here: it is shown as a looping clip)
-    'gif': MediaKind.video,
+    // video
     'webm': MediaKind.video,
     'mpeg': MediaKind.video,
     'mpg': MediaKind.video,

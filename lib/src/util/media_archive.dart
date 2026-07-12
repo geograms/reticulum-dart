@@ -360,8 +360,15 @@ class MediaArchive {
   /// 2 stranger) so the evictor can drop it under storage pressure. If we already
   /// hold the bytes as our own (hosted=0), the row is left as our own. Returns the
   /// sha256 token.
+  /// [pin] marks the blob as one the user deliberately KEEPS (see "keep data"
+  /// on a profile): it stays hosted and served, but the eviction sweep will not
+  /// consider it however tight the quota gets. Pinning is the only promise this
+  /// archive makes that survives storage pressure, so it is opt-in per account.
   String putHosted(Uint8List data, String ext,
-      {required String originPubHex, required int tier, int? receivedAtMs}) {
+      {required String originPubHex,
+      required int tier,
+      int? receivedAtMs,
+      bool pin = false}) {
     final e = _normExt(ext);
     final key = _b64u(crypto.sha256.convert(data).bytes);
     final token = 'file:$key.$e';
@@ -375,12 +382,17 @@ class MediaArchive {
         'INSERT OR IGNORE INTO media'
         '(sha256,sha1,tlsh,name,ext,description,tags,'
         ' first_seen,last_seen,size,screenshot,data,pinned,hosted,origin_pub,tier,received_at) '
-        'VALUES(?,?,NULL,NULL,?,NULL,NULL,?,?,?,NULL,?,0,1,?,?,?)',
-        [key, sha1b64, e, now, now, data.length, data, originPubHex, tier, rcv],
+        'VALUES(?,?,NULL,NULL,?,NULL,NULL,?,?,?,NULL,?,?,1,?,?,?)',
+        [key, sha1b64, e, now, now, data.length, data, pin ? 1 : 0,
+         originPubHex, tier, rcv],
       );
       if (db.updatedRows == 0) {
-        // Already present: just bump last_seen (keep its existing ownership).
+        // Already present: bump last_seen, and let a pin UPGRADE an existing row
+        // (the user turned "keep data" on after we already had the bytes).
         db.execute('UPDATE media SET last_seen=? WHERE sha256=?', [now, key]);
+        if (pin) {
+          db.execute('UPDATE media SET pinned=1 WHERE sha256=?', [key]);
+        }
       }
       _syncFts(db, key);
     } catch (e2) {
@@ -413,8 +425,11 @@ class MediaArchive {
     final db = _ensureDb();
     if (db == null) return const [];
     try {
+      // pinned=0 only: a pinned blob is one the user asked this device to keep,
+      // and handing it to the evictor would break exactly that promise.
       final rows = db.select(
-          'SELECT sha256, tier, size, received_at FROM media WHERE hosted=1');
+          'SELECT sha256, tier, size, received_at FROM media '
+          'WHERE hosted=1 AND pinned=0');
       return [
         for (final r in rows)
           (

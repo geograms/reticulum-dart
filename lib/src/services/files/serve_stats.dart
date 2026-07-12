@@ -11,6 +11,8 @@
  */
 import 'package:sqlite3/sqlite3.dart';
 
+import '../../util/db_opener.dart';
+
 class FolderServeStats {
   final int totalServes; // all-time serves across the folder's files
   final int last24h;
@@ -36,7 +38,7 @@ class ServeStats {
   static const int _msPerDay = 86400000;
 
   factory ServeStats.open(String path) {
-    final db = sqlite3.open(path);
+    final db = dbOpener(path);
     db.execute('PRAGMA journal_mode = WAL;');
     db.execute('PRAGMA synchronous = NORMAL;');
     db.execute('''

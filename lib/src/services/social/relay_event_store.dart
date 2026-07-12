@@ -23,6 +23,8 @@ import 'dart:typed_data';
 
 import 'package:sqlite3/sqlite3.dart';
 
+import '../../util/db_opener.dart';
+
 import '../../util/nostr_event.dart';
 
 /// A NIP-01 subscription filter. All present conditions are AND-ed; within a
@@ -99,7 +101,7 @@ class RelayEventStore {
       final parent = File(path).parent;
       if (!parent.existsSync()) parent.createSync(recursive: true);
     }
-    final db = sqlite3.open(path);
+    final db = dbOpener(path);
     db.execute('PRAGMA journal_mode = WAL;');
     db.execute('PRAGMA synchronous = NORMAL;');
     db.execute('PRAGMA foreign_keys = ON;');

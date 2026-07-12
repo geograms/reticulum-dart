@@ -12,6 +12,8 @@
  */
 import 'package:sqlite3/sqlite3.dart';
 
+import '../../util/db_opener.dart';
+
 class DiskIndexEntry {
   final String sha; // sha256 hex (64)
   final String path; // absolute path on disk
@@ -28,7 +30,7 @@ class DiskIndex {
   DiskIndex._(this._db);
 
   static DiskIndex open(String path) {
-    final db = sqlite3.open(path);
+    final db = dbOpener(path);
     db.execute('''
       CREATE TABLE IF NOT EXISTS disk_files(
         sha       TEXT NOT NULL,

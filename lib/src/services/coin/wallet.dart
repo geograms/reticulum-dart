@@ -15,6 +15,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:sqlite3/sqlite3.dart';
 
+import '../../util/db_opener.dart';
+
 import 'bearer_token.dart';
 import 'coin_keyset.dart';
 
@@ -43,7 +45,7 @@ class CoinWallet {
       } else {
         final parent = File(_dbPath).parent;
         if (!parent.existsSync()) parent.createSync(recursive: true);
-        db = sqlite3.open(_dbPath);
+        db = dbOpener(_dbPath);
         db.execute('PRAGMA journal_mode = WAL;');
         db.execute('PRAGMA synchronous = NORMAL;');
       }

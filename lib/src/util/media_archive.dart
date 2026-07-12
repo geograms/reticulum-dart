@@ -26,6 +26,8 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:sqlite3/sqlite3.dart';
 
+import 'db_opener.dart';
+
 import 'media_ref.dart';
 
 // Pure-Dart logging shim (this package has no Flutter dependency).
@@ -137,7 +139,7 @@ class MediaArchive {
     try {
       final parent = File(_dbPath).parent;
       if (!parent.existsSync()) parent.createSync(recursive: true);
-      final db = sqlite3.open(_dbPath);
+      final db = dbOpener(_dbPath);
       db.execute('PRAGMA journal_mode = WAL;');
       db.execute('PRAGMA synchronous = NORMAL;');
       db.execute('''

@@ -16,6 +16,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../../util/nostr_event.dart';
+import 'feed_quality.dart';
 import 'nostr_local_client.dart';
 import 'nostr_relay_client.dart';
 import 'nostr_wire.dart';
@@ -265,6 +266,37 @@ class NostrRelayHub {
     for (final c in _clients.values) {
       c.unsubscribe(subId);
     }
+
+    // A discovery subscriber leaving must not leave the machinery pointing at a
+    // dead inbox. This is what made pull-to-refresh (unsubscribe → re-subscribe)
+    // kill the discovery feed for the life of the process: _discoFeedSub still
+    // named the id we had just deleted, so every qualifying post was buffered
+    // into nothing and the re-subscribe was handed the same corpse.
+    if (_discoSubscribers.remove(subId) && _discoSubscribers.isEmpty) {
+      _teardownDiscovery();
+    }
+    if (_fireSubscribers.remove(subId) && _fireSubscribers.isEmpty) {
+      _teardownFirehose();
+    }
+  }
+
+  void _teardownDiscovery() {
+    _discoFeedSub = null;
+    final react = _discoReactSub;
+    _discoReactSub = null;
+    if (react != null) {
+      _subFilters.remove(react);
+      _inbox.remove(react);
+      _seen.remove(react);
+      for (final c in _clients.values) {
+        c.unsubscribe(react);
+      }
+    }
+    _discoTimer?.cancel();
+    _discoTimer = null;
+    _discoPrime?.cancel();
+    _discoPrime = null;
+    _discoPrimed = false;
   }
 
   // ── Discovery feed (for users who follow nobody) ────────────────────────────
@@ -272,8 +304,17 @@ class NostrRelayHub {
   // REACTION firehose, tally distinct likers per event, and only surface a post
   // once it has crossed a like threshold — then fetch that specific note by id.
   // Spam gets no reactions, so it never appears.
-  String? _discoFeedSub; // the subId the wapp drains
+  String? _discoFeedSub; // the internal feed the qualifying posts land in
   String? _discoReactSub; // internal kind-7 subscription
+
+  /// Everyone drinking from the discovery feed.
+  ///
+  /// There is more than one: the launcher hero subscribes at startup and the
+  /// Social wapp subscribes when it opens. The old code returned the FIRST
+  /// subscriber's id to everybody and never created an inbox for the others, so
+  /// the second subscriber drained an id the hub would never fill — silently,
+  /// forever. Whoever asked second simply got no feed.
+  final Set<String> _discoSubscribers = {};
   int _discoMinLikes = 2;
   final Map<String, Set<String>> _discoLikers = {}; // eventId → distinct likers
   final Set<String> _discoWanted = {}; // ids past the threshold
@@ -292,12 +333,17 @@ class NostrRelayHub {
       subscribeDiscoveryWithId('disco${_subSeq++}', minLikes: minLikes);
 
   String subscribeDiscoveryWithId(String feed, {int minLikes = 2}) {
-    final existing = _discoFeedSub;
-    if (existing != null) return existing;
-    _discoMinLikes = minLikes;
-    _discoFeedSub = feed;
+    // EVERY subscriber gets its own inbox. Handing them all one shared id (what
+    // this used to do) meant the second one drained a queue that did not exist.
+    _discoSubscribers.add(feed);
     _inbox[feed] = Queue<NostrEvent>();
     _seen[feed] = <String>{};
+
+    final existing = _discoFeedSub;
+    if (existing != null) return feed; // machinery already running
+
+    _discoMinLikes = minLikes;
+    _discoFeedSub = feed;
     // Internal reactions subscription — tallied, never drained by the wapp.
     final react = 'discoR${_subSeq++}';
     _discoReactSub = react;
@@ -318,6 +364,249 @@ class NostrRelayHub {
       _discoTimer = Timer.periodic(kNostrPollInterval, (_) => _discoFetch());
     }
     return feed;
+  }
+
+  // ── The live firehose (the "All" tab) ──────────────────────────────────────
+  //
+  // Discovery (above) can only ever surface a post that has ALREADY collected
+  // likes — it watches reactions and then fetches the post by id. That makes it
+  // a "popular" feed, and it is fine for that, but it was also being used as the
+  // All tab, where it guarantees the newest thing on screen is an hour old.
+  //
+  // This is the actual firehose: a plain live kind-1 subscription that the
+  // relays PUSH to us, sub-second. What makes it usable rather than a sewer is
+  // the quality gate (feed_quality.dart) — and what makes the STRICT gate
+  // possible is that we ask for kind-0 in the same breath, so the authors
+  // posting right now are exactly the authors whose profiles arrive.
+
+  String? _fireSub; // the internal relay subscription
+  final Set<String> _fireSubscribers = {}; // ids the wapp/host drains
+  FirehoseFilter? _fireFilter;
+
+  /// Pubkeys we have a kind-0 for. An in-memory set, not a store query: the gate
+  /// runs on EVERY firehose event, and a sqlite round-trip per post is exactly
+  /// the kind of per-item work that turns the engine isolate into a hot core.
+  /// Misses are memoized too — on a public firehose most authors are unknown,
+  /// and a cache that only remembers hits re-queries them forever
+  /// (aurora/docs/performance.md §3.2).
+  final Set<String> _haveProfile = {};
+  final Set<String> _noProfile = {};
+
+  /// Self + everyone we follow: they bypass the gate entirely. Pushed in by the
+  /// main isolate, which owns the authoritative follow set.
+  Set<String> trustedAuthors = {};
+
+  /// Authors the user muted (the wapp already maintains this list).
+  Set<String> mutedAuthors = {};
+
+  String subscribeFirehose({bool requireProfile = true}) =>
+      subscribeFirehoseWithId('fire${_subSeq++}', requireProfile: requireProfile);
+
+  String subscribeFirehoseWithId(String subId, {bool requireProfile = true}) {
+    _fireSubscribers.add(subId);
+    _inbox[subId] = Queue<NostrEvent>();
+    _seen[subId] = <String>{};
+    _fireFilter ??= FirehoseFilter(requireProfile: requireProfile);
+
+    if (_fireSub != null) return subId; // relay subscription already open
+
+    _openFirehoseReq();
+    // Watchdog. A relay caps how many subscriptions one connection may hold and
+    // silently drops the excess — and we hold a lot of them (profiles, stats,
+    // reactions, web-of-trust, search…), several of which churn their ids. The
+    // firehose was observed going quiet after its first burst for exactly this
+    // reason: nobody had closed it, the relay had just stopped answering it.
+    // There is no error to catch, so the only honest signal is silence.
+    _fireWatchdog ??= Timer.periodic(const Duration(seconds: 30), (_) {
+      if (_fireSub == null) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _fireLastEventMs < _fireSilenceMs) return;
+      log?.call('firehose: silent for ${_fireSilenceMs ~/ 1000}s — re-opening');
+      _closeFirehoseReq();
+      _openFirehoseReq();
+    });
+    // Ask for the held authors' profiles in one small batch, slowly. This is a
+    // background chore, not a hot path: the posts are already held, and a REQ
+    // storm is what got us dropped by the relays in the first place.
+    _fireProfTimer ??=
+        Timer.periodic(const Duration(seconds: 10), (_) => _firehoseProfileFetch());
+    return subId;
+  }
+
+  Timer? _fireWatchdog;
+  int _fireLastEventMs = 0;
+  static const int _fireSilenceMs = 60 * 1000;
+
+  // Authors whose posts are held pending a profile. Fetched in ONE small REQ on
+  // a slow timer — see the note in the FeedPending branch for why this is not
+  // trackProfile.
+  final Set<String> _profileWanted = {};
+  final Map<String, int> _fireProfSubs = {}; // one-shot REQ subs → created ms
+  Timer? _fireProfTimer;
+  static const int _fireProfBatch = 100;
+  static const int _fireProfTtlMs = 30 * 1000;
+
+  void _firehoseProfileFetch() {
+    // Reap the one-shot REQs: their answers arrived long ago, or are not coming,
+    // and an open filter taxes every future event the relay sends us.
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    for (final sub in [
+      for (final e in _fireProfSubs.entries)
+        if (nowMs - e.value > _fireProfTtlMs) e.key,
+    ]) {
+      _fireProfSubs.remove(sub);
+      _subFilters.remove(sub);
+      _inbox.remove(sub);
+      _seen.remove(sub);
+      for (final c in _clients.values) {
+        c.unsubscribe(sub);
+      }
+    }
+
+    if (_profileWanted.isEmpty) return;
+    final batch = <String>[];
+    for (final p in _profileWanted) {
+      if (_haveProfile.contains(p)) continue;
+      batch.add(p);
+      if (batch.length >= _fireProfBatch) break;
+    }
+    _profileWanted.removeAll(batch);
+    if (batch.isEmpty) return;
+
+    final sub = 'fireP${_subSeq++}';
+    final f = [NostrFilter(kinds: const [0], authors: batch)];
+    _subFilters[sub] = f;
+    _inbox[sub] = Queue<NostrEvent>();
+    _seen[sub] = <String>{};
+    _fireProfSubs[sub] = nowMs;
+    for (final e in _endpoints.values) {
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
+    }
+  }
+
+  void _openFirehoseReq() {
+    final sub = 'fireR${_subSeq++}';
+    _fireSub = sub;
+    _fireLastEventMs = DateTime.now().millisecondsSinceEpoch;
+    // kind-0 rides along with kind-1 on purpose — see above.
+    final f = [const NostrFilter(kinds: [0, 1], limit: 200)];
+    _subFilters[sub] = f;
+    _inbox[sub] = Queue<NostrEvent>();
+    _seen[sub] = <String>{};
+    for (final e in _endpoints.values) {
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
+    }
+  }
+
+  void _closeFirehoseReq() {
+    final sub = _fireSub;
+    _fireSub = null;
+    if (sub == null) return;
+    _subFilters.remove(sub);
+    _inbox.remove(sub);
+    _seen.remove(sub);
+    for (final c in _clients.values) {
+      c.unsubscribe(sub);
+    }
+  }
+
+  void _teardownFirehose() {
+    _fireWatchdog?.cancel();
+    _fireWatchdog = null;
+    _fireProfTimer?.cancel();
+    _fireProfTimer = null;
+    _profileWanted.clear();
+    _fireFilter = null;
+    _closeFirehoseReq();
+  }
+
+  bool _hasProfile(String pub) {
+    if (_haveProfile.contains(pub)) return true;
+    if (_noProfile.contains(pub)) return false;
+    final known = profileOf(pub) != null;
+    (known ? _haveProfile : _noProfile).add(pub);
+    // Bound the miss set: a firehose meets an endless supply of strangers.
+    if (_noProfile.length > 20000) _noProfile.clear();
+    return known;
+  }
+
+  /// One firehose event. Returns true if it was handled here (so [_onEvent]
+  /// stops), false to fall through to the normal path.
+  /// Events that actually reached the firehose. Without this, an empty feed is
+  /// ambiguous: is the gate eating everything, or is the relay sending nothing?
+  /// Those have completely different fixes, and guessing wastes a build cycle.
+  int fireSeen = 0;
+
+  bool _onFirehose(NostrEvent event, int nowMs) {
+    fireSeen++;
+    _fireLastEventMs = nowMs; // the watchdog's proof of life
+    final filter = _fireFilter;
+    if (filter == null) return true;
+
+    // A profile: remember it, keep it (the UI needs the name and picture), and
+    // release whatever of that author's posts was waiting on exactly this.
+    if (event.kind == NostrEventKind.setMetadata) {
+      _haveProfile.add(event.pubkey);
+      _noProfile.remove(event.pubkey);
+      if (store.put(event)) eventsStored++;
+      for (final held in filter.release(event.pubkey, nowMs)) {
+        _deliverFirehose(held);
+      }
+      return true;
+    }
+
+    if (event.kind != NostrEventKind.textNote) return true;
+
+    final verdict = filter.verdict(
+      event,
+      hasProfile: _hasProfile,
+      trusted: trustedAuthors.contains,
+      muted: mutedAuthors.contains,
+      nowMs: nowMs,
+    );
+    switch (verdict) {
+      case FeedKeep():
+        // Store only what we would show. Persisting the whole public firehose
+        // would be an INSERT per junk post on the engine isolate, forever.
+        if (store.put(event)) {
+          eventsStored++;
+          onStored?.call(event);
+        }
+        _deliverFirehose(event);
+      case FeedPending():
+        // Hold it, and QUEUE the author for a profile lookup.
+        //
+        // Deliberately NOT trackProfile(): that one re-issues a single REQ
+        // carrying up to 500 authors every time it is called, and a firehose
+        // introduces a new stranger every second or two. The resulting REQ storm
+        // got our subscriptions dropped by the relays — including the firehose
+        // itself, which then went silent while the profiles it was waiting for
+        // never arrived. The feed strangled itself.
+        //
+        // [_profileWanted] instead accumulates authors and asks for them in one
+        // small batch on a slow timer (see [_firehoseProfileFetch]).
+        filter.hold(event, nowMs);
+        if (_profileWanted.length < 2000) _profileWanted.add(event.pubkey);
+      case FeedReject():
+        break; // counted in the filter's stats; never stored, never shown
+    }
+    return true;
+  }
+
+  void _deliverFirehose(NostrEvent event) {
+    for (final id in _fireSubscribers) {
+      _bufferForSub(id, event);
+    }
+  }
+
+  /// Firehose accounting — what arrived, what was kept/held, and a count per
+  /// drop reason. "The feed looks empty" must be answerable from the log.
+  Map<String, int> drainFirehoseStats() {
+    final f = _fireFilter;
+    if (f == null) return const {};
+    final seen = fireSeen;
+    fireSeen = 0;
+    return {'seen': seen, ...f.drainStats()};
   }
 
   // Live discoF fetch subs → created-at ms. These are one-shot id fetches; the
@@ -519,16 +808,32 @@ class NostrRelayHub {
   String? _profSub;
   Timer? _profDebounce;
 
+  bool _profDirty = false;
+
   /// Ensure we subscribe to (and thus store) the kind-0 profile for [pub]. Safe
   /// to call repeatedly; a rolling window keeps the REQ bounded.
+  ///
+  /// The timer here is a BATCH WINDOW, not a debounce, and the difference is the
+  /// whole feature. It used to `cancel()` the pending timer on every new author
+  /// — fine when authors trickled in from a feed you follow, fatal under a
+  /// firehose: a new stranger every few hundred milliseconds reset the timer
+  /// forever, so the profile REQ was never actually sent, and every post from a
+  /// stranger sat waiting for a profile nobody had asked for. Let the first
+  /// timer run; the authors that arrive meanwhile ride along in the same batch.
   void trackProfile(String pub) {
     if (pub.length != 64 || !_profSeen.add(pub)) return;
     _profTracked.add(pub);
     while (_profTracked.length > 500) {
       _profSeen.remove(_profTracked.removeAt(0));
     }
-    _profDebounce?.cancel();
-    _profDebounce = Timer(const Duration(milliseconds: 700), _profResub);
+    _profDirty = true;
+    if (_profDebounce != null) return; // a batch is already in flight
+    _profDebounce = Timer(const Duration(seconds: 2), () {
+      _profDebounce = null;
+      if (!_profDirty) return;
+      _profDirty = false;
+      _profResub();
+    });
   }
 
   void _profResub() {
@@ -656,17 +961,43 @@ class NostrRelayHub {
       return;
     }
     _rateCount++;
+
+    // The firehose has its own rules: the quality gate decides whether this is
+    // stored and shown at all, so it never reaches the generic path below.
+    if (subId == _fireSub) {
+      _onFirehose(event, now);
+      return;
+    }
+
     // Merge into the unified store (dedup + replaceable/deletion handled there).
     if (store.put(event)) {
       eventsStored++;
       onStored?.call(event);
     }
-    // A liked-enough post (fetched by id) goes to the discovery feed too.
-    if (_discoFeedSub != null &&
+
+    // A profile — from ANY subscription, not just the firehose. The kind-0 we
+    // are waiting on usually arrives on the profile-tracking subscription
+    // (trackProfile), so the release has to live here or the held posts would
+    // sit there while their author's profile sat in the store.
+    if (event.kind == NostrEventKind.setMetadata) {
+      _haveProfile.add(event.pubkey);
+      _noProfile.remove(event.pubkey);
+      final filter = _fireFilter;
+      if (filter != null) {
+        for (final held in filter.release(event.pubkey, now)) {
+          _deliverFirehose(held);
+        }
+      }
+    }
+
+    // A liked-enough post (fetched by id) goes to EVERY discovery subscriber.
+    if (_discoSubscribers.isNotEmpty &&
         event.kind == NostrEventKind.textNote &&
         event.id != null &&
         _discoWanted.contains(event.id)) {
-      _bufferForSub(_discoFeedSub!, event);
+      for (final id in _discoSubscribers) {
+        _bufferForSub(id, event);
+      }
     }
     _bufferForSub(subId, event);
     final seen = _seen[subId];
@@ -716,6 +1047,10 @@ class NostrRelayHub {
   Future<void> close() async {
     _discoTimer?.cancel();
     _discoTimer = null;
+    _fireWatchdog?.cancel();
+    _fireWatchdog = null;
+    _fireProfTimer?.cancel();
+    _fireProfTimer = null;
     _statDebounce?.cancel();
     _statDebounce = null;
     _profDebounce?.cancel();

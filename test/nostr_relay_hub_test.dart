@@ -193,4 +193,144 @@ void main() {
     expect(File(persist).readAsStringSync(), isNot(contains('relay.example.com')));
     await hub.close();
   });
+
+  // ── The live firehose (the "All" tab) ─────────────────────────────────────
+
+  test('the firehose delivers a fresh post immediately — no likes required',
+      () async {
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = _hub(fake);
+    await hub.init();
+
+    final sub = hub.subscribeFirehose(requireProfile: false);
+    final relaySub = fake.subscribed.last;
+
+    fake.inject(relaySub, _signed(kp, content: 'a post nobody has liked yet'));
+
+    expect(hub.drainEvents(sub).map((e) => e['content']),
+        ['a post nobody has liked yet'],
+        reason: 'this is the whole point: discovery can only show posts old '
+            'enough to have gathered likes, so it can never be the All tab');
+    await hub.close();
+  });
+
+  test('the firehose drops spam before it is ever stored', () async {
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = _hub(fake);
+    await hub.init();
+
+    final sub = hub.subscribeFirehose(requireProfile: false);
+    final relaySub = fake.subscribed.last;
+
+    fake.inject(
+        relaySub,
+        _signed(kp,
+            content: 'https://spam.example/a https://spam.example/b',
+            at: 1700000002));
+
+    expect(hub.drainEvents(sub), isEmpty);
+    expect(store.byId.values.any((e) => e.content.startsWith('https://spam')),
+        isFalse,
+        reason: 'a public firehose must not write junk into sqlite all day');
+    await hub.close();
+  });
+
+  test('a post from an unknown author waits for their profile, then appears',
+      () async {
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = _hub(fake);
+    await hub.init();
+
+    // Strict: the author must have a kind-0 we have seen.
+    final sub = hub.subscribeFirehose();
+    final relaySub = fake.subscribed.last;
+
+    final author = NostrCrypto.generateKeyPair();
+    fake.inject(relaySub,
+        _signed(author, content: 'hello, I am new here', at: 1700000003));
+
+    expect(hub.drainEvents(sub), isEmpty, reason: 'held, pending their profile');
+
+    // Their kind-0 arrives on the same subscription (which is why the firehose
+    // asks for kind-0 alongside kind-1).
+    fake.inject(
+        relaySub,
+        _signed(author,
+            kind: 0, content: '{"name":"newbie"}', at: 1700000004));
+
+    expect(hub.drainEvents(sub).map((e) => e['content']),
+        contains('hello, I am new here'),
+        reason: 'a new account is not a spammer — their profile was in flight');
+    await hub.close();
+  });
+
+  // ── The two discovery bugs ────────────────────────────────────────────────
+
+  test('TWO discovery subscribers both get the feed', () async {
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = _hub(fake);
+    await hub.init();
+
+    // The launcher hero subscribes first, the Social wapp second. The second
+    // used to be handed the first one's id, with no inbox behind it — so it
+    // drained nothing, forever.
+    final hero = hub.subscribeDiscovery(minLikes: 1);
+    final wapp = hub.subscribeDiscovery(minLikes: 1);
+    expect(hero, isNot(wapp));
+
+    final reactSub = fake.subscribed[fake.subscribed.length - 1];
+    final post = _signed(kp, content: 'a popular post', at: 1700000005);
+
+    // One like qualifies it, then the post itself arrives by id.
+    final liker = NostrCrypto.generateKeyPair();
+    final like = NostrEvent(
+      pubkey: liker.publicKeyHex,
+      createdAt: 1700000006,
+      kind: 7,
+      tags: [
+        ['e', post.id!]
+      ],
+      content: '+',
+    )..sign(liker.privateKeyHex);
+    fake.inject(reactSub, like);
+    fake.inject('anySub', post);
+
+    expect(hub.drainEvents(hero).map((e) => e['content']), ['a popular post']);
+    expect(hub.drainEvents(wapp).map((e) => e['content']), ['a popular post'],
+        reason: 'whoever subscribed SECOND must not get a dead id');
+    await hub.close();
+  });
+
+  test('unsubscribe then re-subscribe still delivers (pull-to-refresh)',
+      () async {
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = _hub(fake);
+    await hub.init();
+
+    final first = hub.subscribeDiscovery(minLikes: 1);
+    hub.unsubscribe(first); // what pull-to-refresh does
+
+    final second = hub.subscribeDiscovery(minLikes: 1);
+    final reactSub = fake.subscribed.last;
+
+    final post = _signed(kp, content: 'after the refresh', at: 1700000007);
+    final liker = NostrCrypto.generateKeyPair();
+    final like = NostrEvent(
+      pubkey: liker.publicKeyHex,
+      createdAt: 1700000008,
+      kind: 7,
+      tags: [
+        ['e', post.id!]
+      ],
+      content: '+',
+    )..sign(liker.privateKeyHex);
+    fake.inject(reactSub, like);
+    fake.inject('anySub', post);
+
+    expect(hub.drainEvents(second).map((e) => e['content']),
+        ['after the refresh'],
+        reason: 'unsubscribe left _discoFeedSub pointing at the deleted inbox, '
+            'so refreshing the feed killed it for the life of the process');
+    await hub.close();
+  });
 }

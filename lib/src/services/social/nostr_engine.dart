@@ -107,6 +107,8 @@ class NostrClient {
         _relays = (msg['json'] as List).cast<Map<String, dynamic>>();
       case 'evstats':
         _eventStats = (msg['stats'] as Map).cast<String, int>();
+      case 'fhstats':
+        firehoseStats = (msg['stats'] as Map).cast<String, int>();
       case 'events':
         final sub = msg['subId'] as String;
         final q = _subEvents.putIfAbsent(sub, () => []);
@@ -187,6 +189,34 @@ class NostrClient {
     _send({'cmd': 'discovery', 'subId': subId, 'minLikes': minLikes});
     return subId;
   }
+
+  /// The live firehose: kind-1 as the relays push it, passed through the quality
+  /// gate. This is what an "All" feed is supposed to be — discovery (above) can
+  /// only surface posts that already collected likes, so it is a *popular* feed
+  /// and can never be a fresh one.
+  String subscribeFirehose({bool requireProfile = true}) {
+    final subId = 'f${_subSeq++}';
+    _subEvents[subId] = [];
+    _send({
+      'cmd': 'firehose',
+      'subId': subId,
+      'requireProfile': requireProfile,
+    });
+    return subId;
+  }
+
+  /// Self + follows: they bypass the firehose gate. Push this whenever the
+  /// follow set changes.
+  void setTrustedAuthors(Iterable<String> pubs) =>
+      _send({'cmd': 'trusted', 'pubs': pubs.toList()});
+
+  /// Authors the user muted — never shown, whatever they post.
+  void setMutedAuthors(Iterable<String> pubs) =>
+      _send({'cmd': 'muted', 'pubs': pubs.toList()});
+
+  /// Firehose accounting: kept / pending / expired, plus a count per drop
+  /// reason. Empty until the first firehose subscription exists.
+  Map<String, int> firehoseStats = const {};
 
   void unsubscribe(String subId) {
     _subEvents.remove(subId);
@@ -352,6 +382,21 @@ class _Engine {
           _drainSubs.add(subId);
           _hub.subscribeDiscoveryWithId(subId,
               minLikes: (c['minLikes'] as int?) ?? 2);
+        case 'firehose':
+          final subId = '${c['subId']}';
+          _drainSubs.add(subId);
+          _hub.subscribeFirehoseWithId(subId,
+              requireProfile: c['requireProfile'] != false);
+        case 'trusted':
+          // Self + everyone we follow. They bypass the firehose quality gate —
+          // you do not vet someone you chose to follow.
+          _hub.trustedAuthors = {
+            for (final p in (c['pubs'] as List)) '$p',
+          };
+        case 'muted':
+          _hub.mutedAuthors = {
+            for (final p in (c['pubs'] as List)) '$p',
+          };
         case 'unsubscribe':
           _drainSubs.remove('${c['subId']}');
           _hub.unsubscribe('${c['subId']}');
@@ -446,6 +491,13 @@ class _Engine {
     final ev = _hub.drainEventStats();
     if (ev.values.any((v) => v > 0)) {
       toMain.send({'snap': 'evstats', 'stats': ev});
+    }
+
+    // What the quality gate kept, held and dropped, by reason. Without this,
+    // "the All tab looks empty" is unanswerable except by guesswork.
+    final fh = _hub.drainFirehoseStats();
+    if (fh.values.any((v) => v > 0)) {
+      toMain.send({'snap': 'fhstats', 'stats': fh});
     }
 
     // Changed engagement stats.

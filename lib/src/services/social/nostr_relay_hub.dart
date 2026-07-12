@@ -327,6 +327,30 @@ class NostrRelayHub {
   final Map<String, int> _discoFetchSubs = {};
   static const int _discoFetchTtlMs = 30 * 1000;
 
+  // The first fetch of a cold discovery feed.
+  //
+  // Discovery is two steps: tally kind-7 reactions, then REQ the posts that
+  // qualified. The tally is empty when the feed is first subscribed, so the
+  // fetch at subscribe time has nothing to ask for — and the next one is the
+  // 10-minute poll. That left a fresh install staring at an empty hero for ten
+  // minutes, which is precisely when it most needs something to show.
+  //
+  // So: once the reactions start qualifying posts, fetch them shortly after,
+  // ONCE. The debounce lets a burst of reactions accumulate into a single REQ
+  // rather than one per post, and after this the slow poll takes over — this is
+  // not a return to the 3-second polling that used to peg the engine.
+  Timer? _discoPrime;
+  bool _discoPrimed = false;
+
+  void _primeDiscovery() {
+    if (_discoPrimed || _discoPrime != null) return;
+    _discoPrime = Timer(const Duration(seconds: 5), () {
+      _discoPrime = null;
+      _discoPrimed = true;
+      _discoFetch();
+    });
+  }
+
   void _discoFetch() {
     // Reap fetch subs past their TTL — their ids either arrived long ago or
     // aren't coming; keeping the filter only taxes every future event.
@@ -377,6 +401,7 @@ class NostrRelayHub {
     if (likers.length >= _discoMinLikes && _discoFetched.add(liked)) {
       _discoWanted.add(liked);
       _discoToFetch.add(liked);
+      _primeDiscovery();
       // Seed the on-screen like tally with the reactions that qualified this
       // post, so it shows its real count (>=2) immediately instead of 0.
       _statReact.putIfAbsent(liked, () => <String>{}).addAll(likers);

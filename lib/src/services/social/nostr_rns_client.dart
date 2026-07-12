@@ -13,6 +13,7 @@ import 'dart:async';
 import '../../util/nostr_event.dart';
 import '../reticulum/rns_identity.dart';
 import 'nostr_relay_client.dart';
+import 'nostr_relay_hub.dart' show kNostrPollInterval;
 import 'relay_node.dart';
 import 'relay_event_store.dart' show NostrFilter;
 
@@ -24,9 +25,13 @@ class NostrRnsClient implements NostrRelayClient {
   final Duration pollInterval;
   final void Function(String msg)? log;
 
+  /// A Reticulum relay has no push channel, so a "subscription" is an initial
+  /// query plus a re-query on this interval. [subscribe] runs the first query
+  /// immediately, so this only governs how often we go BACK — which is a battery
+  /// decision, not a freshness one (was 30s; the phone is in a pocket).
   NostrRnsClient(this.node, this.relay,
       {required this.uri,
-      this.pollInterval = const Duration(seconds: 30),
+      this.pollInterval = kNostrPollInterval,
       this.log});
 
   @override

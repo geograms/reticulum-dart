@@ -22,6 +22,19 @@ import 'nostr_wire.dart';
 import 'nostr_ws_client.dart';
 import 'relay_event_store.dart';
 
+/// How often we go BACK to the relays for new posts.
+///
+/// Not a freshness knob — a battery knob. The wss relays PUSH events over a live
+/// subscription, so nothing here delays a post from a relay that is connected;
+/// this governs the polls we make ourselves (the Reticulum relay re-query, and
+/// the discovery-feed fetch). Those used to run every 30s and every 3s
+/// respectively, on a phone that is usually in a pocket with the screen off and
+/// nobody reading the feed.
+///
+/// Each poll is preceded by an immediate first fetch, so a cold start still
+/// fills the feed at once — the interval only governs how often we go back.
+const Duration kNostrPollInterval = Duration(minutes: 10);
+
 /// The slice of an event store the hub needs — put + query. `RelayEventStore`
 /// satisfies it via [NostrStore.of]; tests use an in-memory fake so the hub is
 /// exercisable without the sqlite native library.
@@ -295,8 +308,15 @@ class NostrRelayHub {
     for (final e in _endpoints.values) {
       if (e.enabled) _clients[e.uri]?.subscribe(react, rf);
     }
-    _discoTimer ??=
-        Timer.periodic(const Duration(seconds: 3), (_) => _discoFetch());
+    // Fetch NOW so the feed fills immediately, then settle into a slow poll.
+    //
+    // This used to re-poll every 3 SECONDS. Nobody needs a discovery feed that
+    // fresh: the phone is usually in a pocket with the screen off, and a poll
+    // interval is a battery setting, not a freshness setting. Ten minutes.
+    if (_discoTimer == null) {
+      _discoFetch();
+      _discoTimer = Timer.periodic(kNostrPollInterval, (_) => _discoFetch());
+    }
     return feed;
   }
 

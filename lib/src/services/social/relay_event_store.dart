@@ -96,12 +96,18 @@ class RelayEventStore {
   /// Open (or create) a relay event store at [path]. Use ':memory:' for tests.
   /// Throws if SQLite cannot be opened — callers running on web should not call
   /// this (sqlite3 needs dart:ffi).
-  factory RelayEventStore.open(String path) {
+  /// [keyHex] applies a SQLCipher key (raw 32-byte hex) to the database — used
+  /// when this store lives inside an encrypted profile and is opened on an
+  /// isolate that cannot reach the host's keyed opener.
+  factory RelayEventStore.open(String path, {String? keyHex}) {
     if (path != ':memory:') {
       final parent = File(path).parent;
       if (!parent.existsSync()) parent.createSync(recursive: true);
     }
     final db = dbOpener(path);
+    if (keyHex != null && keyHex.isNotEmpty) {
+      db.execute('PRAGMA key = "x\'$keyHex\'";');
+    }
     db.execute('PRAGMA journal_mode = WAL;');
     db.execute('PRAGMA synchronous = NORMAL;');
     db.execute('PRAGMA foreign_keys = ON;');

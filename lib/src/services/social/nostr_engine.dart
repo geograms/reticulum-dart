@@ -16,7 +16,10 @@
  */
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:isolate';
+
+import 'package:sqlite3/open.dart' as sqlite_open;
 
 import '../../util/nostr_crypto.dart';
 import '../../util/nostr_event.dart';
@@ -29,8 +32,27 @@ class _EngineInit {
   final String storePath;
   final String? persistPath;
   final String? selfPubHex;
+
+  /// Native SQLite library to load ON THIS ISOLATE, e.g. 'libsqlcipher.so'.
+  ///
+  /// package:sqlite3's loader override is PER-ISOLATE. A host that bundles
+  /// SQLCipher instead of stock SQLite (aurora does, for encrypted profiles)
+  /// sets its override on the main isolate — and the engine isolate then
+  /// tries to load a libsqlite3.so that is not in the app at all, throws, and
+  /// the whole NOSTR pipeline silently never starts.
+  final String? sqliteLibrary;
+
+  /// SQLCipher key (raw hex) for [storePath]. Null = plain database.
+  final String? dbKeyHex;
+
   const _EngineInit(
-      this.toMain, this.storePath, this.persistPath, this.selfPubHex);
+    this.toMain,
+    this.storePath,
+    this.persistPath,
+    this.selfPubHex, {
+    this.sqliteLibrary,
+    this.dbKeyHex,
+  });
 }
 
 /// Main-isolate proxy: mints subscription ids, forwards commands to the engine,
@@ -67,16 +89,45 @@ class NostrClient {
   /// Optional: notified (throttled) when caches change, so the UI can repaint.
   void Function()? onChanged;
 
+  /// Engine-side log lines (e.g. a store that refused to open). The host
+  /// pipes these into its own log so a dead pipeline is never silent.
+  ///
+  /// Setting it flushes whatever the engine already said: the isolate reports
+  /// a failed store open in its constructor, which is BEFORE spawn() has even
+  /// returned to the host — those lines used to fall on the floor, which is
+  /// how a completely dead NOSTR pipeline stayed invisible.
+  void Function(String msg)? get onLog => _onLog;
+  set onLog(void Function(String msg)? f) {
+    _onLog = f;
+    if (f == null) return;
+    for (final l in _logBuffer) {
+      f(l);
+    }
+    _logBuffer.clear();
+  }
+
+  void Function(String msg)? _onLog;
+  final List<String> _logBuffer = [];
+
   static Future<NostrClient> spawn({
     required String storePath,
     String? persistPath,
     String? selfPubHex,
+    String? sqliteLibrary,
+    String? dbKeyHex,
   }) async {
     final c = NostrClient._();
     c._fromEngine.listen(c._onFromEngine);
     c._iso = await Isolate.spawn(
       _engineMain,
-      _EngineInit(c._fromEngine.sendPort, storePath, persistPath, selfPubHex),
+      _EngineInit(
+        c._fromEngine.sendPort,
+        storePath,
+        persistPath,
+        selfPubHex,
+        sqliteLibrary: sqliteLibrary,
+        dbKeyHex: dbKeyHex,
+      ),
       debugName: 'nostr-engine',
     );
     return c;
@@ -102,6 +153,16 @@ class NostrClient {
       return;
     }
     if (msg is! Map) return;
+    final line = msg['log'];
+    if (line is String) {
+      final sink = _onLog;
+      if (sink != null) {
+        sink(line);
+      } else if (_logBuffer.length < 100) {
+        _logBuffer.add(line);
+      }
+      return;
+    }
     switch (msg['snap']) {
       case 'relays':
         _relays = (msg['json'] as List).cast<Map<String, dynamic>>();
@@ -292,9 +353,23 @@ class NostrClient {
 
   // ══ engine isolate ════════════════════════════════════════════════════════
   static Future<void> _engineMain(_EngineInit init) async {
+    // The sqlite3 loader override is per-isolate: re-apply the host's choice
+    // of native library here, BEFORE anything opens a database.
+    final lib = init.sqliteLibrary;
+    if (lib != null && lib.isNotEmpty) {
+      DynamicLibrary open() => DynamicLibrary.open(lib);
+      for (final os in sqlite_open.OperatingSystem.values) {
+        sqlite_open.open.overrideFor(os, open);
+      }
+    }
     // All store/relay setup runs on THIS (background) isolate.
     final engine = _Engine(
-        init.toMain, init.storePath, init.persistPath, init.selfPubHex);
+      init.toMain,
+      init.storePath,
+      init.persistPath,
+      init.selfPubHex,
+      dbKeyHex: init.dbKeyHex,
+    );
     final rx = ReceivePort();
     init.toMain.send(rx.sendPort);
     rx.listen((dynamic m) {
@@ -317,13 +392,18 @@ class _Engine {
   Timer? _timer;
   bool _ok = false;
 
-  _Engine(this.toMain, String storePath, String? persistPath, this.selfPub) {
+  _Engine(this.toMain, String storePath, String? persistPath, this.selfPub,
+      {String? dbKeyHex}) {
     try {
-      _store = RelayEventStore.open(storePath);
+      _store = RelayEventStore.open(storePath, keyHex: dbKeyHex);
       _hub = NostrRelayHub(
         store: NostrStore.of(_store),
         persistPath: persistPath,
         rnsClientFactory: null, // RNS lives on the main isolate; wss + local here
+        // Relay connects, drops and refusals go to the host log. Without this
+        // a feed that never fills is indistinguishable from a feed with
+        // nothing in it.
+        log: (m) => toMain.send({'log': m}),
         // Only a newly-stored contact list can change our follow set, so that
         // is the only thing that makes _syncMyFollows do its (expensive) work.
         onStored: (e) {
@@ -337,8 +417,11 @@ class _Engine {
       _ok = true;
       _sendStoredProfiles(); // hydrate the UI's profile index from disk
       _timer = Timer.periodic(const Duration(milliseconds: 400), (_) => _tick());
-    } catch (_) {
+    } catch (e) {
+      // A dead engine used to be SILENT — no relay ever connected and the feed
+      // was simply empty forever, with nothing in the log to say why. Say it.
       _ok = false;
+      toMain.send({'log': 'NOSTR engine failed to start: $e'});
     }
   }
 

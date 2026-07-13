@@ -239,8 +239,37 @@ class NostrClient {
             (msg['events'] as List).cast<Map<String, dynamic>>();
       case 'myFollows':
         _myFollows = (msg['pubs'] as List).cast<String>();
+      case 'verified':
+        final c = _verifyWaiters.remove('${msg['req']}');
+        c?.complete((msg['events'] as List).cast<Map<String, dynamic>>());
+        return; // not a UI-visible change
     }
     onChanged?.call();
+  }
+
+  int _verifySeq = 0;
+  final Map<String, Completer<List<Map<String, dynamic>>>> _verifyWaiters = {};
+
+  /// Verify a batch of events **on the engine isolate** and return the ones
+  /// whose signatures hold.
+  ///
+  /// This is the door for anything that arrived over Reticulum: RNS runs on the
+  /// main isolate, so verifying a peer's batch there would put secp256k1 on the
+  /// UI thread. Hand the bytes here instead, then store the survivors with
+  /// [RelayEventStore.putAllVerified].
+  Future<List<Map<String, dynamic>>> verifyEvents(
+    List<Map<String, dynamic>> events, {
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    if (events.isEmpty) return const [];
+    final req = 'v${_verifySeq++}';
+    final c = Completer<List<Map<String, dynamic>>>();
+    _verifyWaiters[req] = c;
+    _send({'cmd': 'verify', 'req': req, 'events': events});
+    return c.future.timeout(timeout, onTimeout: () {
+      _verifyWaiters.remove(req);
+      return const [];
+    });
   }
 
   bool get ready => _ready;
@@ -584,6 +613,26 @@ class _Engine {
             _hub.fetchEvent(id); // ask the relays; it lands in the store
             _wantEvents.add(id);
           }
+        case 'verify':
+          // Events that arrived over Reticulum. RNS lives on the MAIN isolate,
+          // and secp256k1 must not: verifying a mesh peer's batch there is the
+          // pattern that froze the app for hours (docs/performance.md §3.1).
+          // So the bytes come here, the signatures are checked on this isolate,
+          // and only the survivors go back — where the caller stores them with
+          // putAllVerified and never runs Schnorr itself.
+          final reqId = '${c['req']}';
+          final raw = (c['events'] as List?) ?? const [];
+          final ok = <Map<String, dynamic>>[];
+          for (final j in raw) {
+            if (j is! Map) continue;
+            try {
+              final ev = NostrEvent.fromJson(j.cast<String, dynamic>());
+              if (ev.verify()) ok.add(ev.toJson());
+            } catch (_) {
+              // A malformed event from a peer is not an error, it is a peer.
+            }
+          }
+          toMain.send({'snap': 'verified', 'req': reqId, 'events': ok});
         case 'trackProfile':
           _hub.trackProfile('${c['pub']}');
         case 'fetchReplies':

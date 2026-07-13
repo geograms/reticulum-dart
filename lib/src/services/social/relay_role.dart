@@ -23,6 +23,7 @@ import '../reticulum/rns_identity.dart';
 import '../files/capacity_policy.dart';
 import '../files/dht/provider_record.dart'
     show kCapArchive, kCapHomeFiber, kCapUnknown;
+import 'node_profile.dart';
 
 enum RelayRole { leaf, indexer }
 
@@ -84,6 +85,12 @@ class RelayAnnouncement {
   final String? pubkey; // this node's own NOSTR pubkey (hex), for profile fetch
   final int uptimeSeconds; // seconds since this node's RNS stack started (0=n/a)
 
+  /// What this node is MADE OF: power, uplink, radios, coverage. Facts only —
+  /// a node never announces that it is precious, it announces what it is, and
+  /// every asker scores it locally (node_profile.dart). Empty on a node that
+  /// has nothing to declare, which is a phone's default.
+  final NodeProfile profile;
+
   const RelayAnnouncement({
     this.version = 1,
     required this.role,
@@ -94,6 +101,7 @@ class RelayAnnouncement {
     this.authorPrefixes = const [],
     this.pubkey,
     this.uptimeSeconds = 0,
+    this.profile = NodeProfile.unknown,
   });
 
   bool has(int cap) => caps & cap != 0;
@@ -104,7 +112,7 @@ class RelayAnnouncement {
   /// (capped); a wide indexer advertises [RelayCap.archive].
   factory RelayAnnouncement.forCapacity(
       CapacityProfile profile, InterestSet interests,
-      {String? pubkey}) {
+      {String? pubkey, NodeProfile node = NodeProfile.unknown}) {
     if (!profile.servingAllowed) {
       return RelayAnnouncement(
           role: RelayRole.leaf,
@@ -114,7 +122,8 @@ class RelayAnnouncement {
           // Advertising probe support is what makes peers stop opening those
           // links: exactly the node that can least afford handshakes.
           caps: RelayCap.probe,
-          pubkey: pubkey);
+          pubkey: pubkey,
+          profile: node);
     }
     // Only unlimited (charger + WiFi/Ethernet) nodes take the indexer role.
     if (!profile.unlimited) {
@@ -126,7 +135,8 @@ class RelayAnnouncement {
           // Advertising probe support is what makes peers stop opening those
           // links: exactly the node that can least afford handshakes.
           caps: RelayCap.probe,
-          pubkey: pubkey);
+          pubkey: pubkey,
+          profile: node);
     }
     var caps = RelayCap.search |
         RelayCap.firehose |
@@ -141,6 +151,7 @@ class RelayAnnouncement {
       caps: caps,
       wide: wide,
       pubkey: pubkey,
+      profile: node,
       topics: wide
           ? const []
           : interests.topics.take(kMaxAnnouncedTopics).toList(),
@@ -158,6 +169,8 @@ class RelayAnnouncement {
   /// Encode for the relay announce app_data. [uptimeSeconds] overrides the field
   /// when set (>0) — the sender stamps its LIVE uptime here on each announce
   /// (uptime grows over time, so it isn't baked into the cached announcement).
+  Map<String, dynamic> get profileMap => profile.toMap();
+
   Uint8List encode({int uptimeSeconds = 0}) {
     final up = uptimeSeconds > 0 ? uptimeSeconds : this.uptimeSeconds;
     return msgpackEncode({
@@ -170,6 +183,9 @@ class RelayAnnouncement {
       'a': authorPrefixes,
       if (pubkey != null && pubkey!.isNotEmpty) 'p': pubkey,
       if (up > 0) 'u': up,
+      // The physical profile rides in the SAME announce — it must never cost a
+      // second packet, so it is a compact map and the radios are capped.
+      if (profileMap.isNotEmpty) 'n': profileMap,
     });
   }
 
@@ -194,6 +210,7 @@ class RelayAnnouncement {
         authorPrefixes: strs(m['a']),
         pubkey: m['p'] is String ? m['p'] as String : null,
         uptimeSeconds: m['u'] is int ? m['u'] as int : 0,
+        profile: NodeProfile.fromMap(m['n'] is Map ? m['n'] as Map : null),
       );
     } catch (_) {
       return null;
@@ -302,15 +319,43 @@ class RelayDirectory {
     return list;
   }
 
-  /// Pick the best indexer to answer a query about [topic]/[author]. Prefers an
-  /// indexer whose interest set covers the query, then higher capacity (lower
-  /// kCap number = better link/storage), then fewer hops, then freshness.
-  RelayEntry? bestIndexer({String? topic, String? author}) {
+  /// Pick the best indexer to answer a query about [topic]/[author].
+  ///
+  /// Prefers an indexer whose interest set covers the query, then the physical
+  /// profile (node_profile.dart), then fewer hops and freshness.
+  ///
+  /// [mode] is what makes this design work. On a normal day the weights favour
+  /// fast and close, and a fibre box wins. When the internet path is GONE the
+  /// weights invert into a survivability question — grid-independent power, a
+  /// grid-independent uplink, and radios the caller actually owns — and the
+  /// solar box with a LoRa antenna, unremarkable on a Tuesday, becomes the most
+  /// valuable node on the network. The disaster case runs the SAME code; only
+  /// the weights move.
+  RelayEntry? bestIndexer({
+    String? topic,
+    String? author,
+    NetworkMode mode = NetworkMode.normal,
+    int callerLinks = 0,
+    int? nowMs,
+  }) {
     final candidates = indexers();
     if (candidates.isEmpty) return null;
     final topics = topic == null ? const <String>[] : [topic];
+    final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
     int score(RelayEntry e) {
       var s = 0;
+      // What it is made of, weighed for the world we are actually in. Observed
+      // freshness is part of the score, because a node we have not heard from is
+      // a guess whatever it claims about itself.
+      s += scoreNode(
+        e.announcement.profile,
+        Observed(
+          lastHeardSec: ((now - e.lastSeenMs) ~/ 1000).clamp(0, 1 << 30),
+          hops: e.hops,
+        ),
+        mode: mode,
+        callerLinks: callerLinks,
+      );
       // Prefer a specialist that explicitly lists the topic/author over a
       // full-archive catch-all, to shard load across the network.
       if (e.announcement.explicitlyCovers(topics: topics, author: author)) {

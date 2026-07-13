@@ -79,6 +79,9 @@ class NostrClient {
   Map<String, int> get eventStats => _eventStats;
   final Map<String, List<Map<String, dynamic>>> _subEvents = {}; // subId → queue
   final Map<String, (int, int, bool)> _stats = {}; // eventId → (likes,replies,mine)
+  // eventId → (upvotes, downvotes, myVote ∈ {-1,0,1}). NIP-25 puts the verdict
+  // in the reaction's content: "-" is a downvote, anything else is a like.
+  final Map<String, (int, int, int)> _votes = {};
   final Set<String> _likedLocally = {}; // ids we've liked (keep them filled)
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
   final Map<String, Map<String, String>> _profByShort12 = {}; // pub[:12] → profile
@@ -187,6 +190,18 @@ class NostrClient {
             if (likes < 1) likes = 1;
           }
           _stats['$k'] = (likes, l[1] as int, mine);
+          if (l.length >= 6) {
+            var up = l[3] as int;
+            var down = l[4] as int;
+            var my = l[5] as int;
+            final local = _votedLocally['$k'];
+            if (local != null) {
+              my = local; // hold our own vote until the engine confirms it
+              if (local > 0 && up < 1) up = 1;
+              if (local < 0 && down < 1) down = 1;
+            }
+            _votes['$k'] = (up, down, my);
+          }
         });
       case 'profiles':
         (msg['entries'] as Map).forEach((k, v) {
@@ -307,6 +322,28 @@ class NostrClient {
   (int, int, bool) statsOf(String id, String? selfPub) =>
       _stats[id] ?? (0, 0, false);
 
+  /// (upvotes, downvotes, myVote) for a post.
+  (int, int, int) votesOf(String id) => _votes[id] ?? (0, 0, 0);
+
+  final Map<String, int> _votedLocally = {};
+
+  /// Our own vote: 1 up, -1 down, 0 retracted. Bumps the count locally so the
+  /// thumb fills at once instead of after a relay round-trip.
+  void recordVote(String id, String pub, int vote) {
+    _votedLocally[id] = vote;
+    final cur = _votes[id] ?? (0, 0, 0);
+    var up = cur.$1, down = cur.$2;
+    if (vote > 0) {
+      if (cur.$3 <= 0) up += 1;
+      if (cur.$3 < 0 && down > 0) down -= 1;
+    } else if (vote < 0) {
+      if (cur.$3 >= 0) down += 1;
+      if (cur.$3 > 0 && up > 0) up -= 1;
+    }
+    _votes[id] = (up, down, vote);
+    _send({'cmd': 'recordVote', 'id': id, 'pub': pub, 'vote': vote});
+  }
+
   void recordReaction(String id, String pub) {
     // Optimistic local bump so the heart fills before it round-trips.
     _likedLocally.add(id);
@@ -385,7 +422,7 @@ class _Engine {
   late final RelayEventStore _store;
   late final NostrRelayHub _hub;
   final Set<String> _drainSubs = {}; // wapp-facing subs to push to main
-  final Map<String, (int, int, bool)> _statsSent = {};
+  final Map<String, (int, int, bool, int, int, int)> _statsSent = {};
   final Set<String> _profSent = {};
   bool _myFollowsSub = false; // subscribed my kind-3 yet
   Set<String>? _myFollowsSent; // last contact-list set sent to main
@@ -492,6 +529,10 @@ class _Engine {
           final pub = '${c['pub']}';
           selfPub ??= pub; // learn our pubkey so the mine-check works
           _hub.recordReaction('${c['id']}', pub);
+        case 'recordVote':
+          final pub = '${c['pub']}';
+          selfPub ??= pub;
+          _hub.recordVote('${c['id']}', pub, (c['vote'] as num).toInt());
         case 'trackProfile':
           _hub.trackProfile('${c['pub']}');
         case 'fetchReplies':
@@ -587,10 +628,12 @@ class _Engine {
     final statEntries = <String, List<Object>>{};
     for (final id in _hub.trackedStatIds) {
       final s = _hub.statsOf(id, selfPub);
+      final v = _hub.votesOf(id, selfPub);
       final prev = _statsSent[id];
-      if (prev == null || prev != s) {
-        _statsSent[id] = s;
-        statEntries[id] = [s.$1, s.$2, s.$3];
+      final now = (s.$1, s.$2, s.$3, v.$1, v.$2, v.$3);
+      if (prev == null || prev != now) {
+        _statsSent[id] = now;
+        statEntries[id] = [s.$1, s.$2, s.$3, v.$1, v.$2, v.$3];
       }
     }
     if (statEntries.isNotEmpty) {

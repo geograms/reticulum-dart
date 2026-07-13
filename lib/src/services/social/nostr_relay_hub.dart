@@ -712,6 +712,11 @@ class NostrRelayHub {
 
   // ── Engagement stats (likes + replies per visible post) ─────────────────────
   final Map<String, Set<String>> _statReact = {}; // eventId → reactor pubkeys
+  // NIP-25 says the reaction's CONTENT carries the verdict: "-" is a downvote,
+  // anything else ("+", "🤙", an emoji) is a like. Tallying only "did someone
+  // react" cannot tell an upvote from a downvote, so keep the two apart.
+  final Map<String, Set<String>> _statUp = {};   // eventId → upvoter pubkeys
+  final Map<String, Set<String>> _statDown = {}; // eventId → downvoter pubkeys
   final Map<String, Set<String>> _statReply = {}; // eventId → reply event ids
   final List<String> _statTracked = []; // rolling set of ids we count for
   String? _statSub;
@@ -730,12 +735,16 @@ class NostrRelayHub {
       // until the relays redeliver. Live events then dedup into these sets.
       _statReact[id] = store.reactionPubkeys(id).toSet();
       _statReply[id] = store.replyIdsFor(id).toSet();
+      _statUp[id] = <String>{};
+      _statDown[id] = <String>{};
       added = true;
     }
     while (_statTracked.length > 300) {
       final old = _statTracked.removeAt(0);
       _statReact.remove(old);
       _statReply.remove(old);
+      _statUp.remove(old);
+      _statDown.remove(old);
     }
     if (added) {
       // Debounce: the feed adds ids in bursts as the user scrolls.
@@ -776,8 +785,24 @@ class NostrRelayHub {
     final ref = _firstETag(event);
     if (ref == null) return false;
     if (event.kind == NostrEventKind.reaction) {
-      final s = _statReact[ref];
-      if (s != null) s.add(event.pubkey);
+      // NIP-25 puts the verdict in the content. Three DISJOINT buckets, so a
+      // post is not counted twice: "+"/👍 is an upvote, "-"/👎 a downvote, and
+      // any other emoji ("❤️", "🤙") is a plain like. Lumping them together
+      // lit the heart and the thumb for the same single reaction.
+      final c = event.content.trim();
+      final isUp = c == '+' || c == '👍';
+      final isDown = c == '-' || c == '👎';
+      if (isUp) {
+        _statUp[ref]?.add(event.pubkey);
+        _statDown[ref]?.remove(event.pubkey);
+        _statReact[ref]?.remove(event.pubkey);
+      } else if (isDown) {
+        _statDown[ref]?.add(event.pubkey);
+        _statUp[ref]?.remove(event.pubkey);
+        _statReact[ref]?.remove(event.pubkey);
+      } else {
+        _statReact[ref]?.add(event.pubkey);
+      }
       return true; // reactions are never displayed
     }
     if (event.kind == NostrEventKind.textNote) {
@@ -793,6 +818,38 @@ class NostrRelayHub {
     final r = _statReact[id];
     final mine = selfPub != null && (r?.contains(selfPub) ?? false);
     return (r?.length ?? 0, _statReply[id]?.length ?? 0, mine);
+  }
+
+  /// (upvotes, downvotes, myVote) for a post id. myVote is 1, -1 or 0.
+  (int, int, int) votesOf(String id, String? selfPub) {
+    final up = _statUp[id];
+    final down = _statDown[id];
+    var mine = 0;
+    if (selfPub != null) {
+      if (up?.contains(selfPub) ?? false) {
+        mine = 1;
+      } else if (down?.contains(selfPub) ?? false) {
+        mine = -1;
+      }
+    }
+    return (up?.length ?? 0, down?.length ?? 0, mine);
+  }
+
+  /// Our own vote, recorded before it round-trips back from a relay.
+  void recordVote(String id, String pub, int vote) {
+    _statUp.putIfAbsent(id, () => <String>{});
+    _statDown.putIfAbsent(id, () => <String>{});
+    _statReact[id]?.remove(pub); // a vote is not also a like
+    if (vote > 0) {
+      _statUp[id]!.add(pub);
+      _statDown[id]!.remove(pub);
+    } else if (vote < 0) {
+      _statDown[id]!.add(pub);
+      _statUp[id]!.remove(pub);
+    } else {
+      _statUp[id]!.remove(pub);
+      _statDown[id]!.remove(pub);
+    }
   }
 
   /// Optimistically record our own like so the count updates before it round-

@@ -646,6 +646,55 @@ class RelayEventStore {
     return old.length;
   }
 
+  // ── Keeping (the touch rule) ──────────────────────────────────────────────
+
+  /// The retention tier of [id] (0 self / 1 followed / 2 stranger), or null when
+  /// the event is not stored.
+  int? tierOfId(String id) {
+    final r = _db.select('SELECT tier FROM events WHERE id = ? LIMIT 1', [id]);
+    return r.isEmpty ? null : r.first['tier'] as int;
+  }
+
+  /// Promote a stored event to a stronger tier — the storage half of "I touched
+  /// this, so I keep it" (see docs/NOSTR.md, the touch rule).
+  ///
+  /// Only ever promotes (lower number = stronger): pinning something already at
+  /// tier 0 is a no-op, and nothing here can ever weaken an event's standing, so
+  /// a hostile peer that re-sends a note we kept cannot demote it into the
+  /// evictable stranger slice. Returns true when the tier actually changed.
+  bool pin(String id, {int tier = 0}) {
+    final cur = tierOfId(id);
+    if (cur == null || cur <= tier) return false;
+    _db.execute('UPDATE events SET tier = ? WHERE id = ?', [tier, id]);
+    return true;
+  }
+
+  /// The event ids referenced by `e` tags of [id] (its thread parents / the note
+  /// a reaction or repost points at), oldest tag first. Empty when unknown.
+  List<String> eTagsOf(String id) {
+    final rows = _db.select(
+      "SELECT value FROM tags WHERE event_id = ? AND name = 'e'",
+      [id],
+    );
+    return [for (final r in rows) r['value'] as String];
+  }
+
+  /// Ids from [ids] that are NOT in the store — what a keep still has to fetch.
+  List<String> missingIds(Iterable<String> ids) {
+    final want = ids.toSet().toList();
+    if (want.isEmpty) return const [];
+    final rows = _db.select(
+      'SELECT id FROM events WHERE id IN (${_marks(want.length)})',
+      want,
+    );
+    final have = {for (final r in rows) r['id'] as String};
+    return [for (final id in want) if (!have.contains(id)) id];
+  }
+
+  /// True when a kind-0 profile for [pubkey] is stored (so a keep knows whether
+  /// it still has to go and get one).
+  bool hasProfile(String pubkey) => profileOf(pubkey) != null;
+
   // ── Store-and-forward hosting: tier usage + tier-aware retention ───────────
 
   /// Current hosting usage for the quota policy: count of stranger NOTES (kind 1)

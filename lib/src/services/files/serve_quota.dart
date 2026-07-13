@@ -17,6 +17,21 @@
  */
 import 'dart:typed_data';
 
+/// Who is asking. Bandwidth belongs to the owner of the device, so the person
+/// they know and the person they do not are simply not the same request.
+///
+///   trusted  = me, my other devices, the people I follow (and, if the owner
+///              says so, the people THEY follow). Handing their data back to
+///              them is the entire purpose of having kept it — no budget.
+///   stranger = everyone else. Generous by default on a machine that
+///              volunteered, zero by default on a phone on cellular.
+enum Requester { trusted, stranger }
+
+/// Resolve a requester's key (hex pubkey, or a link id when the peer is
+/// anonymous) to a trust level. Returning [Requester.stranger] for anything
+/// unrecognised is the safe default and is what the fallback does.
+typedef TrustLookup = Requester Function(String requester);
+
 class ServeQuota {
   bool enabled; // false = no limiting at all
   bool servingAllowed; // false = decline everything (e.g. on cellular)
@@ -24,8 +39,19 @@ class ServeQuota {
   int perRequesterBytes; // per-requester cap per day
   Duration manifestRefetchWindow; // refuse repeated full re-downloads
 
+  /// Daily ceiling for **strangers, in aggregate**. The whole hostile-client
+  /// budget: one npub cannot eat it (perRequesterBytes still applies underneath)
+  /// and a thousand npubs cannot exceed it between them. 0 = serve strangers
+  /// nothing at all, which is what a phone on a metered plan should do.
+  int strangerDailyBudgetBytes;
+
+  /// How we tell a friend from a stranger. Null = everyone is a stranger, which
+  /// is the safe reading of "we were never told".
+  TrustLookup? trustOf;
+
   int _day = 0;
   int _globalToday = 0;
+  int _strangerToday = 0;
   final Map<String, int> _perReqToday = {};
   final Map<String, int> _lastManifestMs = {}; // 'requester|shaHex' -> ms
 
@@ -34,8 +60,15 @@ class ServeQuota {
     this.servingAllowed = true,
     this.dailyBudgetBytes = 1 << 30, // 1 GB
     this.perRequesterBytes = 256 << 20, // 256 MB
+    this.strangerDailyBudgetBytes = 512 << 20, // 512 MB to people we don't know
     this.manifestRefetchWindow = const Duration(minutes: 10),
+    this.trustOf,
   });
+
+  Requester _levelOf(String requester) =>
+      trustOf?.call(requester) ?? Requester.stranger;
+
+  int get strangerBytesServedToday => _strangerToday;
 
   int get bytesServedToday => _globalToday;
   int get remainingToday =>
@@ -51,7 +84,14 @@ class ServeQuota {
       {bool manifest = false}) {
     _rollDay();
     if (!enabled) return true;
+
+    // Someone we know, asking for something we kept for them: unmetered. Not
+    // even the serving switch stops it — "don't serve strangers on cellular"
+    // was never meant to mean "don't answer my own other phone".
+    if (_levelOf(requester) == Requester.trusted) return true;
+
     if (!servingAllowed) return false;
+    if (_strangerToday + bytes > strangerDailyBudgetBytes) return false;
     if (_globalToday + bytes > dailyBudgetBytes) return false;
     if ((_perReqToday[requester] ?? 0) + bytes > perRequesterBytes) return false;
     if (manifest) {
@@ -70,6 +110,7 @@ class ServeQuota {
     _rollDay();
     if (!enabled) return;
     _globalToday += bytes;
+    if (_levelOf(requester) == Requester.stranger) _strangerToday += bytes;
     _perReqToday[requester] = (_perReqToday[requester] ?? 0) + bytes;
     if (manifest) _lastManifestMs['$requester|${_hex(sha)}'] = _now();
   }
@@ -80,6 +121,8 @@ class ServeQuota {
         'dailyBudget': dailyBudgetBytes,
         'servedToday': _globalToday,
         'remaining': remainingToday,
+        'strangerBudget': strangerDailyBudgetBytes,
+        'strangerServedToday': _strangerToday,
         'requesters': _perReqToday.length,
       };
 
@@ -88,6 +131,7 @@ class ServeQuota {
     if (d != _day) {
       _day = d;
       _globalToday = 0;
+      _strangerToday = 0;
       _perReqToday.clear();
       // Drop manifest marks older than the window (cheap opportunistic prune).
       final cutoff = _now() - manifestRefetchWindow.inMilliseconds;

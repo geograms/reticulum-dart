@@ -22,6 +22,7 @@ import '../reticulum/rns_link.dart';
 import '../reticulum/rns_packet.dart';
 import 'dht/dht_core.dart';
 import 'dht/dht_message.dart';
+import 'dht/holder_hint.dart';
 import 'dht/dht_node.dart';
 import 'dht/provider_record.dart';
 import 'file_transfer.dart';
@@ -149,6 +150,13 @@ class FileTransferNode {
   /// library stays free of app concepts; null/empty → classic Kademlia.
   final Iterable<RnsIdentity> Function()? stableAnchors;
 
+  /// What this node can say about a holder when it answers "these devices have
+  /// it": power, uplink and radios, so a caller can prefer the box on mains over
+  /// somebody's phone on a metered plan. Supplied by the host, which owns the
+  /// relay directory; null = we report freshness only, which is still the signal
+  /// that matters most.
+  HolderHint? Function(Uint8List providerPub)? holderHint;
+
   /// Serving-side budget / anti-abuse guard applied to everything we serve.
   final ServeQuota serveQuota;
 
@@ -252,7 +260,11 @@ class FileTransferNode {
               : () => [
                     for (final id in stableAnchors!())
                       DhtContact.ofIdentity(id)
-                  ]);
+                  ])
+        // What we can honestly say about each holder we hand out. The DHT knows
+        // freshness; only the host knows the hardware (it owns the relay
+        // directory), so it fills the rest in.
+        ..hintProvider = holderHint;
     }
   }
 

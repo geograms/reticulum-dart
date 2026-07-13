@@ -15,6 +15,7 @@ import 'dart:typed_data';
 import '../../reticulum/rns_identity.dart';
 import 'dht_core.dart';
 import 'dht_message.dart';
+import 'holder_hint.dart';
 import 'provider_record.dart';
 import 'routing_table.dart';
 
@@ -36,6 +37,19 @@ class DhtNode {
   /// becomes a fallback. Supplied by the owner (the DHT engine stays generic);
   /// empty/unset → classic Kademlia behaviour.
   final List<DhtContact> Function()? anchors;
+
+  /// What we can say about a holder when we hand it out: its power, uplink and
+  /// radios, and how recently we heard of it. The DHT itself knows none of that
+  /// — the HOST does (it owns the relay directory and the announces) — so it
+  /// supplies this, and we stay transport- and app-agnostic. Without it we still
+  /// report freshness, which is the signal a caller needs most.
+  HolderHint? Function(Uint8List providerPub)? hintProvider;
+
+  /// When we last had evidence of a (provider, key) pair: the STORE that carried
+  /// it, or a refresh. Feeds the freshness half of a hint — a holder last heard
+  /// of three weeks ago is a lottery ticket, and a caller deserves to know
+  /// before it spends a link on one.
+  final Map<String, int> _acceptedAt = {};
 
   /// Anti-abuse ceilings on the local record store. Routing DHT RPC over the
   /// (widely-known) chat dest means any peer can open a link and STORE at us, so
@@ -111,10 +125,18 @@ class DhtNode {
       case DhtOp.findValue:
         final key = dhtFileKey(req.sha!);
         final recs = _liveRecords(key, req.sha!);
-        return recs.isNotEmpty
-            ? DhtMessage.valueRecords(myPub, _cap(recs, maxR))
-            : DhtMessage.valueNodes(
-                myPub, _cap(routing.closest(key, k), maxC));
+        if (recs.isEmpty) {
+          return DhtMessage.valueNodes(
+              myPub, _cap(routing.closest(key, k), maxC));
+        }
+        // "These N devices have it" — and what we know about each, so the caller
+        // does not have to guess which one to wake (docs/NOSTR.md).
+        final capped = _cap(recs, maxR);
+        return DhtMessage.valueRecords(
+          myPub,
+          capped,
+          hints: [for (final r in capped) _hintFor(r)],
+        );
       case DhtOp.store:
         final r = req.records.first;
         // Anti-abuse: refuse over-cap STOREs BEFORE the signature verify so a
@@ -212,8 +234,14 @@ class DhtNode {
   }
 
   /// Resolve a file id to its providers (verified, unexpired), best class first.
+  /// The hints that came back with the last [resolve] — keyed by provider pubkey
+  /// hex. A caller ranks holders with these (see rankHolders); they are advisory,
+  /// and a provider that then fails to serve is demoted regardless.
+  final Map<String, HolderHint> lastHints = {};
+
   Future<List<ProviderRecord>> resolve(Uint8List sha256) async {
     final target = dhtFileKey(sha256);
+    lastHints.clear();
     final found = <String, ProviderRecord>{}; // providerPub hex -> record
     for (final r in _liveRecords(target, sha256)) {
       found[dhtHex(r.providerPub)] = r;
@@ -228,10 +256,14 @@ class DhtNode {
         final resp = await sendRpc(c, DhtMessage.findValue(myPub, sha256));
         if (resp == null || !resp.hasValue) return;
         routing.add(c);
-        for (final r in resp.records) {
+        for (var idx = 0; idx < resp.records.length; idx++) {
+          final r = resp.records[idx];
           if (!_eq(r.sha256, sha256) || r.isExpired()) continue;
           if (!await r.verify()) continue;
           found[dhtHex(r.providerPub)] = r;
+          if (idx < resp.hints.length) {
+            lastHints[dhtHex(r.providerPub)] = resp.hints[idx];
+          }
         }
       }));
       if (found.isNotEmpty) {
@@ -244,10 +276,14 @@ class DhtNode {
       makeReq: () => DhtMessage.findValue(myPub, sha256),
       onResponse: (resp) async {
         if (!resp.hasValue) return;
-        for (final r in resp.records) {
+        for (var idx = 0; idx < resp.records.length; idx++) {
+          final r = resp.records[idx];
           if (!_eq(r.sha256, sha256) || r.isExpired()) continue;
           if (!await r.verify()) continue;
           found[dhtHex(r.providerPub)] = r;
+          if (idx < resp.hints.length) {
+            lastHints[dhtHex(r.providerPub)] = resp.hints[idx];
+          }
         }
       },
       // FIND_VALUE short-circuits: the moment a queried node returns a verified
@@ -261,6 +297,21 @@ class DhtNode {
     final list = found.values.toList()
       ..sort((a, b) => a.capacity.compareTo(b.capacity));
     return list;
+  }
+
+  /// What we can honestly say about the holder of [r]: how recently we had
+  /// evidence of it, whether that evidence is first-hand, and what it is made
+  /// of. The host supplies [hintProvider] (it owns the relay directory and the
+  /// announces); with none, we still report freshness, which is the signal a
+  /// caller needs most.
+  HolderHint _hintFor(ProviderRecord r) {
+    final fromHost = hintProvider?.call(r.providerPub);
+    if (fromHost != null) return fromHost;
+    final acceptedMs = _acceptedAt[dhtHex(r.providerPub) + dhtHex(r.sha256)];
+    final ageSec = acceptedMs == null
+        ? 0xffff
+        : ((DateTime.now().millisecondsSinceEpoch - acceptedMs) ~/ 1000);
+    return HolderHint(lastHeardSec: ageSec, source: HintSource.direct);
   }
 
   /// Find the k contacts closest to [target] (iterative).
@@ -354,6 +405,15 @@ class DhtNode {
     final list = _store.putIfAbsent(key, () => <ProviderRecord>[]);
     list.removeWhere((e) => _eq(e.providerPub, r.providerPub));
     list.add(r);
+    _acceptedAt[dhtHex(r.providerPub) + dhtHex(r.sha256)] =
+        DateTime.now().millisecondsSinceEpoch;
+    // Bounded like everything else here: a flood must not turn this into a leak.
+    if (_acceptedAt.length > maxStoredKeys * 4) {
+      final drop = _acceptedAt.keys.take(_acceptedAt.length ~/ 4).toList();
+      for (final d in drop) {
+        _acceptedAt.remove(d);
+      }
+    }
     return true;
   }
 

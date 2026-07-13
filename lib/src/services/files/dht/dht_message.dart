@@ -9,6 +9,7 @@
 import 'dart:typed_data';
 
 import 'dht_core.dart';
+import 'holder_hint.dart';
 import 'provider_record.dart';
 
 class DhtOp {
@@ -29,6 +30,16 @@ class DhtMessage {
   Uint8List? sha; // 32B (FIND_VALUE)
   List<Uint8List> contactPubs = []; // 64B each (NODES / VALUE-as-nodes)
   List<ProviderRecord> records = []; // VALUE-as-records
+
+  /// One per record, in the same order: what the ANSWERING node believes about
+  /// each holder (last heard, whether that is first-hand, its power/uplink/
+  /// radios) so the caller can pick the mains-powered box over somebody's phone
+  /// on a metered plan. Empty when the answerer had nothing to say.
+  ///
+  /// Carried AFTER the records, so a node that predates hints simply stops
+  /// reading and is none the wiser — old and new interoperate.
+  List<HolderHint> hints = [];
+
   bool hasValue = false; // VALUE: records vs nodes
   bool ok = false; // STORE_OK
 
@@ -53,10 +64,12 @@ class DhtMessage {
   static DhtMessage findValue(Uint8List senderPub, Uint8List sha) =>
       DhtMessage(DhtOp.findValue, senderPub)..sha = sha;
 
-  static DhtMessage valueRecords(Uint8List senderPub, List<ProviderRecord> recs) =>
+  static DhtMessage valueRecords(Uint8List senderPub, List<ProviderRecord> recs,
+          {List<HolderHint> hints = const []}) =>
       DhtMessage(DhtOp.value, senderPub)
         ..hasValue = true
-        ..records = recs;
+        ..records = recs
+        ..hints = hints;
   static DhtMessage valueNodes(Uint8List senderPub, List<DhtContact> cs) =>
       DhtMessage(DhtOp.value, senderPub)
         ..hasValue = false
@@ -89,6 +102,14 @@ class DhtMessage {
             final e = r.encode();
             b.add(_u16(e.length));
             b.add(e);
+          }
+          // Trailing, optional, and safely ignorable by an older node: it has
+          // read its record count and stops.
+          if (hints.length == records.length && records.isNotEmpty) {
+            b.addByte(hints.length & 0xff);
+            for (final h in hints) {
+              b.add(h.encode());
+            }
           }
         } else {
           _putContacts(b, contactPubs);
@@ -136,6 +157,17 @@ class DhtMessage {
                   Uint8List.sublistView(data, i, i + len));
               if (r != null) m.records.add(r);
               i += len;
+            }
+            // Hints are optional: a peer that sends none is not broken, it is
+            // just older (or has nothing to say about these holders).
+            if (i < data.length) {
+              final hn = data[i++];
+              for (var k = 0;
+                  k < hn && i + HolderHint.wireLen <= data.length;
+                  k++) {
+                m.hints.add(HolderHint.decode(data, i));
+                i += HolderHint.wireLen;
+              }
             }
           } else {
             i = _getContacts(data, i, m);

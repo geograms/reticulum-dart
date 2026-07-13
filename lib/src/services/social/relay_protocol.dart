@@ -37,6 +37,20 @@ class RelayOp {
   // relay drops each id whose stored event carries a `p` tag == reqPub.
   static const int drop = 0x05; // [5, reqPubHex, [ids], sigHex]
   static const int dropRes = 0x85; // [0x85, nDropped]
+
+  // ── Indexer↔Indexer pointer sync (docs/NOSTR.md) ─────────────────────────
+  //
+  // Indexers exchange ADDRESSES, never content. The records are signed by their
+  // providers, so a relaying indexer can neither forge nor resurrect a pointer,
+  // and a receiver verifies everything end to end.
+  //
+  // "What changed since…" takes two cursors, and the POSITION one is normative:
+  // an ESP32 back from a reboot has no clock and cannot say "since Tuesday", but
+  // it can persist (epoch, seq). Clock skew across a fleet silently drops or
+  // duplicates records at the boundary of a time query; a position cannot skew.
+  static const int syncReq = 0x06; // [6, epoch|'', sinceSeq, sinceMs, max]
+  static const int syncRes = 0x86; // [0x86, epoch, [entries], nextSeq, more]
+  static const int syncReset = 0x87; // [0x87, epoch, oldestSeq]
 }
 
 /// A decoded relay frame. Only the fields relevant to [op] are populated.
@@ -56,6 +70,14 @@ class RelayFrame {
   final List<String>? ids; // DROP: event ids to delete
   final String? sig; // DROP: BIP-340 sig over sha256(ids.join(','))
 
+  // Pointer sync.
+  final String? epoch; // whose log this cursor belongs to
+  final int sinceSeq; // SYNC_REQ: resume position / SYNC_RESET: oldest we hold
+  final int sinceMs; // SYNC_REQ: the time cursor, for nodes that have a clock
+  final List<Map<String, dynamic>>? entries; // SYNC_RES: inserts + removals
+  final int nextSeq; // SYNC_RES: where to resume next
+  final bool more; // SYNC_RES: is there still a backlog?
+
   const RelayFrame({
     required this.op,
     this.subId,
@@ -71,6 +93,12 @@ class RelayFrame {
     this.reqPub,
     this.ids,
     this.sig,
+    this.epoch,
+    this.sinceSeq = 0,
+    this.sinceMs = 0,
+    this.entries,
+    this.nextSeq = 0,
+    this.more = false,
   });
 }
 
@@ -113,6 +141,35 @@ class RelayProtocol {
       msgpackEncode([RelayOp.drop, reqPubHex, ids, sigHex]);
 
   static Uint8List dropResult(int n) => msgpackEncode([RelayOp.dropRes, n]);
+
+  /// "What changed since…". [epoch] + [sinceSeq] is the position cursor (the
+  /// only one a clockless node can keep); [sinceMs] is the convenience for a
+  /// node that has a clock. Send epoch='' with no cursor to ask for a snapshot.
+  static Uint8List syncReq({
+    String epoch = '',
+    int sinceSeq = 0,
+    int sinceMs = 0,
+    int max = 64,
+  }) =>
+      msgpackEncode([RelayOp.syncReq, epoch, sinceSeq, sinceMs, max]);
+
+  /// A bounded, resumable batch. [entries] are encoded ProviderRecords (inserts)
+  /// or removals; [nextSeq] is where the asker resumes, and [more] says whether
+  /// there is still a backlog — a LoRa-attached indexer takes the same log in
+  /// tiny bites over hours, and the cursor makes that free.
+  static Uint8List syncRes({
+    required String epoch,
+    required List<Map<String, dynamic>> entries,
+    required int nextSeq,
+    required bool more,
+  }) =>
+      msgpackEncode([RelayOp.syncRes, epoch, entries, nextSeq, more]);
+
+  /// "Your cursor is not from this log (or is older than what I still hold) —
+  /// start over." Never a best-effort partial answer: a partial answer leaves a
+  /// hole in the asker's map that nobody ever notices.
+  static Uint8List syncReset(String epoch, int oldestSeq) =>
+      msgpackEncode([RelayOp.syncReset, epoch, oldestSeq]);
 
   // ── Decode ──────────────────────────────────────────────────────────────
 
@@ -178,6 +235,31 @@ class RelayProtocol {
           );
         case RelayOp.dropRes:
           return RelayFrame(op: op, count: raw[1] as int);
+        case RelayOp.syncReq:
+          return RelayFrame(
+            op: op,
+            epoch: raw[1] as String,
+            sinceSeq: (raw[2] as num).toInt(),
+            sinceMs: (raw[3] as num).toInt(),
+            count: raw.length > 4 ? (raw[4] as num).toInt() : 64,
+          );
+        case RelayOp.syncRes:
+          return RelayFrame(
+            op: op,
+            epoch: raw[1] as String,
+            entries: [
+              for (final e in (raw[2] as List))
+                if (e is Map) e.cast<String, dynamic>()
+            ],
+            nextSeq: (raw[3] as num).toInt(),
+            more: raw[4] == true,
+          );
+        case RelayOp.syncReset:
+          return RelayFrame(
+            op: op,
+            epoch: raw[1] as String,
+            sinceSeq: (raw[2] as num).toInt(),
+          );
         default:
           return null;
       }

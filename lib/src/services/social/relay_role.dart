@@ -400,6 +400,15 @@ class RelayRoleManager {
   /// starting discovery. Set by the wiring layer; null/0 means "not advertised".
   int Function()? uptimeProvider;
 
+  /// What this device is physically made of (power, uplink, radios, coverage).
+  /// The host owns it: some of it is measured (powered fraction, throughput),
+  /// and some only a human can know — nothing on Android reports that there is
+  /// a solar panel on the roof. Re-read on every re-announce, so plugging in a
+  /// LoRa hat or moving to Starlink shows up without a restart.
+  NodeProfile Function()? nodeProfileProvider;
+
+  NodeProfile get _node => nodeProfileProvider?.call() ?? NodeProfile.unknown;
+
   RelayAnnouncement _current;
 
   RelayRoleManager({
@@ -407,6 +416,7 @@ class RelayRoleManager {
     CapacityProfile? initial,
     this.selfPubkey,
     this.uptimeProvider,
+    this.nodeProfileProvider,
     this.onChanged,
   })  : interests = interests ?? InterestSet(),
         _current = RelayAnnouncement.forCapacity(
@@ -426,8 +436,8 @@ class RelayRoleManager {
   /// Apply a new capacity profile; re-derive the role and fire [onChanged] if it
   /// (or its capabilities/capacity) changed.
   void applyCapacity(CapacityProfile profile) {
-    final next =
-        RelayAnnouncement.forCapacity(profile, interests, pubkey: selfPubkey);
+    final next = RelayAnnouncement.forCapacity(profile, interests,
+        pubkey: selfPubkey, node: _node);
     if (next.role != _current.role ||
         next.caps != _current.caps ||
         next.capacity != _current.capacity ||

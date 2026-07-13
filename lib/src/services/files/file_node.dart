@@ -200,9 +200,11 @@ class FileTransferNode {
 
   /// Store-and-forward hosting hooks (see FileServeSession). When both are set
   /// this node accepts blob deposits from peers; null = deposits declined.
-  final DepositVerdict Function(
-      Uint8List sha, int size, String ext, String pubHex, String sigHex)?
-      onDepositOffer;
+  /// [linkIdHex] is the link the offer arrived on: an Archiver treats the LINK
+  /// as policy, because a peer that reached it over the LAN, Bluetooth or LoRa
+  /// has no route to anywhere else, and that data dies if it is refused.
+  final DepositVerdict Function(Uint8List sha, int size, String ext,
+      String pubHex, String sigHex, String linkIdHex)? onDepositOffer;
   final void Function(
       Uint8List sha, Uint8List bytes, String originPubHex, int tier, String ext)?
       onDepositStore;

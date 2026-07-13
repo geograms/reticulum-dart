@@ -110,9 +110,12 @@ class FileServeSession {
   final void Function(Uint8List fileHash)? onServed;
 
   /// Store-and-forward deposit hooks (null = this node does not accept deposits).
-  final DepositVerdict Function(
-      Uint8List sha, int size, String ext, String pubHex, String sigHex)?
-      onDepositOffer;
+  /// [linkIdHex] is the link the offer arrived on: the host maps it back to the
+  /// interface (LAN, Bluetooth, LoRa, a hub) because for an Archiver the link IS
+  /// the policy — a peer that reached us over a direct link has no route to
+  /// anywhere else, and its data dies if we refuse it.
+  final DepositVerdict Function(Uint8List sha, int size, String ext,
+      String pubHex, String sigHex, String linkIdHex)? onDepositOffer;
   final void Function(
       Uint8List sha, Uint8List bytes, String originPubHex, int tier, String ext)?
       onDepositStore;
@@ -201,7 +204,7 @@ class FileServeSession {
         }
         return _depositAfterReceive(rx);
       case RnsContext.none:
-        return _onCommand(link.decrypt(p));
+        return _onCommand(link.decrypt(p), link.linkId);
       default:
         return const [];
     }
@@ -230,7 +233,7 @@ class FileServeSession {
     return rx.pump();
   }
 
-  List<RnsPacket> _onCommand(Uint8List cmd) {
+  List<RnsPacket> _onCommand(Uint8List cmd, Uint8List? linkId) {
     if (cmd.isEmpty) return const [];
     final op = cmd[0];
     if (op == kOpGetFile && cmd.length >= 1 + 32) {
@@ -263,7 +266,11 @@ class FileServeSession {
       final pub = Uint8List.sublistView(cmd, o, o + 32);
       o += 32;
       final sig = Uint8List.sublistView(cmd, o, o + 64);
-      final accept = onDepositOffer?.call(sha, size, ext, _hex(pub), _hex(sig));
+      // The LINK is part of the policy, not a detail: a peer that reached us
+      // over Bluetooth or LoRa has no route to anywhere else, and its data dies
+      // if we refuse it. The host maps the link to the interface it arrived on.
+      final accept = onDepositOffer?.call(
+          sha, size, ext, _hex(pub), _hex(sig), linkId == null ? '' : _hex(linkId));
       if (accept == null || !accept.ok) {
         return [_putReject(accept?.reason ?? 'deposits not accepted')];
       }

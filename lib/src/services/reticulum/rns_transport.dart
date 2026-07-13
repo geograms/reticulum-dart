@@ -305,6 +305,11 @@ class RnsTransport implements RnsInterfaceRegistry {
 
   /// Record that link [linkId] is reachable on interface [via] (called for every
   /// inbound link-addressed packet).
+  /// Which interface a link arrived on ('lan', 'ble', a hub name…), or null.
+  /// An Archiver reads this: a peer that reached us over a direct link has no
+  /// route to anywhere else, and that fact IS the policy.
+  String? ifaceOfLink(Uint8List linkId) => _linkIface[_hex(linkId)];
+
   void noteLinkIface(Uint8List linkId, String via) {
     final k = _hex(linkId);
     final cur = _linkIface[k];

@@ -352,10 +352,19 @@ class BlossomServer {
   // GETs it by sha256. These were verified to accept our exact BIP-340 auth and
   // serve the blob back (blossom.band rejects by file-type; satellite needs a
   // paid plan — excluded).
-  static const List<String> publicServers = [
+  /// Shipped defaults. The LIVE list is [publicServers], which the host
+  /// replaces from what the user has configured — this is only what a device
+  /// starts with.
+  static const List<String> defaultPublicServers = [
     'https://blossom.primal.net',
     'https://nostr.download',
   ];
+
+  /// The Blossom servers this device uploads to and fetches from, in order.
+  /// The host owns it (the user edits it in the wapp); the transfer code just
+  /// reads it. It used to be a `const` list, so the servers your media went to
+  /// were whatever we had hard-coded and there was no way to see or change it.
+  static List<String> publicServers = List.of(defaultPublicServers);
 
   static String _mimeFor(String ext) {
     switch (ext.toLowerCase()) {

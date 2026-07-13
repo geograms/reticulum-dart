@@ -189,6 +189,28 @@ class NostrRelayHub {
           }
       ];
 
+  /// Turn a relay on or off without forgetting it. Off means: no subscriptions,
+  /// no publishes, no connection — but it stays in the list, so a relay that is
+  /// down (or that you simply do not want to talk to right now) does not have to
+  /// be re-typed later.
+  bool setRelayEnabled(String uri, bool enabled) {
+    final e = _endpoints[uri];
+    if (e == null || e.enabled == enabled) return false;
+    e.enabled = enabled;
+    _save();
+    if (enabled) {
+      final c = _ensureClient(uri);
+      for (final f in _subFilters.entries) {
+        c?.subscribe(f.key, f.value);
+      }
+    } else {
+      final c = _clients.remove(uri);
+      // ignore: discarded_futures
+      c?.close();
+    }
+    return true;
+  }
+
   /// Add a relay by URI. Returns false if the scheme is unknown or duplicate.
   bool addRelay(String uri) {
     final u = uri.trim();
@@ -395,6 +417,10 @@ class NostrRelayHub {
   /// Self + everyone we follow: they bypass the gate entirely. Pushed in by the
   /// main isolate, which owns the authoritative follow set.
   Set<String> trustedAuthors = {};
+
+  /// My own pubkey. Everything I write, and everything ANYONE writes ABOUT me,
+  /// is kept in the local store at tier `self` — see [_isMine].
+  String? selfPubkey;
 
   /// Authors the user muted (the wapp already maintains this list).
   Set<String> mutedAuthors = {};
@@ -963,6 +989,25 @@ class NostrRelayHub {
     }
   }
 
+  /// Everything anyone has done to MY posts — reactions, replies, reposts and
+  /// mentions — newest first, READ FROM THE LOCAL STORE.
+  ///
+  /// This is the whole point of keeping them at tier `self`: the notification
+  /// list is answerable with the relays unreachable and after a restart, which
+  /// an in-memory list drained from a live subscription never was.
+  List<NostrEvent> myNotifications({int limit = 100}) {
+    final me = selfPubkey;
+    if (me == null) return const [];
+    final evs = store.query(NostrFilter(
+      kinds: const [1, 6, 7],
+      tags: {'p': [me]},
+      limit: limit,
+    ));
+    final out = [for (final e in evs) if (e.pubkey != me) e];
+    out.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return out;
+  }
+
   NostrEvent? profileOf(String pub) {
     profileLookups++;
     final evs = store.query(NostrFilter(kinds: const [0], authors: [pub]));
@@ -1004,8 +1049,40 @@ class NostrRelayHub {
     return out;
   }
 
+  /// Is this event mine — my post, or someone's reaction/reply/repost OF my
+  /// post (it p-tags me)?
+  bool _isMine(NostrEvent event) {
+    final me = selfPubkey;
+    if (me == null) return false;
+    if (event.pubkey == me) return true;
+    for (final t in event.tags) {
+      if (t.length >= 2 && t[0] == 'p' && t[1] == me) return true;
+    }
+    return false;
+  }
+
   void _onEvent(String subId, NostrEvent event) {
     eventsSeen++;
+
+    // MY OWN CORNER OF THE NETWORK IS NOT CACHE.
+    //
+    // A reaction to my post is a fact about me, and this is an off-grid app:
+    // the relay that delivered it may be unreachable for days. It is stored
+    // here, at tier `self`, BEFORE the reaction short-circuit and BEFORE the
+    // firehose rate cap — both of which used to drop it on the floor, so the
+    // notification list survived only as long as the process did, and opening
+    // the post it was about went back to the network for something we had
+    // already been given.
+    if (_isMine(event)) {
+      if (store.put(event, tier: 0)) {
+        eventsStored++;
+        onStored?.call(event);
+      }
+      final ref = _firstETag(event);
+      if (event.kind == NostrEventKind.reaction && ref != null) {
+        store.addReaction(ref, event.pubkey);
+      }
+    }
     // Persist reaction receipts (post id + reactor) so like totals survive a
     // restart instead of crawling back over the network.
     //

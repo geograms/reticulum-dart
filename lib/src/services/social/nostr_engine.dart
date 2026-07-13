@@ -85,6 +85,21 @@ class NostrClient {
 
   /// Single events fetched by id (see [eventById]).
   final Map<String, Map<String, dynamic>> _events = {};
+
+  /// Reactions/replies/reposts/mentions of MY posts, newest first, as the
+  /// engine reads them out of the local store.
+  List<Map<String, dynamic>> _notifications = const [];
+  List<Map<String, dynamic>> get notifications => _notifications;
+
+  /// Turn a relay on/off (it stays in the list).
+  void setRelayEnabled(String uri, bool on) =>
+      _send({'cmd': 'relayEnable', 'uri': uri, 'on': on});
+
+  /// Tell the engine (and its store) who we are.
+  void setSelfPubkey(String pub) {
+    if (pub.length != 64) return;
+    _send({'cmd': 'selfPub', 'pub': pub});
+  }
   final Set<String> _likedLocally = {}; // ids we've liked (keep them filled)
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
   final Map<String, Map<String, String>> _profByShort12 = {}; // pub[:12] → profile
@@ -212,6 +227,10 @@ class NostrClient {
           _profiles['$k'] = m;
           if ('$k'.length >= 12) _profByShort12['$k'.substring(0, 12)] = m;
         });
+      case 'notifications':
+        _notifications = (msg['events'] as List)
+            .map((e) => (e as Map).cast<String, dynamic>())
+            .toList();
       case 'event':
         _events['${msg['id']}'] =
             (msg['event'] as Map).cast<String, dynamic>();
@@ -438,6 +457,7 @@ class _Engine {
   late final NostrRelayHub _hub;
   final Set<String> _drainSubs = {}; // wapp-facing subs to push to main
   final Set<String> _wantEvents = {}; // ids asked for, not yet in the store
+  String _notifSig = '';
   final Map<String, (int, int, bool, int, int, int)> _statsSent = {};
   final Set<String> _profSent = {};
   bool _myFollowsSub = false; // subscribed my kind-3 yet
@@ -466,6 +486,7 @@ class _Engine {
         },
       );
       // ignore: discarded_futures
+      _hub.selfPubkey = selfPub;
       _hub.init();
       _ok = true;
       _sendStoredProfiles(); // hydrate the UI's profile index from disk
@@ -545,6 +566,11 @@ class _Engine {
           final pub = '${c['pub']}';
           selfPub ??= pub; // learn our pubkey so the mine-check works
           _hub.recordReaction('${c['id']}', pub);
+        case 'relayEnable':
+          _hub.setRelayEnabled('${c['uri']}', c['on'] == true);
+        case 'selfPub':
+          selfPub = '${c['pub']}';
+          _hub.selfPubkey = selfPub;
         case 'recordVote':
           final pub = '${c['pub']}';
           selfPub ??= pub;
@@ -633,6 +659,20 @@ class _Engine {
       final evs = _hub.drainEvents(sub, max: 60);
       if (evs.isNotEmpty) {
         toMain.send({'snap': 'events', 'subId': sub, 'events': evs});
+      }
+    }
+
+    // Notifications, straight from the store — they outlive the process and the
+    // network, which is the whole reason they are stored.
+    if (selfPub != null) {
+      final notifs = _hub.myNotifications(limit: 100);
+      final sig = notifs.isEmpty ? '' : '${notifs.length}:${notifs.first.id}';
+      if (sig != _notifSig) {
+        _notifSig = sig;
+        toMain.send({
+          'snap': 'notifications',
+          'events': [for (final e in notifs) e.toJson()],
+        });
       }
     }
 

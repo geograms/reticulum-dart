@@ -32,6 +32,7 @@ import '../reticulum/lxmf/lxmf_router.dart';
 import '../../util/nostr_event.dart';
 import '../../util/nostr_crypto.dart';
 import 'relay_event_store.dart';
+import '../files/dht/pointer_sync.dart';
 import 'relay_protocol.dart';
 import '../../util/npd.dart';
 import 'spam.dart';
@@ -84,6 +85,15 @@ class RelayNode {
   /// isolate (57 MB/s of sqlite reads) and ANR'd the app. Mutable so the owner
   /// can flip hosting on/off at runtime (capacity / settings switch).
   bool serve;
+
+  /// The pointer map this node syncs with other indexers (docs/NOSTR.md).
+  ///
+  /// Set by the host on an INDEXER; null on a leaf, and that is the point:
+  /// battery-powered leaves announce, are indexed, and are left alone. Indexer-
+  /// to-indexer traffic is fast and wired, so the load belongs there. A node
+  /// with none simply answers SYNC_RESET with an empty epoch, which an asker
+  /// reads as "this peer has no map to give".
+  PointerSyncServer? pointerServer;
 
   /// Hosting tier classifier: maps an author pubkey (hex) to a retention tier
   /// index (0 self / 1 followed / 2 stranger). Null = treat everyone as stranger.
@@ -218,6 +228,47 @@ class RelayNode {
 
     final r = await _request(relay, reqBytes, timeout: timeout);
     return r?.events ?? const [];
+  }
+
+  /// Pull one batch of pointer changes from another indexer.
+  ///
+  /// Returns the peer's answer, or null if it had nothing to say. A RESET is
+  /// reported as [SyncOutcome.wasReset] with the peer's epoch: the caller drops
+  /// its cursor and starts again, rather than silently missing everything that
+  /// happened while its position was stale.
+  ///
+  /// Every record inside is verified against the PROVIDER that signed it before
+  /// it can enter our map (see PointerSyncClient), so we never have to trust the
+  /// indexer we are talking to — only the maths.
+  Future<SyncOutcome?> syncPointers(
+    RnsIdentity peer,
+    PointerSyncClient client, {
+    SyncCursor cursor = SyncCursor.none,
+    int max = 64,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final r = await _request(
+      peer,
+      RelayProtocol.syncReq(
+          epoch: cursor.epoch, sinceSeq: cursor.seq, max: max),
+      timeout: timeout,
+    );
+    if (r == null) return null;
+    if (r.op == RelayOp.syncReset) {
+      final epoch = r.epoch ?? '';
+      log?.call('sync: reset by peer (epoch $epoch) — starting over');
+      return SyncOutcome(
+        cursor: SyncCursor(epoch, 0),
+        wasReset: true,
+      );
+    }
+    if (r.op != RelayOp.syncRes) return null;
+    return client.merge(
+      r.epoch ?? '',
+      r.entries ?? const [],
+      r.nextSeq,
+      r.more,
+    );
   }
 
   /// Count matches for [filter] on [relay].
@@ -481,6 +532,33 @@ class RelayNode {
             ok = true;
           }
           rl.sendMessage(RelayProtocol.stored(ok, ok ? null : 'rejected'));
+          break;
+        case RelayOp.syncReq:
+          // "What changed since (epoch, seq)?" — addresses, never content.
+          final ps = pointerServer;
+          if (ps == null) {
+            rl.sendMessage(RelayProtocol.syncReset('', 0));
+            break;
+          }
+          final answer = ps.answer(
+            f.epoch ?? '',
+            f.sinceSeq,
+            max: f.count <= 0 ? 64 : (f.count > 256 ? 256 : f.count),
+          );
+          if (answer == null) {
+            // Their cursor is not from this log, or is older than what we still
+            // hold. Say so — a partial answer would leave a hole in their map
+            // that nobody would ever notice.
+            rl.sendMessage(
+                RelayProtocol.syncReset(ps.log.epoch, ps.log.oldestSeq));
+            break;
+          }
+          rl.sendMessage(RelayProtocol.syncRes(
+            epoch: ps.log.epoch,
+            entries: answer.entries,
+            nextSeq: answer.nextSeq,
+            more: answer.more,
+          ));
           break;
         case RelayOp.drop:
           // Recipient-authorized delete: verify the requester owns reqPub (a

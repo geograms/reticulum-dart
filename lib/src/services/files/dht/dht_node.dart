@@ -398,6 +398,19 @@ class DhtNode {
     return list.length < maxRecordsPerKey;
   }
 
+  /// Accept a record into the local map WITHOUT it having come over an RPC —
+  /// the door an indexer sync comes through. It runs the same anti-abuse cap and
+  /// the same signature verify as a STORE, because a pointer handed to us by a
+  /// peer deserves exactly as much trust as one shouted at us by a stranger:
+  /// none.
+  Future<bool> storeLocal(ProviderRecord r) async {
+    if (!_admitStore(r)) {
+      storesRejected++;
+      return false;
+    }
+    return _accept(r);
+  }
+
   Future<bool> _accept(ProviderRecord r) async {
     if (r.isExpired()) return false;
     if (!await r.verify()) return false;

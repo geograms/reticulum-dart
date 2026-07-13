@@ -82,6 +82,9 @@ class NostrClient {
   // eventId → (upvotes, downvotes, myVote ∈ {-1,0,1}). NIP-25 puts the verdict
   // in the reaction's content: "-" is a downvote, anything else is a like.
   final Map<String, (int, int, int)> _votes = {};
+
+  /// Single events fetched by id (see [eventById]).
+  final Map<String, Map<String, dynamic>> _events = {};
   final Set<String> _likedLocally = {}; // ids we've liked (keep them filled)
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
   final Map<String, Map<String, String>> _profByShort12 = {}; // pub[:12] → profile
@@ -209,6 +212,9 @@ class NostrClient {
           _profiles['$k'] = m;
           if ('$k'.length >= 12) _profByShort12['$k'.substring(0, 12)] = m;
         });
+      case 'event':
+        _events['${msg['id']}'] =
+            (msg['event'] as Map).cast<String, dynamic>();
       case 'replies':
         _replies['${msg['id']}'] =
             (msg['events'] as List).cast<Map<String, dynamic>>();
@@ -352,6 +358,15 @@ class NostrClient {
     _send({'cmd': 'recordReaction', 'id': id, 'pub': pub});
   }
 
+  /// One event by id. Returns it when we hold it; otherwise asks the engine
+  /// (and the relays) for it and answers null — call again once it lands.
+  Map<String, dynamic>? eventById(String id) {
+    final have = _events[id];
+    if (have != null) return have;
+    _send({'cmd': 'fetchEvent', 'id': id});
+    return null;
+  }
+
   // ── Profiles ──────────────────────────────────────────────────────────────
   void trackProfile(String pub) {
     if (pub.length != 64) return;
@@ -422,6 +437,7 @@ class _Engine {
   late final RelayEventStore _store;
   late final NostrRelayHub _hub;
   final Set<String> _drainSubs = {}; // wapp-facing subs to push to main
+  final Set<String> _wantEvents = {}; // ids asked for, not yet in the store
   final Map<String, (int, int, bool, int, int, int)> _statsSent = {};
   final Set<String> _profSent = {};
   bool _myFollowsSub = false; // subscribed my kind-3 yet
@@ -533,6 +549,15 @@ class _Engine {
           final pub = '${c['pub']}';
           selfPub ??= pub;
           _hub.recordVote('${c['id']}', pub, (c['vote'] as num).toInt());
+        case 'fetchEvent':
+          final id = '${c['id']}';
+          final have = _hub.eventById(id);
+          if (have != null) {
+            toMain.send({'snap': 'event', 'id': id, 'event': have.toJson()});
+          } else {
+            _hub.fetchEvent(id); // ask the relays; it lands in the store
+            _wantEvents.add(id);
+          }
         case 'trackProfile':
           _hub.trackProfile('${c['pub']}');
         case 'fetchReplies':
@@ -608,6 +633,17 @@ class _Engine {
       final evs = _hub.drainEvents(sub, max: 60);
       if (evs.isNotEmpty) {
         toMain.send({'snap': 'events', 'subId': sub, 'events': evs});
+      }
+    }
+
+    // Events the main isolate asked for (a notification's post, say) that have
+    // since arrived from a relay.
+    if (_wantEvents.isNotEmpty) {
+      for (final id in _wantEvents.toList()) {
+        final e = _hub.eventById(id);
+        if (e == null) continue;
+        _wantEvents.remove(id);
+        toMain.send({'snap': 'event', 'id': id, 'event': e.toJson()});
       }
     }
 

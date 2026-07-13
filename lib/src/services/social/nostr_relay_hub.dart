@@ -942,6 +942,27 @@ class NostrRelayHub {
   /// of absent profiles once pegged an entire core with nothing to show for it.
   int profileLookups = 0;
 
+  /// One event by id, from the store (it is there once any relay delivered it).
+  NostrEvent? eventById(String id) {
+    if (id.length != 64) return null;
+    final evs = store.query(NostrFilter(ids: [id], limit: 1));
+    return evs.isEmpty ? null : evs.first;
+  }
+
+  /// Ask the relays for an event we do not hold yet (a notification about a
+  /// post this device never saw in its own feed, say).
+  void fetchEvent(String id) {
+    if (id.length != 64) return;
+    final sub = 'ev${_subSeq++}';
+    final f = [NostrFilter(ids: [id], limit: 1)];
+    _subFilters[sub] = f;
+    _inbox[sub] = Queue<NostrEvent>();
+    _seen[sub] = <String>{};
+    for (final e in _endpoints.values) {
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
+    }
+  }
+
   NostrEvent? profileOf(String pub) {
     profileLookups++;
     final evs = store.query(NostrFilter(kinds: const [0], authors: [pub]));

@@ -17,6 +17,7 @@ import 'dart:io';
 
 import '../../util/nostr_event.dart';
 import 'feed_quality.dart';
+import 'firehose_curator.dart';
 import 'nostr_local_client.dart';
 import 'nostr_relay_client.dart';
 import 'nostr_wire.dart';
@@ -576,6 +577,21 @@ class NostrRelayHub {
     // UI renders perfectly well. It used to be destroyed in silence, and on a
     // network where the relays are stingy with kind-0 that meant an empty All
     // tab and a pending queue frozen at 42 for twenty minutes.
+    // The feed advances at a human rate: the best few, every few seconds.
+    _curateTimer ??= Timer.periodic(
+        const Duration(seconds: FirehoseCurator.tickSeconds), (_) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final out = _curator.take(now);
+      if (out.isNotEmpty || _curator.pending > 0) {
+        log?.call('curator: emitted ${out.length}, ${_curator.pending} ranked, '
+            '${_fireSubscribers.length} subscriber(s)');
+      }
+      for (final e in out) {
+        curatorDelivered++;
+        _deliverFirehose(e);
+      }
+    });
+
     _fireSweepTimer ??= Timer.periodic(const Duration(seconds: 15), (_) {
       final f = _fireFilter;
       if (f == null) {
@@ -717,6 +733,17 @@ class NostrRelayHub {
     }
   }
 
+  /// Hand the feed whatever the curator is holding, now. The timer does this on
+  /// its own cadence; a test should not have to wait ten seconds to see a post.
+  int debugCurateNow() {
+    final out = _curator.take(DateTime.now().millisecondsSinceEpoch);
+    for (final e in out) {
+      curatorDelivered++;
+      _deliverFirehose(e);
+    }
+    return out.length;
+  }
+
   /// What the silence watchdog does, exposed so a test can prove a re-open asks
   /// for what is NEW rather than dragging the same backlog back.
   void debugReopenFirehose() {
@@ -743,6 +770,8 @@ class NostrRelayHub {
     _fireProfTimer = null;
     _fireSweepTimer?.cancel();
     _fireSweepTimer = null;
+    _curateTimer?.cancel();
+    _curateTimer = null;
     // The REQ stops; the KNOWLEDGE stays. Nulling the filter here threw away
     // every held post and every author we were still waiting on a name for —
     // on every page close — so re-opening Social always started from nothing and
@@ -836,7 +865,22 @@ class NostrRelayHub {
           eventsStored++;
           onStored?.call(event);
         }
-        _deliverFirehose(event);
+        // Somebody the user FOLLOWS is not a candidate to be ranked against
+        // strangers — they are the point. Straight through.
+        if (trustedAuthors.contains(event.pubkey)) {
+          _deliverFirehose(event);
+        } else {
+          // Everyone else is a candidate. The curator decides what is worth the
+          // user's attention and at what rate — a firehose is not a feed, and
+          // pouring 150 events a second at a wapp that can take 26 is how the
+          // top of the feed ended up minutes old and getting older.
+          _curator.offer(event, _signalsFor(event), nowMs);
+          _authorAccepted[event.pubkey] =
+              (_authorAccepted[event.pubkey] ?? 0) + 1;
+          if (_authorAccepted.length > 4000) {
+            _authorAccepted.remove(_authorAccepted.keys.first);
+          }
+        }
       case FeedPending():
         // Hold it, and QUEUE the author for a profile lookup.
         //
@@ -876,9 +920,49 @@ class NostrRelayHub {
     }
   }
 
+  final FirehoseCurator _curator = FirehoseCurator();
+  final Map<String, int> _authorAccepted = {};
+  Timer? _curateTimer;
+
+  /// What this device already knows about a candidate post. No network calls:
+  /// every one of these is a cache we filled on the way here.
+  CandidateSignals _signalsFor(NostrEvent e) {
+    final id = e.id ?? '';
+    return (
+      likes: _statReact[id]?.length ?? 0,
+      replies: _statReply[id]?.length ?? 0,
+      hasMedia: _hasMedia(e),
+      authorHasProfile: _haveProfile.contains(e.pubkey),
+      authorSeenBefore: _authorAccepted[e.pubkey] ?? 0,
+    );
+  }
+
+  static bool _hasMedia(NostrEvent e) {
+    for (final t in e.tags) {
+      if (t.isNotEmpty && t[0] == 'imeta') return true;
+    }
+    final c = e.content.toLowerCase();
+    return c.contains('.jpg') ||
+        c.contains('.jpeg') ||
+        c.contains('.png') ||
+        c.contains('.gif') ||
+        c.contains('.webp') ||
+        c.contains('.mp4');
+  }
+
+  /// How many posts are ranked and waiting for their turn.
+  int get curatorPending => _curator.pending;
+  int curatorDelivered = 0;
+
   void _deliverFirehose(NostrEvent event) {
-    for (final id in _fireSubscribers) {
-      _bufferForSub(id, event);
+    // A post we are about to SHOW is a post whose likes and replies the user is
+    // about to look at. Track it as it goes out — otherwise every card in the
+    // feed reads "0 likes, 0 replies" no matter how popular the post is, which is
+    // both wrong and exactly the signal the curator ranked it on.
+    final id = event.id;
+    if (id != null && id.length == 64) trackStats([id]);
+    for (final sub in _fireSubscribers) {
+      _bufferForSub(sub, event);
     }
   }
 
@@ -898,12 +982,16 @@ class NostrRelayHub {
     // `new` vs `dup` is the line that would have saved a day: "seen=200 kept=0"
     // is unreadable, but "seen=200 new=0 dup=200" says plainly that the relays
     // are reading their cache back to us and nothing is actually arriving.
+    final delivered = curatorDelivered;
+    curatorDelivered = 0;
     return {
       'seen': seen,
       'new': fresh,
       'dup': dup,
       'released': released,
       'held': _fireFilter?.pendingNow ?? 0,
+      'shown': delivered, // what actually reached the feed
+      'ranked': _curator.pending, // waiting their turn
       ...f.drainStats(),
     };
   }

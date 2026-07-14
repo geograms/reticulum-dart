@@ -127,6 +127,7 @@ void main() {
     for (var i = 0; i < 8; i++) {
       fake.inject(relaySub, post);
     }
+    h.debugCurateNow(); // the curator holds candidates; flush it
 
     final got = h.drainEvents(sub, max: 20);
     expect(got, hasLength(1), reason: 'shown once');
@@ -218,6 +219,7 @@ void main() {
     }
     fake.inject(
         other, _signed(stranger, kind: 0, content: '{"name":"Alice"}'));
+    h.debugCurateNow();
 
     expect(h.drainEvents(sub).map((e) => e['content']),
         ['held until you know me'],

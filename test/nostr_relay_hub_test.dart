@@ -213,6 +213,7 @@ void main() {
     final relaySub = fake.subscribed.last;
 
     fake.inject(relaySub, _signed(kp, content: 'a post nobody has liked yet'));
+    hub.debugCurateNow(); // strangers are ranked, then handed over
 
     expect(hub.drainEvents(sub).map((e) => e['content']),
         ['a post nobody has liked yet'],
@@ -244,6 +245,10 @@ void main() {
           _signed(author, content: 'post number $i', at: 1700000000 + i));
     }
 
+    // The curator hands the feed a handful at a time — flush until it is empty.
+    for (var i = 0; i < 30; i++) {
+      if (hub.debugCurateNow() == 0) break;
+    }
     expect(hub.drainEvents(sub, max: burst * 2), hasLength(burst),
         reason: 'the gate decides what the feed shows, not a cap sized for '
             'sqlite writes on a thread the hub no longer runs on');
@@ -266,6 +271,7 @@ void main() {
 
     fake.inject(relaySub, _signed(spammer, content: 'buy my coin, scumbag'));
     fake.inject(relaySub, _signed(kp, content: 'a real post'));
+    hub.debugCurateNow();
 
     expect(hub.drainEvents(sub).map((e) => e['content']), ['a real post'],
         reason: 'a mute is a refusal to CARRY, not a place to hide a post '

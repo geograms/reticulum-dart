@@ -39,6 +39,7 @@ export 'src/util/db_opener.dart';
 
 // ── Social relay (distributed user protocol) ────────────────────────────
 export 'src/services/social/feed_quality.dart';
+export 'src/services/social/firehose_curator.dart';
 export 'src/services/social/file_meta.dart';
 export 'src/services/social/follow_set.dart';
 export 'src/services/social/host_retention_policy.dart';

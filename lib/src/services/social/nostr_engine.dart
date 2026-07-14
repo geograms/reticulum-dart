@@ -733,6 +733,9 @@ class _Engine {
     for (final sub in _drainSubs) {
       final evs = _hub.drainEvents(sub, max: 60);
       if (evs.isNotEmpty) {
+        // The hand-off the feed depends on. Silent here = the gate kept posts and
+        // nobody ever saw them.
+        toMain.send({'log': 'engine->main: sub=$sub n=${evs.length}'});
         toMain.send({'snap': 'events', 'subId': sub, 'events': evs});
       }
     }

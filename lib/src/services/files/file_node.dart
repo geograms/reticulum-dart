@@ -16,6 +16,8 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
+
 import '../reticulum/rns_crypto.dart';
 import '../reticulum/rns_identity.dart';
 import '../reticulum/rns_link.dart';
@@ -55,6 +57,19 @@ class _FetchEntry {
   bool restartedFull = false;
   Future<void> persist = Future.value();
   _FetchEntry(this.link, this.fileHash, this.done);
+}
+
+/// One peer of a piece swarm: a link held open, serving one request at a time.
+class _PieceEntry {
+  final RnsLink link;
+  final PieceFetchSession session;
+  Uint8List? rttRaw;
+  Completer<bool>? ready; // completes when the link handshake finishes
+  Completer<void>? pending; // completes when the current request settles
+  Timer? retry;
+  bool dead = false;
+  int served = 0; // pieces this peer actually delivered (for a fair ranking)
+  _PieceEntry(this.link, this.session);
 }
 
 class _DhtRpcEntry {
@@ -116,6 +131,7 @@ class FileTransferNode {
 
   final Map<String, _ServeEntry> _serve = {}; // link_id hex -> serve
   final Map<String, _FetchEntry> _fetch = {}; // link_id hex -> fetch
+  final Map<String, _PieceEntry> _pieces = {}; // link_id hex -> piece peer
   // Coalesce concurrent fetches of the SAME file (content-addressed) so two
   // callers can't race the same .part / open competing links.
   final Map<String, Future<Uint8List?>> _inflightBySha = {};
@@ -370,6 +386,11 @@ class FileTransferNode {
       final fetch = _fetch[id];
       if (fetch != null) {
         await _onFetchPacket(fetch, p);
+        return true;
+      }
+      final piece = _pieces[id];
+      if (piece != null) {
+        _onPiecePacket(piece, p);
         return true;
       }
       final dep = _deposit[id];
@@ -811,6 +832,303 @@ class FileTransferNode {
     _provided[_hex(sha256)] =
         _Provided(Uint8List.fromList(sha256), capacity, manifestHash);
     return _publishOne(sha256, capacity, manifestHash);
+  }
+
+  // ── The piece engine (aurora/docs/torrents.md §8 step 2) ──────────────────
+  //
+  // Fetch ONE file from MANY peers at once, in pieces, verifying each piece
+  // against a hash the folder's owner signed. Three properties make this a swarm
+  // rather than a download queue, and all three are load-bearing:
+  //
+  //   * every piece is verifiable ON ITS OWN, so bytes from a stranger are safe
+  //     to use — the liar is caught on the piece, not after the last byte of a
+  //     4 GB file;
+  //   * a PARTIAL holder is a source (GET_HAVE returns its bitfield), so a peer
+  //     that is 40% done uploads those 40% and a 50-peer swarm has 50 uploaders
+  //     instead of one;
+  //   * the tail is not held hostage: in the endgame the last few pieces are
+  //     asked of every idle peer at once and the first answer wins.
+  //
+  // Rarest-first, because the piece only one peer holds is the one that
+  // disappears when that peer does.
+
+  /// Progress of a piece fetch, for a UI that wants to say something true.
+  final Map<String, ({int have, int total})> _pieceProgress = {};
+  ({int have, int total})? pieceProgressFor(Uint8List fileHash) =>
+      _pieceProgress[_hex(fileHash)];
+
+  /// Fetch [fileHash] from a swarm, in pieces, verifying each against
+  /// [pieceHashes] (index i = sha256 of piece i — SIGNED by the folder owner, so
+  /// a stranger's bytes are checkable before they are trusted).
+  ///
+  /// Returns the assembled file, or null when the swarm could not produce every
+  /// piece. Falls back to nothing: the caller decides whether to try a plain
+  /// whole-file fetch (which is what a provider that predates this speaks).
+  Future<Uint8List?> fetchFilePieces({
+    required Uint8List fileHash,
+    required int size,
+    required int pieceSize,
+    required List<Uint8List> pieceHashes,
+    required List<RnsIdentity> providers,
+    int maxPeers = 4,
+    Duration timeout = const Duration(minutes: 20),
+  }) async {
+    final count = pieceCountFor(size, pieceSize);
+    if (count == 0 || pieceHashes.length != count || providers.isEmpty) {
+      return null;
+    }
+    final key = _hex(fileHash);
+    final out = Uint8List(size);
+    final done = List<bool>.filled(count, false);
+    var haveCount = 0;
+    _pieceProgress[key] = (have: 0, total: count);
+
+    // Open up to maxPeers links, in parallel. A peer that never completes its
+    // handshake, or holds nothing, simply isn't in the swarm.
+    final peers = <_PieceEntry>[];
+    await Future.wait([
+      for (final p in providers.take(maxPeers))
+        _openPiecePeer(p, fileHash, pieceSize).then((e) {
+          if (e != null) peers.add(e);
+        }).catchError((Object err) {
+          // A peer that cannot be opened is not a swarm failure — but swallowing
+          // WHY is how a swarm that never forms looks like a swarm with nothing
+          // in it.
+          log?.call('files: piece peer failed: $err');
+        }),
+    ]);
+    if (peers.isEmpty) {
+      log?.call('files: no piece peers answered for ${key.substring(0, 8)}');
+      _pieceProgress.remove(key);
+      return null;
+    }
+    log?.call('files: piece swarm for ${key.substring(0, 8)}: '
+        '${peers.length} peer(s), $count piece(s) of $pieceSize B');
+
+    final deadline = DateTime.now().add(timeout);
+    final inFlight = <int, Set<_PieceEntry>>{}; // piece -> peers asked
+
+    try {
+      while (haveCount < count && DateTime.now().isBefore(deadline)) {
+        final live = peers.where((p) => !p.dead && p.pending == null).toList();
+        if (live.isEmpty) {
+          if (peers.every((p) => p.dead)) break; // swarm is gone
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+          continue;
+        }
+
+        // What is left, rarest first: the piece the fewest peers hold is the one
+        // that vanishes when its only holder does.
+        final want = <int>[];
+        for (var i = 0; i < count; i++) {
+          if (!done[i]) want.add(i);
+        }
+        want.sort((a, b) => _holdersOf(peers, a).compareTo(_holdersOf(peers, b)));
+
+        // Endgame: with only a few pieces left, ask EVERY idle peer for them and
+        // take the first answer. Otherwise one slow peer owns the last 2%.
+        final endgame = want.length <= live.length;
+
+        var assigned = 0;
+        for (final piece in want) {
+          if (assigned >= live.length) break;
+          final asked = inFlight.putIfAbsent(piece, () => <_PieceEntry>{});
+          for (final peer in live) {
+            if (peer.pending != null) continue;
+            if (!(peer.session.mask?.has(piece) ?? false)) continue;
+            if (asked.contains(peer)) continue;
+            if (!endgame && asked.isNotEmpty) break; // one peer per piece
+            asked.add(peer);
+            assigned++;
+            // ignore: discarded_futures
+            _requestPiece(peer, piece, pieceSize, size).then((bytes) {
+              if (bytes == null) return;
+              if (done[piece]) return; // an endgame duplicate lost the race
+              final h =
+                  Uint8List.fromList(crypto.sha256.convert(bytes).bytes);
+              if (!RnsCrypto.constantTimeEquals(h, pieceHashes[piece])) {
+                // The signed hash says these bytes are not the piece. Drop the
+                // peer: a source that hands us garbage once will do it again,
+                // and every other piece it gave us is now suspect only in the
+                // sense that it was also checked — so we keep those and stop
+                // asking this one.
+                log?.call('files: piece $piece failed its signed hash — '
+                    'dropping that peer');
+                peer.dead = true;
+                _closePiecePeer(peer);
+                return;
+              }
+              out.setRange(piece * pieceSize,
+                  piece * pieceSize + bytes.length, bytes);
+              done[piece] = true;
+              haveCount++;
+              peer.served++;
+              _pieceProgress[key] = (have: haveCount, total: count);
+            }).whenComplete(() {
+              asked.remove(peer);
+            });
+            if (!endgame) break;
+          }
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+    } finally {
+      for (final p in peers) {
+        _closePiecePeer(p);
+      }
+      _pieceProgress.remove(key);
+    }
+
+    if (haveCount < count) {
+      log?.call('files: piece fetch incomplete ($haveCount/$count)');
+      return null;
+    }
+    // The whole file must still hash to what was asked for. Every piece was
+    // verified, so this can only fail if the piece-hash LIST itself was wrong —
+    // which is worth knowing loudly rather than quietly returning bad bytes.
+    final h = Uint8List.fromList(crypto.sha256.convert(out).bytes);
+    if (!RnsCrypto.constantTimeEquals(h, fileHash)) {
+      log?.call('files: pieces all verified but the file hash does not match — '
+          'the piece-hash list is wrong');
+      return null;
+    }
+    return out;
+  }
+
+  int _holdersOf(List<_PieceEntry> peers, int piece) {
+    var n = 0;
+    for (final p in peers) {
+      if (!p.dead && (p.session.mask?.has(piece) ?? false)) n++;
+    }
+    return n;
+  }
+
+  /// Ask one peer for one piece. Completes with the bytes, or null.
+  Future<Uint8List?> _requestPiece(
+      _PieceEntry peer, int piece, int pieceSize, int size) async {
+    if (peer.dead) return null;
+    final offset = piece * pieceSize;
+    final len = (offset + pieceSize > size) ? size - offset : pieceSize;
+    final c = Completer<void>();
+    peer.pending = c;
+    peer.session.result = null;
+    send(peer.session.askRange(offset, len).pack());
+    try {
+      await c.future.timeout(const Duration(seconds: 90));
+    } on TimeoutException {
+      // A peer that goes quiet on a piece is not a source right now. It is not
+      // necessarily a liar, so it stays in the swarm — but this piece is re-issued.
+      peer.pending = null;
+      return null;
+    }
+    peer.pending = null;
+    final bytes = peer.session.result;
+    peer.session.result = null;
+    return bytes;
+  }
+
+  /// Open a link to one provider and ask what it holds. Null when the handshake
+  /// never completes or the peer holds nothing of this file.
+  Future<_PieceEntry?> _openPiecePeer(
+      RnsIdentity provider, Uint8List fileHash, int pieceSize) async {
+    final link = await RnsLink.initiator(provider, kFilesApp, kFilesAspects);
+    link.nextHop = await _ensurePath(provider, kFilesApp, kFilesAspects);
+    link.offerMtu(nextHopMtuForDest?.call(link.destHash) ?? kRnsMtu);
+    // The link id only exists once the request is BUILT — register after, or the
+    // peer is routed to nothing and every packet from it is dropped.
+    final req = link.buildRequest();
+    final entry = _PieceEntry(link, PieceFetchSession(link, fileHash));
+    final id = _hex(link.linkId!);
+    _pieces[id] = entry;
+    onLinkOpened?.call(link.linkId!, link.destHash);
+
+    final ready = Completer<bool>();
+    entry.ready = ready;
+    send(req.pack());
+
+    // Stall recovery while a range is in flight (re-request missing parts).
+    entry.retry = Timer.periodic(const Duration(seconds: 4), (_) {
+      if (entry.dead) return;
+      if (entry.pending == null) return;
+      for (final out in entry.session.retry()) {
+        send(out.pack());
+      }
+    });
+
+    try {
+      final ok = await ready.future.timeout(const Duration(seconds: 30));
+      if (!ok) {
+        _closePiecePeer(entry);
+        return null;
+      }
+    } on TimeoutException {
+      _closePiecePeer(entry);
+      return null;
+    }
+
+    // What does it have?
+    final c = Completer<void>();
+    entry.pending = c;
+    send(entry.session.askHave(pieceSize).pack());
+    try {
+      await c.future.timeout(const Duration(seconds: 30));
+    } on TimeoutException {
+      _closePiecePeer(entry);
+      return null;
+    }
+    entry.pending = null;
+    final mask = entry.session.mask;
+    if (mask == null || mask.isEmpty) {
+      _closePiecePeer(entry);
+      return null;
+    }
+    return entry;
+  }
+
+  void _onPiecePacket(_PieceEntry e, RnsPacket p) {
+    if (e.dead) return;
+    // Handshake, exactly as a whole-file fetch does it.
+    if (e.ready != null && !e.ready!.isCompleted) {
+      if (p.packetType == RnsPacketType.proof &&
+          p.context == RnsContext.lrproof) {
+        if (e.link.status != RnsLinkStatus.pending) return;
+        // ignore: discarded_futures
+        e.link.handleProof(p).then((rtt) {
+          if (rtt == null) {
+            if (!e.ready!.isCompleted) e.ready!.complete(false);
+            return;
+          }
+          e.rttRaw = rtt.pack();
+          send(e.rttRaw!);
+          if (!e.ready!.isCompleted) e.ready!.complete(true);
+        });
+      }
+      return;
+    }
+    // A responder that never saw our LRRTT keeps re-proofing; re-send it while
+    // nothing is flowing yet (the same fix the whole-file path needed).
+    if (p.packetType == RnsPacketType.proof &&
+        p.context == RnsContext.lrproof) {
+      if (e.rttRaw != null && e.session.receivedBytes == 0) send(e.rttRaw!);
+      return;
+    }
+    for (final out in e.session.onPacket(p)) {
+      send(out.pack());
+    }
+    final s = e.session.state;
+    if (s == PieceReqState.done || s == PieceReqState.failed) {
+      final c = e.pending;
+      if (c != null && !c.isCompleted) c.complete();
+    }
+  }
+
+  void _closePiecePeer(_PieceEntry e) {
+    e.dead = true;
+    e.retry?.cancel();
+    final c = e.pending;
+    if (c != null && !c.isCompleted) c.complete();
+    final id = e.link.linkId;
+    if (id != null) _pieces.remove(_hex(id));
   }
 
   /// Advertise ourselves as a provider of an arbitrary 32-byte DHT [key] (e.g. a

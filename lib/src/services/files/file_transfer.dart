@@ -52,6 +52,104 @@ const int kOpPutReject = 0x82;
 const int kOpPutAccept = 0x84;
 const int kOpPutStored = 0x85;
 
+// ── The piece engine (aurora/docs/torrents.md §8 step 2) ────────────────────
+//
+// A whole-file GET_FILE is a download queue, not a swarm: one provider serves
+// the whole thing, a partial holder can serve nothing, and a slow peer holds the
+// tail hostage. These three ops are what make it a torrent:
+//
+//   0x07 GET_HAVE  + fileHash(32) + pieceSize(4 BE)
+//   0x87 HAVE      + fileHash(32) + pieceSize(4 BE) + pieceCount(4 BE)
+//                                 + size(8 BE) + bitfield(ceil(count/8))
+//   0x06 GET_RANGE + fileHash(32) + offset(8 BE) + length(4 BE)
+//        → the bytes as a Resource, or 0x81 NOT_FOUND when we hold none of it.
+//
+// HAVE is what lets a leecher seed: it answers with the pieces it actually has,
+// so a peer that is 40% done is a source for those 40%. The bitfield is the
+// whole reason a 50-peer swarm has 50 uploaders instead of one.
+//
+// A range's bytes are NOT self-verifying (they are not a whole file, so their
+// sha256 is not the file id). The fetcher checks each piece against the SIGNED
+// piece hash from the folder's op-log — which is what makes fetching from
+// strangers in parallel safe at all. A provider that returns bad bytes is caught
+// on the piece, not after the last byte of a 4 GB file.
+const int kOpGetRange = 0x06;
+const int kOpGetHave = 0x07;
+const int kOpHave = 0x87;
+
+/// Which pieces of a file a peer holds. `count` pieces of `pieceSize` bytes
+/// (the last one is short), `size` bytes in total.
+class PieceMask {
+  final int pieceSize;
+  final int count;
+  final int size;
+  final Uint8List bits; // little bit = piece index, LSB-first per byte
+
+  PieceMask({
+    required this.pieceSize,
+    required this.count,
+    required this.size,
+    required this.bits,
+  });
+
+  /// A peer that holds the whole file.
+  factory PieceMask.full(int size, int pieceSize) {
+    final count = pieceCountFor(size, pieceSize);
+    final bits = Uint8List((count + 7) >> 3);
+    for (var i = 0; i < count; i++) {
+      bits[i >> 3] |= 1 << (i & 7);
+    }
+    return PieceMask(
+        pieceSize: pieceSize, count: count, size: size, bits: bits);
+  }
+
+  factory PieceMask.empty(int size, int pieceSize) {
+    final count = pieceCountFor(size, pieceSize);
+    return PieceMask(
+      pieceSize: pieceSize,
+      count: count,
+      size: size,
+      bits: Uint8List((count + 7) >> 3),
+    );
+  }
+
+  bool has(int i) =>
+      i >= 0 && i < count && (bits[i >> 3] & (1 << (i & 7))) != 0;
+
+  void set(int i) {
+    if (i < 0 || i >= count) return;
+    bits[i >> 3] |= 1 << (i & 7);
+  }
+
+  int get held {
+    var n = 0;
+    for (var i = 0; i < count; i++) {
+      if (has(i)) n++;
+    }
+    return n;
+  }
+
+  bool get isEmpty => held == 0;
+  bool get isComplete => held == count;
+}
+
+int pieceCountFor(int size, int pieceSize) =>
+    pieceSize <= 0 ? 0 : (size + pieceSize - 1) ~/ pieceSize;
+
+/// A source that can serve part of a file, and say which parts it holds.
+///
+/// Optional: a plain [FileSource] still works (the serve side slices whole-file
+/// bytes), but a node that implements this can serve a 4 GB file without reading
+/// 4 GB into memory, and — the point — can seed pieces of a file it has not
+/// finished downloading.
+abstract class RangedFileSource implements FileSource {
+  /// Bytes `[offset, offset+length)`, or null when this node cannot serve them.
+  Uint8List? readRange(Uint8List fileHash, int offset, int length);
+
+  /// Which pieces of [fileHash] this node holds, or null if it holds none.
+  PieceMask? pieceMask(Uint8List fileHash, int pieceSize);
+}
+
 /// The canonical message a depositor Schnorr-signs to authorize hosting [shaHex]
 /// (returned as 64-char hex, ready for NostrCrypto.schnorrSign/Verify).
 String depositAuthMessageHex(String shaHex) =>
@@ -254,6 +352,30 @@ class FileServeSession {
       onServed?.call(Uint8List.fromList(fileHash));
       return _serveResource(bytes, fileHash, startSegment: startSeg);
     }
+    if (op == kOpGetHave && cmd.length >= 1 + 32 + 4) {
+      // "What do you have of this file?" — answered even by a node that holds
+      // only some of it, which is exactly the point: a leecher seeds.
+      final fileHash = Uint8List.sublistView(cmd, 1, 33);
+      final pieceSize = ByteData.sublistView(cmd, 33, 37).getUint32(0, Endian.big);
+      if (pieceSize <= 0) return const [];
+      final mask = _maskFor(fileHash, pieceSize);
+      if (mask == null || mask.isEmpty) return [_notFound(fileHash)];
+      return [_have(fileHash, mask)];
+    }
+    if (op == kOpGetRange && cmd.length >= 1 + 32 + 8 + 4) {
+      final fileHash = Uint8List.sublistView(cmd, 1, 33);
+      final offset = ByteData.sublistView(cmd, 33, 41).getUint64(0, Endian.big);
+      final length = ByteData.sublistView(cmd, 41, 45).getUint32(0, Endian.big);
+      if (length <= 0) return [_notFound(fileHash)];
+      final bytes = _readRange(fileHash, offset, length);
+      if (bytes == null || bytes.isEmpty) return [_notFound(fileHash)];
+      if (!_allow(fileHash, bytes.length)) return [_notFound(fileHash)];
+      onServed?.call(Uint8List.fromList(fileHash));
+      // The range rides a Resource like any other payload. It is NOT the whole
+      // file, so its sha256 is not the file id — the fetcher verifies it against
+      // the signed piece hash instead.
+      return _serveResource(bytes, fileHash);
+    }
     if (op == kOpPutOffer && cmd.length >= 1 + 32 + 8 + 1) {
       // [0x03][sha32][size8][extLen1][ext][pub32][sig64]
       final sha = Uint8List.sublistView(cmd, 1, 33);
@@ -335,6 +457,42 @@ class FileServeSession {
       ..addByte(kOpNotFound)
       ..add(fileHash);
     return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
+
+  RnsPacket _have(Uint8List fileHash, PieceMask m) {
+    final head = ByteData(4 + 4 + 8);
+    head.setUint32(0, m.pieceSize, Endian.big);
+    head.setUint32(4, m.count, Endian.big);
+    head.setUint64(8, m.size, Endian.big);
+    final b = BytesBuilder()
+      ..addByte(kOpHave)
+      ..add(fileHash)
+      ..add(head.buffer.asUint8List())
+      ..add(m.bits);
+    return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
+
+  /// What we hold of this file. A [RangedFileSource] answers precisely (and can
+  /// therefore seed a file it is still downloading); a plain source either has
+  /// the whole thing or nothing.
+  PieceMask? _maskFor(Uint8List fileHash, int pieceSize) {
+    final s = source;
+    if (s is RangedFileSource) return s.pieceMask(fileHash, pieceSize);
+    final bytes = s.read(fileHash);
+    if (bytes == null) return null;
+    return PieceMask.full(bytes.length, pieceSize);
+  }
+
+  /// Serve part of a file WITHOUT reading the whole thing when the source can do
+  /// it properly. The fallback slices, which is correct but costs the memory.
+  Uint8List? _readRange(Uint8List fileHash, int offset, int length) {
+    final s = source;
+    if (s is RangedFileSource) return s.readRange(fileHash, offset, length);
+    final bytes = s.read(fileHash);
+    if (bytes == null) return null;
+    if (offset < 0 || offset >= bytes.length) return null;
+    final end = (offset + length) > bytes.length ? bytes.length : offset + length;
+    return Uint8List.sublistView(bytes, offset, end);
   }
 }
 
@@ -457,6 +615,120 @@ class FileFetchSession {
       ..addByte(startSegment & 0xff);
     return link.encrypt(b.toBytes(), context: RnsContext.none);
   }
+}
+
+// ── Piece side (fetcher): one peer, many pieces, over ONE link ───────────────
+
+enum PieceReqState { idle, asking, receiving, done, failed }
+
+/// One peer, held open, answering piece requests.
+///
+/// The link is the expensive thing (a Curve25519 handshake), so it is opened
+/// once and reused for every range this peer serves — a link per piece would
+/// cost more in handshakes than the pieces are worth. One request is in flight
+/// at a time on a link; parallelism comes from having several PEERS, which is
+/// what a swarm is.
+class PieceFetchSession {
+  final RnsLink link;
+  final Uint8List fileHash;
+
+  PieceReqState state = PieceReqState.idle;
+  String? error;
+
+  /// The peer's answer to GET_HAVE (null until it arrives; a peer that holds
+  /// nothing answers NOT_FOUND and lands in [error]).
+  PieceMask? mask;
+
+  /// The bytes of the range currently being fetched, once complete.
+  Uint8List? result;
+
+  int _wantLen = 0;
+  RnsResourceReceiver? _rx;
+
+  PieceFetchSession(this.link, this.fileHash);
+
+  int get receivedBytes => _rx?.receivedBytes ?? 0;
+
+  /// Ask what this peer holds.
+  RnsPacket askHave(int pieceSize) {
+    state = PieceReqState.asking;
+    final head = ByteData(4)..setUint32(0, pieceSize, Endian.big);
+    final b = BytesBuilder()
+      ..addByte(kOpGetHave)
+      ..add(fileHash)
+      ..add(head.buffer.asUint8List());
+    return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
+
+  /// Ask for `[offset, offset+length)`.
+  RnsPacket askRange(int offset, int length) {
+    state = PieceReqState.receiving;
+    result = null;
+    error = null;
+    _wantLen = length;
+    _rx = RnsResourceReceiver(link);
+    final head = ByteData(12)
+      ..setUint64(0, offset, Endian.big)
+      ..setUint32(8, length, Endian.big);
+    final b = BytesBuilder()
+      ..addByte(kOpGetRange)
+      ..add(fileHash)
+      ..add(head.buffer.asUint8List());
+    return link.encrypt(b.toBytes(), context: RnsContext.none);
+  }
+
+  /// Feed one inbound packet; returns packets to send back.
+  List<RnsPacket> onPacket(RnsPacket p) {
+    if (p.context == RnsContext.none) {
+      final cmd = link.decrypt(p);
+      if (cmd.isEmpty) return const [];
+      if (cmd[0] == kOpNotFound) {
+        error = 'peer does not have it';
+        state = PieceReqState.failed;
+        return const [];
+      }
+      if (cmd[0] == kOpHave && cmd.length >= 1 + 32 + 16) {
+        final pieceSize =
+            ByteData.sublistView(cmd, 33, 37).getUint32(0, Endian.big);
+        final count = ByteData.sublistView(cmd, 37, 41).getUint32(0, Endian.big);
+        final size = ByteData.sublistView(cmd, 41, 49).getUint64(0, Endian.big);
+        final bits = Uint8List.fromList(cmd.sublist(49));
+        if ((count + 7) >> 3 > bits.length) {
+          error = 'short bitfield';
+          state = PieceReqState.failed;
+          return const [];
+        }
+        mask = PieceMask(
+            pieceSize: pieceSize, count: count, size: size, bits: bits);
+        state = PieceReqState.done;
+      }
+      return const [];
+    }
+    final rx = _rx;
+    if (rx == null) return const [];
+    final out = rx.handle(p);
+    if (rx.error != null) {
+      error = 'resource error: ${rx.error}';
+      state = PieceReqState.failed;
+      return const [];
+    }
+    if (rx.complete) {
+      final bytes = rx.payload;
+      if (bytes == null || bytes.length != _wantLen) {
+        // A peer that answers a range with the wrong number of bytes is either
+        // broken or lying. Either way it is not a source for this range.
+        error = 'range length mismatch '
+            '(${bytes?.length ?? 0} != $_wantLen)';
+        state = PieceReqState.failed;
+        return out;
+      }
+      result = bytes;
+      state = PieceReqState.done;
+    }
+    return out;
+  }
+
+  List<RnsPacket> retry() => _rx?.retry() ?? const [];
 }
 
 // ── Deposit side (client asks a host to keep a blob) ─────────────────────────

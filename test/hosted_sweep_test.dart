@@ -136,6 +136,23 @@ void main() {
     expect(s.pinnedItems, 1);
   });
 
+  test('"free space" gives back everything held for OTHERS, and nothing else',
+      () {
+    seed();
+    final p = archive.previewSweep(const HostedSweep.all());
+    expect(p.items, 3, reason: 'two strangers + one followed author');
+    expect(p.bytes, 7000);
+    expect(archive.hostedStats().totalItems, 4, reason: 'preview frees nothing');
+
+    final r = archive.sweepHosted(const HostedSweep.all());
+    expect(r.items, 3);
+    final s = archive.hostedStats();
+    expect(s.strangerItems, 0);
+    expect(s.followedItems, 0);
+    expect(s.pinnedItems, 1,
+        reason: 'what the owner asked to keep is not the archive\'s to delete');
+  });
+
   test('one depositor can be evicted on their own', () {
     seed();
     final r = archive.sweepHosted(HostedSweep.byOrigin('a' * 64));

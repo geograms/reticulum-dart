@@ -59,6 +59,11 @@ enum SweepKind {
   /// Free up to N bytes from the STRANGER slice, oldest first. It never reaches
   /// into a followed author's media, however short it falls of the target.
   freeBytes,
+
+  /// Everything this device holds FOR OTHERS — strangers and followed authors
+  /// alike. Still never the owner's own media, and never what they pinned: the
+  /// archive is the space volunteered, and giving it back is the owner's right.
+  all,
 }
 
 class HostedSweep {
@@ -92,6 +97,12 @@ class HostedSweep {
   const HostedSweep.freeBytes(this.freeBytes)
       : kind = SweepKind.freeBytes,
         olderThanMs = 0,
+        originPub = '';
+
+  const HostedSweep.all()
+      : kind = SweepKind.all,
+        olderThanMs = 0,
+        freeBytes = 0,
         originPub = '';
 }
 
@@ -601,6 +612,8 @@ class MediaArchive {
         params.add(sweep.originPub);
       case SweepKind.freeBytes:
         break; // handled below: oldest first until enough is freed
+      case SweepKind.all:
+        break; // the base clause (hosted, not pinned) IS the filter
     }
 
     try {

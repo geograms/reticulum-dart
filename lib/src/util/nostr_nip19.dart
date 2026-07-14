@@ -57,7 +57,12 @@ class NostrNip19 {
   static NostrNip19Result? decode(String uri) {
     final value = uri.startsWith('nostr:') ? uri.substring(6) : uri;
     try {
-      final decoded = const Bech32Codec().decode(value);
+      // The bech32 spec's 90-character limit is for addresses; NIP-19 explicitly
+      // does not apply it. An `nprofile`/`nevent` carries relay hints in its TLV
+      // and routinely runs to several hundred characters — with the default
+      // limit those threw, decoded to nothing, and the UI fell back to printing
+      // the raw key at the reader.
+      final decoded = const Bech32Codec().decode(value, 4096);
       final hrp = decoded.hrp.toLowerCase();
       final bytes = _convertBits(
         Uint8List.fromList(decoded.data),

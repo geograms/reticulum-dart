@@ -193,6 +193,18 @@ class MediaArchive {
   static const String _fileName = 'media.sqlite3';
 
   final String _dbPath;
+
+  /// Where this archive's SQLite file lives. A caller that must move a large
+  /// blob (exporting a file so the OS can open it) opens this path on a WORKER
+  /// isolate and streams the row out, rather than pulling tens of MB through
+  /// [get] on the isolate that draws the UI.
+  String get dbPath => _dbPath;
+
+  /// The storage key for a token / hex sha256 / b64u hash — the same
+  /// normalisation [get] and [has] apply, exposed so an off-isolate reader can
+  /// look a row up without duplicating the rules.
+  static String? storageKeyOf(String tokenOrSha256) => _keyOf(tokenOrSha256);
+
   Database? _db;
   bool _failed = false; // a fatal open error → operate degraded, never wipe
 

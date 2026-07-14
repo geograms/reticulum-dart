@@ -61,6 +61,11 @@ class DhtNode {
   final int maxStoredKeys;
   final int maxRecordsPerKey;
 
+  /// FIND_VALUE requests this node answered WITH RECORDS — the "is my offer
+  /// being used at all" number an Indexer's owner reads off the dashboard.
+  /// Lifetime total; the host samples deltas into an hourly ring for the rate.
+  int queriesAnswered = 0;
+
   /// STOREs refused by the caps above (observability).
   int storesRejected = 0;
 
@@ -129,6 +134,7 @@ class DhtNode {
           return DhtMessage.valueNodes(
               myPub, _cap(routing.closest(key, k), maxC));
         }
+        queriesAnswered++;
         // "These N devices have it" — and what we know about each, so the caller
         // does not have to guess which one to wake (docs/NOSTR.md).
         final capped = _cap(recs, maxR);
@@ -428,6 +434,104 @@ class DhtNode {
       }
     }
     return true;
+  }
+
+  /// How old the held pointers are: counts for <1h / <24h / <7d / older.
+  ///
+  /// Age = when WE last had evidence of the record (`_acceptedAt`), falling back
+  /// to the record's own timestamp. One walk over the store — cheap at the
+  /// 10k-key cap, and it is what makes "remove older than X" an informed act
+  /// instead of a guess.
+  ({int h1, int d1, int d7, int older}) ageBuckets({int? nowMs}) {
+    final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    var h1 = 0, d1 = 0, d7 = 0, older = 0;
+    for (final list in _store.values) {
+      for (final r in list) {
+        final at = _acceptedAt[dhtHex(r.providerPub) + dhtHex(r.sha256)] ??
+            r.timestampMs;
+        final age = now - at;
+        if (age < 3600000) {
+          h1++;
+        } else if (age < 86400000) {
+          d1++;
+        } else if (age < 7 * 86400000) {
+          d7++;
+        } else {
+          older++;
+        }
+      }
+    }
+    return (h1: h1, d1: d1, d7: d7, older: older);
+  }
+
+  /// Remove (or, with [dryRun], count) every record older than [age].
+  ///
+  /// Preview first: a cleanup tool that cannot tell you what it is about to
+  /// delete is not a tool, it is a gamble. Returns the records affected and, via
+  /// [onRemoved], hands each real removal to the caller — who is expected to put
+  /// it in the pointer log so the deletion TRAVELS to synced indexers (a dead
+  /// address must propagate as surely as a new one).
+  int sweepOlderThan(
+    Duration age, {
+    bool dryRun = false,
+    int? nowMs,
+    void Function(ProviderRecord record)? onRemoved,
+  }) {
+    final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    final cutoff = now - age.inMilliseconds;
+    var n = 0;
+    final emptyKeys = <String>[];
+    for (final e in _store.entries) {
+      final victims = <ProviderRecord>[];
+      for (final r in e.value) {
+        final at = _acceptedAt[dhtHex(r.providerPub) + dhtHex(r.sha256)] ??
+            r.timestampMs;
+        if (at < cutoff) victims.add(r);
+      }
+      n += victims.length;
+      if (dryRun) continue;
+      for (final r in victims) {
+        e.value.remove(r);
+        _acceptedAt.remove(dhtHex(r.providerPub) + dhtHex(r.sha256));
+        onRemoved?.call(r);
+      }
+      if (e.value.isEmpty) emptyKeys.add(e.key);
+    }
+    for (final k in emptyKeys) {
+      _store.remove(k);
+    }
+    return n;
+  }
+
+  /// Remove (or count) every record from one provider, across ALL keys —
+  /// `demoteProvider` is per-key; this is the "evict this depositor" tool.
+  int dropProviderEverywhere(
+    Uint8List providerPub, {
+    bool dryRun = false,
+    void Function(ProviderRecord record)? onRemoved,
+  }) {
+    final pub = dhtHex(providerPub);
+    var n = 0;
+    final emptyKeys = <String>[];
+    for (final e in _store.entries) {
+      final victims = [
+        for (final r in e.value)
+          if (dhtHex(r.providerPub) == pub) r
+      ];
+      n += victims.length;
+      if (dryRun) continue;
+      for (final r in victims) {
+        e.value.remove(r);
+        _acceptedAt.remove(pub + dhtHex(r.sha256));
+        onRemoved?.call(r);
+      }
+      if (e.value.isEmpty) emptyKeys.add(e.key);
+    }
+    for (final k in emptyKeys) {
+      _store.remove(k);
+    }
+    if (!dryRun && n > 0) providersDemoted += n;
+    return n;
   }
 
   /// Drop a provider's record for [sha256] from our local store — called when a

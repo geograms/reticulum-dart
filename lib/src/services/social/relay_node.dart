@@ -86,6 +86,12 @@ class RelayNode {
   /// can flip hosting on/off at runtime (capacity / settings switch).
   bool serve;
 
+  /// Queries served over links (REQ + COUNT) and probes answered — lifetime
+  /// totals; the host samples deltas into an hourly ring for the dashboard's
+  /// requests-per-hour. A role nobody can inspect is a role nobody trusts.
+  int reqsServed = 0;
+  int probesAnswered = 0;
+
   /// The pointer map this node syncs with other indexers (docs/NOSTR.md).
   ///
   /// Set by the host on an INDEXER; null on a leaf, and that is the point:
@@ -413,6 +419,7 @@ class RelayNode {
     // We have something. Send it inline if it fits one datagram; otherwise just
     // say HOW MANY and let the peer open a link for the bulk (the link is worth
     // paying for when there is actually data to move).
+    probesAnswered++;
     final full = RelayProtocol.result(f.subId ?? '', events, true);
     if (full.length <= kNpdMaxPlaintext) {
       log?.call('relay: probe answered inline -> ${events.length} event(s)');
@@ -513,11 +520,13 @@ class RelayNode {
             );
           }
           final events = store.query(filter);
+          reqsServed++;
           log?.call('relay: answered REQ -> ${events.length} event(s)'
               '${serve ? '' : ' (self-scoped)'}');
           rl.sendMessage(RelayProtocol.result(f.subId ?? '', events, true));
           break;
         case RelayOp.count:
+          reqsServed++;
           final n = store.count(f.filter);
           rl.sendMessage(RelayProtocol.countResult(f.subId ?? '', n));
           break;

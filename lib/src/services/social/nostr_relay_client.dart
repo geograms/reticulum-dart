@@ -44,6 +44,13 @@ abstract class NostrRelayClient {
   /// [onEose] fires once the stored backlog is delivered.
   void subscribe(String subId, List<NostrFilter> filters);
 
+  /// Frames received since the last call (evidence that a socket is alive).
+  int drainFrames() => 0;
+
+  /// Foreground/pull-to-refresh recovery: reconnect a dead or zombie socket
+  /// immediately instead of waiting out backoff. No-op for local transports.
+  void resume() {}
+
   /// Drop the connection and build it again (subscriptions are replayed).
   ///
   /// For when a relay has silently stopped answering a subscription it never

@@ -19,13 +19,13 @@ final _me = _pk('f');
 final _friend = _pk('e');
 
 NostrEvent _post(String content, {String? pubkey, int? at}) => NostrEvent(
-      id: content.hashCode.toRadixString(16).padLeft(64, '0'),
-      pubkey: pubkey ?? _alice,
-      createdAt: at ?? 1752300000,
-      kind: 1,
-      tags: const [],
-      content: content,
-    );
+  id: content.hashCode.toRadixString(16).padLeft(64, '0'),
+  pubkey: pubkey ?? _alice,
+  createdAt: at ?? 1752300000,
+  kind: 1,
+  tags: const [],
+  content: content,
+);
 
 void main() {
   group('content rules keep what real people write', () {
@@ -36,7 +36,7 @@ void main() {
           'this explains the routing bug better than I could https://example.org/x',
       'a couple of hashtags under real prose':
           'Spent the weekend getting the mesh to survive a hub outage. '
-              'Notes and numbers in the post. #nostr #meshtastic',
+          'Notes and numbers in the post. #nostr #meshtastic',
       'Japanese': 'おはようございます。今日はいい天気ですね。',
       'Arabic': 'صباح الخير، كيف حالك اليوم؟',
       'Portuguese with an emoji': 'temos um beta release! 😂 finalmente',
@@ -46,8 +46,11 @@ void main() {
 
     for (final e in keeps.entries) {
       test('keeps ${e.key}', () {
-        expect(contentVerdict(e.value), isA<FeedKeep>(),
-            reason: 'wrongly hidden: "${e.value}"');
+        expect(
+          contentVerdict(e.value),
+          isA<FeedKeep>(),
+          reason: 'wrongly hidden: "${e.value}"',
+        );
       });
     }
   });
@@ -60,7 +63,15 @@ void main() {
 
     test('a wall of hashtags with a few words wedged in', () {
       final v = contentVerdict(
-          'buy now #crypto #bitcoin #nostr #airdrop #free #money #pump #moon');
+        'buy now #crypto #bitcoin #nostr #airdrop #free #money #pump #moon',
+      );
+      expect((v as FeedReject).reason, FeedDrop.hashtagStuffing);
+    });
+
+    test('a short promotional caption cannot hide behind three hashtags', () {
+      final v = contentVerdict(
+        'Jojo #npub1sexy 🍒 #NSFW #FitLifeAndBeyond 🏋️ 🌟',
+      );
       expect((v as FeedReject).reason, FeedDrop.hashtagStuffing);
     });
 
@@ -80,25 +91,31 @@ void main() {
     final known = <String>{_alice, _bob};
 
     FeedVerdict run(NostrEvent e, {int nowMs = 0}) => f.verdict(
-          e,
-          hasProfile: known.contains,
-          trusted: (p) => p == _me || p == _friend,
-          muted: (_) => false,
-          nowMs: nowMs,
-        );
+      e,
+      hasProfile: known.contains,
+      trusted: (p) => p == _me || p == _friend,
+      muted: (_) => false,
+      nowMs: nowMs,
+    );
 
     setUp(() => f = FirehoseFilter());
 
     test('a stranger with a profile and something to say gets through', () {
-      expect(run(_post('the link budget runs out before the radio does')),
-          isA<FeedKeep>());
+      expect(
+        run(_post('the link budget runs out before the radio does')),
+        isA<FeedKeep>(),
+      );
     });
 
     test('an author with NO profile is held, not dropped', () {
       final v = run(_post('hello from a new account', pubkey: _stranger));
-      expect(v, isA<FeedPending>(),
-          reason: 'a new user without a kind-0 is not a spammer — their profile '
-              'may simply still be in flight');
+      expect(
+        v,
+        isA<FeedPending>(),
+        reason:
+            'a new user without a kind-0 is not a spammer — their profile '
+            'may simply still be in flight',
+      );
     });
 
     test('holding, then releasing when the profile lands', () {
@@ -120,13 +137,17 @@ void main() {
     test('the pending buffer cannot grow without bound', () {
       for (var i = 0; i < 500; i++) {
         f.hold(
-            _post('post $i',
-                pubkey: i.toRadixString(16).padLeft(64, '0')),
-            1000);
+          _post('post $i', pubkey: i.toRadixString(16).padLeft(64, '0')),
+          1000,
+        );
       }
-      expect(f.pendingNow, lessThanOrEqualTo(400),
-          reason: 'a firehose meets an endless supply of unknown authors — the '
-              'hold buffer must be bounded or it is a memory leak');
+      expect(
+        f.pendingNow,
+        lessThanOrEqualTo(400),
+        reason:
+            'a firehose meets an endless supply of unknown authors — the '
+            'hold buffer must be bounded or it is a memory leak',
+      );
     });
 
     test('the same text from a DIFFERENT author is a copy-paste ring', () {
@@ -137,23 +158,33 @@ void main() {
     });
 
     test('the same text from the SAME author is not a ring', () {
-      const text = 'reminder: the meetup is at seven, upstairs at the usual bar';
+      const text =
+          'reminder: the meetup is at seven, upstairs at the usual bar';
       expect(run(_post(text, pubkey: _alice)), isA<FeedKeep>());
-      expect(run(_post(text, pubkey: _alice)), isA<FeedKeep>(),
-          reason: 'a person repeating themselves is covered by the flood rule, '
-              'not by the bot-ring rule');
+      expect(
+        run(_post(text, pubkey: _alice)),
+        isA<FeedKeep>(),
+        reason:
+            'a person repeating themselves is covered by the flood rule, '
+            'not by the bot-ring rule',
+      );
     });
 
     test('"gm" from a thousand people is not a duplicate', () {
       expect(run(_post('gm', pubkey: _alice)), isA<FeedKeep>());
-      expect(run(_post('gm', pubkey: _bob)), isA<FeedKeep>(),
-          reason: 'short greetings collide by nature; only real text counts');
+      expect(
+        run(_post('gm', pubkey: _bob)),
+        isA<FeedKeep>(),
+        reason: 'short greetings collide by nature; only real text counts',
+      );
     });
 
     test('an author posting five times a minute is flooding', () {
       for (var i = 0; i < 4; i++) {
-        expect(run(_post('post number $i', pubkey: _alice), nowMs: i * 1000),
-            isA<FeedKeep>());
+        expect(
+          run(_post('post number $i', pubkey: _alice), nowMs: i * 1000),
+          isA<FeedKeep>(),
+        );
       }
       final v = run(_post('post number five', pubkey: _alice), nowMs: 5000);
       expect((v as FeedReject).reason, FeedDrop.flooding);
@@ -164,8 +195,10 @@ void main() {
         run(_post('post $i', pubkey: _alice), nowMs: i * 1000);
       }
       // Two minutes later the window has moved on.
-      expect(run(_post('a new thought', pubkey: _alice), nowMs: 130 * 1000),
-          isA<FeedKeep>());
+      expect(
+        run(_post('a new thought', pubkey: _alice), nowMs: 130 * 1000),
+        isA<FeedKeep>(),
+      );
     });
 
     test('our own posts and the people we follow bypass every rule', () {
@@ -191,8 +224,10 @@ void main() {
 
     test('moderate mode (requireProfile off) keeps profile-less strangers', () {
       f = FirehoseFilter(requireProfile: false);
-      expect(run(_post('hello from a new account', pubkey: _stranger)),
-          isA<FeedKeep>());
+      expect(
+        run(_post('hello from a new account', pubkey: _stranger)),
+        isA<FeedKeep>(),
+      );
     });
 
     test('drops are counted by reason for the telemetry line', () {
@@ -201,7 +236,11 @@ void main() {
       final stats = f.drainStats();
       expect(stats['linkOnly'], 1);
       expect(stats['empty'], 1);
-      expect(f.drainStats()['linkOnly'], isNull, reason: 'counters reset on read');
+      expect(
+        f.drainStats()['linkOnly'],
+        isNull,
+        reason: 'counters reset on read',
+      );
     });
   });
 }

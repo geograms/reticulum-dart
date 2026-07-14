@@ -65,7 +65,8 @@ class NostrClient {
   SendPort? _toEngine;
   final ReceivePort _fromEngine = ReceivePort();
   bool _ready = false;
-  final List<Map<String, dynamic>> _preReady = []; // commands queued pre-handshake
+  final List<Map<String, dynamic>> _preReady =
+      []; // commands queued pre-handshake
 
   int _subSeq = 0;
 
@@ -77,8 +78,10 @@ class NostrClient {
   /// so this is how the host attributes its CPU. Reset each engine push.
   Map<String, int> _eventStats = const {};
   Map<String, int> get eventStats => _eventStats;
-  final Map<String, List<Map<String, dynamic>>> _subEvents = {}; // subId → queue
-  final Map<String, (int, int, bool)> _stats = {}; // eventId → (likes,replies,mine)
+  final Map<String, List<Map<String, dynamic>>> _subEvents =
+      {}; // subId → queue
+  final Map<String, (int, int, bool)> _stats =
+      {}; // eventId → (likes,replies,mine)
   // eventId → (upvotes, downvotes, myVote ∈ {-1,0,1}). NIP-25 puts the verdict
   // in the reaction's content: "-" is a downvote, anything else is a like.
   final Map<String, (int, int, int)> _votes = {};
@@ -100,10 +103,13 @@ class NostrClient {
     if (pub.length != 64) return;
     _send({'cmd': 'selfPub', 'pub': pub});
   }
+
   final Set<String> _likedLocally = {}; // ids we've liked (keep them filled)
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
-  final Map<String, Map<String, String>> _profByShort12 = {}; // pub[:12] → profile
-  final Map<String, List<Map<String, dynamic>>> _replies = {}; // postId → replies
+  final Map<String, Map<String, String>> _profByShort12 =
+      {}; // pub[:12] → profile
+  final Map<String, List<Map<String, dynamic>>> _replies =
+      {}; // postId → replies
   List<String> _myFollows = const []; // my kind-3 contact list (hex pubkeys)
   static const int _subQueueMax = 800;
 
@@ -246,23 +252,28 @@ class NostrClient {
             .map((e) => (e as Map).cast<String, dynamic>())
             .toList();
       case 'event':
-        _events['${msg['id']}'] =
-            (msg['event'] as Map).cast<String, dynamic>();
+        _events['${msg['id']}'] = (msg['event'] as Map).cast<String, dynamic>();
       case 'replies':
-        _replies['${msg['id']}'] =
-            (msg['events'] as List).cast<Map<String, dynamic>>();
+        _replies['${msg['id']}'] = (msg['events'] as List)
+            .cast<Map<String, dynamic>>();
       case 'myFollows':
         _myFollows = (msg['pubs'] as List).cast<String>();
       case 'verified':
         final c = _verifyWaiters.remove('${msg['req']}');
         c?.complete((msg['events'] as List).cast<Map<String, dynamic>>());
         return; // not a UI-visible change
+      case 'refreshBurstDone':
+        final c = _refreshWaiters.remove('${msg['req']}');
+        c?.complete((msg['count'] as int?) ?? 0);
+        return;
     }
     onChanged?.call();
   }
 
   int _verifySeq = 0;
   final Map<String, Completer<List<Map<String, dynamic>>>> _verifyWaiters = {};
+  int _refreshSeq = 0;
+  final Map<String, Completer<int>> _refreshWaiters = {};
 
   /// Verify a batch of events **on the engine isolate** and return the ones
   /// whose signatures hold.
@@ -280,10 +291,13 @@ class NostrClient {
     final c = Completer<List<Map<String, dynamic>>>();
     _verifyWaiters[req] = c;
     _send({'cmd': 'verify', 'req': req, 'events': events});
-    return c.future.timeout(timeout, onTimeout: () {
-      _verifyWaiters.remove(req);
-      return const [];
-    });
+    return c.future.timeout(
+      timeout,
+      onTimeout: () {
+        _verifyWaiters.remove(req);
+        return const [];
+      },
+    );
   }
 
   bool get ready => _ready;
@@ -299,7 +313,12 @@ class NostrClient {
     // Optimistic: show it immediately as connecting.
     _relays = [
       ..._relays,
-      {'uri': u, 'scheme': _schemeOf(u), 'enabled': true, 'status': 'connecting'}
+      {
+        'uri': u,
+        'scheme': _schemeOf(u),
+        'enabled': true,
+        'status': 'connecting',
+      },
     ];
     return true;
   }
@@ -311,9 +330,12 @@ class NostrClient {
     return true;
   }
 
-  static String _schemeOf(String u) => u.startsWith('wss://') || u.startsWith('ws://')
+  static String _schemeOf(String u) =>
+      u.startsWith('wss://') || u.startsWith('ws://')
       ? 'websocket'
-      : (u.startsWith('rns://') ? 'reticulum' : (u == 'local' ? 'local' : 'unknown'));
+      : (u.startsWith('rns://')
+            ? 'reticulum'
+            : (u == 'local' ? 'local' : 'unknown'));
 
   // ── Subscriptions ─────────────────────────────────────────────────────────
   String subscribe(List<NostrFilter> filters) {
@@ -357,6 +379,25 @@ class NostrClient {
   /// Authors the user muted — never shown, whatever they post.
   void setMutedAuthors(Iterable<String> pubs) =>
       _send({'cmd': 'muted', 'pubs': pubs.toList()});
+
+  /// Pull-to-refresh: fetch, rank and hand the feed up to [n] new posts.
+  Future<int> refreshBurst({int n = 100}) {
+    final req = 'r${_refreshSeq++}';
+    final completer = Completer<int>();
+    _refreshWaiters[req] = completer;
+    _send({'cmd': 'refreshBurst', 'req': req, 'n': n});
+    return completer.future.timeout(
+      const Duration(seconds: 25),
+      onTimeout: () {
+        _refreshWaiters.remove(req);
+        return 0;
+      },
+    );
+  }
+
+  /// App resumed / user pulled to refresh: recover zombie sockets and refetch
+  /// the missed window.
+  void resumeNetwork() => _send({'cmd': 'resume'});
 
   /// Firehose accounting: kept / pending / expired, plus a count per drop
   /// reason. Empty until the first firehose subscription exists.
@@ -518,16 +559,24 @@ class _Engine {
   bool _myFollowsSub = false; // subscribed my kind-3 yet
   Set<String>? _myFollowsSent; // last contact-list set sent to main
   Timer? _timer;
+  int _tickN = 0;
+  int _healthTick = 0;
   bool _ok = false;
 
-  _Engine(this.toMain, String storePath, String? persistPath, this.selfPub,
-      {String? dbKeyHex}) {
+  _Engine(
+    this.toMain,
+    String storePath,
+    String? persistPath,
+    this.selfPub, {
+    String? dbKeyHex,
+  }) {
     try {
       _store = RelayEventStore.open(storePath, keyHex: dbKeyHex);
       _hub = NostrRelayHub(
         store: NostrStore.of(_store),
         persistPath: persistPath,
-        rnsClientFactory: null, // RNS lives on the main isolate; wss + local here
+        rnsClientFactory:
+            null, // RNS lives on the main isolate; wss + local here
         // Relay connects, drops and refusals go to the host log. Without this
         // a feed that never fills is indistinguishable from a feed with
         // nothing in it.
@@ -545,7 +594,10 @@ class _Engine {
       _hub.init();
       _ok = true;
       _sendStoredProfiles(); // hydrate the UI's profile index from disk
-      _timer = Timer.periodic(const Duration(milliseconds: 400), (_) => _tick());
+      _timer = Timer.periodic(
+        const Duration(milliseconds: 400),
+        (_) => _tick(),
+      );
     } catch (e) {
       // A dead engine used to be SILENT — no relay ever connected and the feed
       // was simply empty forever, with nothing in the log to say why. Say it.
@@ -592,29 +644,43 @@ class _Engine {
         case 'discovery':
           final subId = '${c['subId']}';
           _drainSubs.add(subId);
-          _hub.subscribeDiscoveryWithId(subId,
-              minLikes: (c['minLikes'] as int?) ?? 2);
+          _hub.subscribeDiscoveryWithId(
+            subId,
+            minLikes: (c['minLikes'] as int?) ?? 2,
+          );
         case 'firehose':
           final subId = '${c['subId']}';
           _drainSubs.add(subId);
-          _hub.subscribeFirehoseWithId(subId,
-              requireProfile: c['requireProfile'] != false);
+          _hub.subscribeFirehoseWithId(
+            subId,
+            requireProfile: c['requireProfile'] != false,
+          );
         case 'trusted':
           // Self + everyone we follow. They bypass the firehose quality gate —
           // you do not vet someone you chose to follow.
-          _hub.trustedAuthors = {
-            for (final p in (c['pubs'] as List)) '$p',
-          };
+          _hub.trustedAuthors = {for (final p in (c['pubs'] as List)) '$p'};
         case 'muted':
-          _hub.mutedAuthors = {
-            for (final p in (c['pubs'] as List)) '$p',
-          };
+          _hub.mutedAuthors = {for (final p in (c['pubs'] as List)) '$p'};
+        case 'refreshBurst':
+          final req = '${c['req']}';
+          unawaited(
+            _hub.refreshBurst(n: (c['n'] as int?) ?? 100).then((count) {
+              toMain.send({
+                'snap': 'refreshBurstDone',
+                'req': req,
+                'count': count,
+              });
+            }),
+          );
+        case 'resume':
+          _hub.resumeNetwork();
         case 'unsubscribe':
           _drainSubs.remove('${c['subId']}');
           _hub.unsubscribe('${c['subId']}');
         case 'publish':
-          _hub.publish(NostrEvent.fromJson(
-              (c['event'] as Map).cast<String, dynamic>()));
+          _hub.publish(
+            NostrEvent.fromJson((c['event'] as Map).cast<String, dynamic>()),
+          );
         case 'trackStats':
           _hub.trackStats((c['ids'] as List).cast<String>());
         case 'recordReaction':
@@ -670,10 +736,10 @@ class _Engine {
   }
 
   List<NostrFilter> _filters(dynamic raw) => [
-        if (raw is List)
-          for (final f in raw)
-            if (f is Map) NostrFilter.fromJson(f.cast<String, dynamic>())
-      ];
+    if (raw is List)
+      for (final f in raw)
+        if (f is Map) NostrFilter.fromJson(f.cast<String, dynamic>()),
+  ];
 
   /// The NOSTR way to know who I follow: subscribe my own kind-3 contact list
   /// from the relays, parse its p-tags, and push the pubkeys to the main isolate
@@ -693,14 +759,17 @@ class _Engine {
     if (me == null || me.length != 64) return;
     if (!_myFollowsSub) {
       _myFollowsSub = true;
-      _hub.subscribeWithId(
-          'myfollows', [NostrFilter(kinds: const [3], authors: [me])]);
+      _hub.subscribeWithId('myfollows', [
+        NostrFilter(kinds: const [3], authors: [me]),
+      ]);
     }
     if (!_myFollowsDirty) return; // nothing new since we last parsed
     _myFollowsDirty = false;
 
     NostrEvent? latest;
-    for (final e in _store.query(NostrFilter(kinds: const [3], authors: [me]))) {
+    for (final e in _store.query(
+      NostrFilter(kinds: const [3], authors: [me]),
+    )) {
       if (latest == null || e.createdAt > latest.createdAt) latest = e;
     }
     if (latest == null) return;
@@ -724,8 +793,11 @@ class _Engine {
   }
 
   void _tick() {
-    // Relay statuses.
-    toMain.send({'snap': 'relays', 'json': _hub.relaysJson()});
+    _tickN++;
+    // Relay statuses change on the order of seconds, not 400ms.
+    if (_tickN % 5 == 0) {
+      toMain.send({'snap': 'relays', 'json': _hub.relaysJson()});
+    }
 
     _syncMyFollows();
 
@@ -742,7 +814,14 @@ class _Engine {
 
     // Notifications, straight from the store — they outlive the process and the
     // network, which is the whole reason they are stored.
-    if (selfPub != null) {
+    //
+    // EVERY 10 SECONDS, NOT EVERY TICK. This is a sqlite tag-join over the whole
+    // events table, and at 400ms it owned the isolate's event loop: the relay
+    // sockets live on this isolate, their handshakes and frames never got a turn,
+    // and every websocket sat "connected" delivering nothing while a raw probe
+    // on the main isolate streamed happily. The feed starved on a query whose
+    // answer nobody needs faster than once in ten seconds.
+    if (selfPub != null && _tickN % 25 == 0) {
       final notifs = _hub.myNotifications(limit: 100);
       final sig = notifs.isEmpty ? '' : '${notifs.length}:${notifs.first.id}';
       if (sig != _notifSig) {
@@ -773,6 +852,15 @@ class _Engine {
 
     // What the quality gate kept, held and dropped, by reason. Without this,
     // "the All tab looks empty" is unanswerable except by guesswork.
+    // Compute it ONLY when we are about to log it: relayHealth() drains the
+    // frame counters, so calling it every 400ms tick and printing every 30th
+    // reported the last 400ms and always said zero. The reporter must not eat
+    // the evidence it is reporting.
+    if (_healthTick++ % 75 == 0) {
+      final health = _hub.relayHealth();
+      if (health.isNotEmpty) toMain.send({'log': 'relays: $health'});
+    }
+
     final fh = _hub.drainFirehoseStats();
     if (fh.values.any((v) => v > 0)) {
       toMain.send({'snap': 'fhstats', 'stats': fh});
@@ -840,7 +928,7 @@ class _Engine {
           'pubkey': e.pubkey,
           'content': e.content,
           'ts': e.createdAt,
-        }
+        },
     ];
     toMain.send({'snap': 'replies', 'id': postId, 'events': out});
   }

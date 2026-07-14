@@ -34,12 +34,11 @@ class _FakeStore implements NostrStore {
 
   @override
   List<String> replyIdsFor(String eventId) => [
-        for (final e in byId.values)
-          if (e.kind == 1 &&
-              e.tags
-                  .any((t) => t.length >= 2 && t[0] == 'e' && t[1] == eventId))
-            e.id!,
-      ];
+    for (final e in byId.values)
+      if (e.kind == 1 &&
+          e.tags.any((t) => t.length >= 2 && t[0] == 'e' && t[1] == eventId))
+        e.id!,
+  ];
 }
 
 class _FakeClient implements NostrRelayClient {
@@ -67,6 +66,10 @@ class _FakeClient implements NostrRelayClient {
   void subscribe(String subId, List<NostrFilter> filters) =>
       subscribed.add(subId);
   @override
+  int drainFrames() => 0;
+  @override
+  void resume() {}
+  @override
   void reconnect() {}
 
   @override
@@ -84,14 +87,19 @@ class _FakeClient implements NostrRelayClient {
   void inject(String subId, NostrEvent e) => onEvent?.call(subId, e);
 }
 
-NostrEvent _signed(NostrKeyPair kp,
-    {int kind = 1, String content = 'hi', int at = 1700000000}) {
+NostrEvent _signed(
+  NostrKeyPair kp, {
+  int kind = 1,
+  String content = 'hi',
+  int at = 1700000000,
+}) {
   final e = NostrEvent(
-      pubkey: kp.publicKeyHex,
-      createdAt: at,
-      kind: kind,
-      tags: const [],
-      content: content);
+    pubkey: kp.publicKeyHex,
+    createdAt: at,
+    kind: kind,
+    tags: const [],
+    content: content,
+  );
   e.sign(kp.privateKeyHex);
   return e;
 }
@@ -108,8 +116,9 @@ void main() {
     store = _FakeStore();
     // Seed the list with local + one rns relay so init() does NOT pull the
     // wss:// defaults (which would open real sockets).
-    File(persist).writeAsStringSync(
-        '[{"uri":"local"},{"uri":"rns://${'a' * 64}"}]');
+    File(
+      persist,
+    ).writeAsStringSync('[{"uri":"local"},{"uri":"rns://${'a' * 64}"}]');
   });
 
   tearDown(() {
@@ -137,43 +146,51 @@ void main() {
     await hub.close();
   });
 
-  test('subscribe answers from local store AND fans to the rns transport',
-      () async {
-    final backlog = _signed(kp, content: 'stored', at: 1700000001);
-    store.put(backlog);
-    final fake = _FakeClient('rns://${'a' * 64}');
-    final hub = _hub(fake);
-    await hub.init();
+  test(
+    'subscribe answers from local store AND fans to the rns transport',
+    () async {
+      final backlog = _signed(kp, content: 'stored', at: 1700000001);
+      store.put(backlog);
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = _hub(fake);
+      await hub.init();
 
-    final sub = hub.subscribe([NostrFilter(authors: [kp.publicKeyHex])]);
-    // Local backlog reached the wapp inbox synchronously.
-    final drained = hub.drainEvents(sub);
-    expect(drained.map((e) => e['content']), contains('stored'));
-    // The rns transport got the same subscription.
-    expect(fake.subscribed, contains(sub));
-    await hub.close();
-  });
+      final sub = hub.subscribe([
+        NostrFilter(authors: [kp.publicKeyHex]),
+      ]);
+      // Local backlog reached the wapp inbox synchronously.
+      final drained = hub.drainEvents(sub);
+      expect(drained.map((e) => e['content']), contains('stored'));
+      // The rns transport got the same subscription.
+      expect(fake.subscribed, contains(sub));
+      await hub.close();
+    },
+  );
 
-  test('an inbound event merges into the store and buffers once per sub',
-      () async {
-    final fake = _FakeClient('rns://${'a' * 64}');
-    final stored = <NostrEvent>[];
-    final hub = _hub(fake, onStored: stored.add);
-    await hub.init();
-    final sub = hub.subscribe([const NostrFilter(kinds: [1])]);
-    hub.drainEvents(sub); // clear any local backlog
+  test(
+    'an inbound event merges into the store and buffers once per sub',
+    () async {
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final stored = <NostrEvent>[];
+      final hub = _hub(fake, onStored: stored.add);
+      await hub.init();
+      final sub = hub.subscribe([
+        const NostrFilter(kinds: [1]),
+      ]);
+      hub.drainEvents(sub); // clear any local backlog
 
-    final e = _signed(kp, content: 'live', at: 1700000002);
-    fake.inject(sub, e);
-    fake.inject(sub, e); // duplicate from another relay → delivered once
+      final e = _signed(kp, content: 'live', at: 1700000002);
+      fake.inject(sub, e);
+      fake.inject(sub, e); // duplicate from another relay → delivered once
 
-    expect(store.query(NostrFilter(ids: [e.id!])).length, 1);
-    expect(stored.where((s) => s.id == e.id).length, 1);
-    final drained = hub.drainEvents(sub);
-    expect(drained.length, 1);
-    expect(drained.single['content'], 'live');
-    await hub.close();
-  });
+      expect(store.query(NostrFilter(ids: [e.id!])).length, 1);
+      expect(stored.where((s) => s.id == e.id).length, 1);
+      final drained = hub.drainEvents(sub);
+      expect(drained.length, 1);
+      expect(drained.single['content'], 'live');
+      await hub.close();
+    },
+  );
 
   test('publish writes to the store and fans to the transport', () async {
     final fake = _FakeClient('rns://${'a' * 64}');
@@ -197,33 +214,82 @@ void main() {
     expect(File(persist).readAsStringSync(), contains('relay.example.com'));
 
     expect(hub.removeRelay('wss://relay.example.com'), true);
-    expect(File(persist).readAsStringSync(), isNot(contains('relay.example.com')));
+    expect(
+      File(persist).readAsStringSync(),
+      isNot(contains('relay.example.com')),
+    );
     await hub.close();
   });
 
   // ── The live firehose (the "All" tab) ─────────────────────────────────────
 
-  test('the firehose delivers a fresh post immediately — no likes required',
-      () async {
-    final fake = _FakeClient('rns://${'a' * 64}');
-    final hub = _hub(fake);
-    await hub.init();
+  test(
+    'the firehose delivers a fresh post immediately — no likes required',
+    () async {
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = _hub(fake);
+      await hub.init();
 
-    final sub = hub.subscribeFirehose(requireProfile: false);
-    final relaySub = fake.subscribed.last;
+      final sub = hub.subscribeFirehose(requireProfile: false);
+      final relaySub = fake.subscribed.last;
 
-    fake.inject(relaySub, _signed(kp, content: 'a post nobody has liked yet'));
-    hub.debugCurateNow(); // strangers are ranked, then handed over
+      fake.inject(
+        relaySub,
+        _signed(kp, content: 'a post nobody has liked yet'),
+      );
+      hub.debugCurateNow(); // strangers are ranked, then handed over
 
-    expect(hub.drainEvents(sub).map((e) => e['content']),
+      expect(
+        hub.drainEvents(sub).map((e) => e['content']),
         ['a post nobody has liked yet'],
-        reason: 'this is the whole point: discovery can only show posts old '
-            'enough to have gathered likes, so it can never be the All tab');
-    await hub.close();
-  });
+        reason:
+            'this is the whole point: discovery can only show posts old '
+            'enough to have gathered likes, so it can never be the All tab',
+      );
+      await hub.close();
+    },
+  );
 
-  test('a relay burst bigger than the rate cap still reaches the feed',
-      () async {
+  test(
+    'manual refresh completes with one generation-tagged append batch',
+    () async {
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = NostrRelayHub(
+        store: store,
+        persistPath: persist,
+        defaultRelays: const [],
+        rnsClientFactory: (_) => fake,
+        firehoseOpeningDelay: const Duration(days: 1),
+        firehoseSettleDelay: Duration.zero,
+      );
+      await hub.init();
+
+      final sub = hub.subscribeFirehose(requireProfile: false);
+      final relaySub = fake.subscribed.last;
+      for (var i = 0; i < 3; i++) {
+        final author = NostrCrypto.generateKeyPair();
+        fake.inject(
+          relaySub,
+          _signed(
+            author,
+            content: 'manual refresh candidate number $i has useful context',
+            at: 1700000100 + i,
+          ),
+        );
+      }
+
+      expect(await hub.refreshBurst(n: 100), 3);
+      final batch = hub.drainEvents(sub, max: 100);
+      expect(batch, hasLength(3));
+      expect(batch.map((e) => e['_geogram_batch_mode']).toSet(), {'manual'});
+      expect(batch.map((e) => e['_geogram_batch']).toSet(), hasLength(1));
+      expect(batch.map((e) => e['_geogram_batch_size']).toSet(), {3});
+      expect(batch.map((e) => e['_geogram_batch_index']), [0, 1, 2]);
+      await hub.close();
+    },
+  );
+
+  test('a relay burst bigger than the rate cap still reaches the feed', () async {
     // A relay answers a fresh kind-1 subscription with its recent window in one
     // go — hundreds of events, instantly, from every relay at once. The generic
     // rate cap (15 per 250ms) used to run FIRST and threw that burst away before
@@ -241,45 +307,65 @@ void main() {
     const burst = 40; // >> the 15-per-window cap
     for (var i = 0; i < burst; i++) {
       final author = NostrCrypto.generateKeyPair();
-      fake.inject(relaySub,
-          _signed(author, content: 'post number $i', at: 1700000000 + i));
+      fake.inject(
+        relaySub,
+        _signed(
+          author,
+          content: 'relay burst post number $i has useful context',
+          at: 1700000000 + i,
+        ),
+      );
     }
 
     // The curator hands the feed a handful at a time — flush until it is empty.
     for (var i = 0; i < 30; i++) {
       if (hub.debugCurateNow() == 0) break;
     }
-    expect(hub.drainEvents(sub, max: burst * 2), hasLength(burst),
-        reason: 'the gate decides what the feed shows, not a cap sized for '
-            'sqlite writes on a thread the hub no longer runs on');
+    expect(
+      hub.drainEvents(sub, max: burst * 2),
+      hasLength(burst),
+      reason:
+          'the gate decides what the feed shows, not a cap sized for '
+          'sqlite writes on a thread the hub no longer runs on',
+    );
     await hub.close();
   });
 
-  test('a muted author is refused by the gate — by the 12-char key the feed shows',
-      () async {
-    // The user mutes what they can see, and what they can see on a post is the
-    // first 12 hex chars of the author's key. The host keys it upper-case; the
-    // wire is lower-case. Both must hit.
-    final spammer = NostrCrypto.generateKeyPair();
-    final fake = _FakeClient('rns://${'a' * 64}');
-    final hub = _hub(fake);
-    await hub.init();
-    hub.mutedAuthors = {spammer.publicKeyHex.substring(0, 12).toUpperCase()};
+  test(
+    'a muted author is refused by the gate — by the 12-char key the feed shows',
+    () async {
+      // The user mutes what they can see, and what they can see on a post is the
+      // first 12 hex chars of the author's key. The host keys it upper-case; the
+      // wire is lower-case. Both must hit.
+      final spammer = NostrCrypto.generateKeyPair();
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = _hub(fake);
+      await hub.init();
+      hub.mutedAuthors = {spammer.publicKeyHex.substring(0, 12).toUpperCase()};
 
-    final sub = hub.subscribeFirehose(requireProfile: false);
-    final relaySub = fake.subscribed.last;
+      final sub = hub.subscribeFirehose(requireProfile: false);
+      final relaySub = fake.subscribed.last;
 
-    fake.inject(relaySub, _signed(spammer, content: 'buy my coin, scumbag'));
-    fake.inject(relaySub, _signed(kp, content: 'a real post'));
-    hub.debugCurateNow();
+      fake.inject(relaySub, _signed(spammer, content: 'buy my coin, scumbag'));
+      const kept = 'a real post with enough detail to curate';
+      fake.inject(relaySub, _signed(kp, content: kept));
+      hub.debugCurateNow();
 
-    expect(hub.drainEvents(sub).map((e) => e['content']), ['a real post'],
-        reason: 'a mute is a refusal to CARRY, not a place to hide a post '
-            'we stored anyway');
-    expect(store.query(NostrFilter(authors: [spammer.publicKeyHex])), isEmpty,
-        reason: 'the muted post must never reach the store');
-    await hub.close();
-  });
+      expect(
+        hub.drainEvents(sub).map((e) => e['content']),
+        [kept],
+        reason:
+            'a mute is a refusal to CARRY, not a place to hide a post '
+            'we stored anyway',
+      );
+      expect(
+        store.query(NostrFilter(authors: [spammer.publicKeyHex])),
+        isEmpty,
+        reason: 'the muted post must never reach the store',
+      );
+      await hub.close();
+    },
+  );
 
   test('the firehose drops spam before it is ever stored', () async {
     final fake = _FakeClient('rns://${'a' * 64}');
@@ -290,46 +376,66 @@ void main() {
     final relaySub = fake.subscribed.last;
 
     fake.inject(
-        relaySub,
-        _signed(kp,
-            content: 'https://spam.example/a https://spam.example/b',
-            at: 1700000002));
+      relaySub,
+      _signed(
+        kp,
+        content: 'https://spam.example/a https://spam.example/b',
+        at: 1700000002,
+      ),
+    );
 
     expect(hub.drainEvents(sub), isEmpty);
-    expect(store.byId.values.any((e) => e.content.startsWith('https://spam')),
-        isFalse,
-        reason: 'a public firehose must not write junk into sqlite all day');
+    expect(
+      store.byId.values.any((e) => e.content.startsWith('https://spam')),
+      isFalse,
+      reason: 'a public firehose must not write junk into sqlite all day',
+    );
     await hub.close();
   });
 
-  test('a post from an unknown author waits for their profile, then appears',
-      () async {
-    final fake = _FakeClient('rns://${'a' * 64}');
-    final hub = _hub(fake);
-    await hub.init();
+  test(
+    'a post from an unknown author waits for their profile, then appears',
+    () async {
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = _hub(fake);
+      await hub.init();
 
-    // Strict: the author must have a kind-0 we have seen.
-    final sub = hub.subscribeFirehose();
-    final relaySub = fake.subscribed.last;
+      // Strict: the author must have a kind-0 we have seen.
+      final sub = hub.subscribeFirehose();
+      final relaySub = fake.subscribed.last;
 
-    final author = NostrCrypto.generateKeyPair();
-    fake.inject(relaySub,
-        _signed(author, content: 'hello, I am new here', at: 1700000003));
-
-    expect(hub.drainEvents(sub), isEmpty, reason: 'held, pending their profile');
-
-    // Their kind-0 arrives on the same subscription (which is why the firehose
-    // asks for kind-0 alongside kind-1).
-    fake.inject(
+      final author = NostrCrypto.generateKeyPair();
+      fake.inject(
         relaySub,
-        _signed(author,
-            kind: 0, content: '{"name":"newbie"}', at: 1700000004));
+        _signed(
+          author,
+          content: 'hello, I am new here and learning how this works',
+          at: 1700000003,
+        ),
+      );
 
-    expect(hub.drainEvents(sub).map((e) => e['content']),
-        contains('hello, I am new here'),
-        reason: 'a new account is not a spammer — their profile was in flight');
-    await hub.close();
-  });
+      expect(
+        hub.drainEvents(sub),
+        isEmpty,
+        reason: 'held, pending their profile',
+      );
+
+      // Their kind-0 arrives on the same subscription (which is why the firehose
+      // asks for kind-0 alongside kind-1).
+      fake.inject(
+        relaySub,
+        _signed(author, kind: 0, content: '{"name":"newbie"}', at: 1700000004),
+      );
+      hub.debugCurateNow();
+
+      expect(
+        hub.drainEvents(sub).map((e) => e['content']),
+        contains('hello, I am new here and learning how this works'),
+        reason: 'a new account is not a spammer — their profile was in flight',
+      );
+      await hub.close();
+    },
+  );
 
   // ── The two discovery bugs ────────────────────────────────────────────────
 
@@ -355,7 +461,7 @@ void main() {
       createdAt: 1700000006,
       kind: 7,
       tags: [
-        ['e', post.id!]
+        ['e', post.id!],
       ],
       content: '+',
     )..sign(liker.privateKeyHex);
@@ -363,41 +469,49 @@ void main() {
     fake.inject('anySub', post);
 
     expect(hub.drainEvents(hero).map((e) => e['content']), ['a popular post']);
-    expect(hub.drainEvents(wapp).map((e) => e['content']), ['a popular post'],
-        reason: 'whoever subscribed SECOND must not get a dead id');
+    expect(
+      hub.drainEvents(wapp).map((e) => e['content']),
+      ['a popular post'],
+      reason: 'whoever subscribed SECOND must not get a dead id',
+    );
     await hub.close();
   });
 
-  test('unsubscribe then re-subscribe still delivers (pull-to-refresh)',
-      () async {
-    final fake = _FakeClient('rns://${'a' * 64}');
-    final hub = _hub(fake);
-    await hub.init();
+  test(
+    'unsubscribe then re-subscribe still delivers (pull-to-refresh)',
+    () async {
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = _hub(fake);
+      await hub.init();
 
-    final first = hub.subscribeDiscovery(minLikes: 1);
-    hub.unsubscribe(first); // what pull-to-refresh does
+      final first = hub.subscribeDiscovery(minLikes: 1);
+      hub.unsubscribe(first); // what pull-to-refresh does
 
-    final second = hub.subscribeDiscovery(minLikes: 1);
-    final reactSub = fake.subscribed.last;
+      final second = hub.subscribeDiscovery(minLikes: 1);
+      final reactSub = fake.subscribed.last;
 
-    final post = _signed(kp, content: 'after the refresh', at: 1700000007);
-    final liker = NostrCrypto.generateKeyPair();
-    final like = NostrEvent(
-      pubkey: liker.publicKeyHex,
-      createdAt: 1700000008,
-      kind: 7,
-      tags: [
-        ['e', post.id!]
-      ],
-      content: '+',
-    )..sign(liker.privateKeyHex);
-    fake.inject(reactSub, like);
-    fake.inject('anySub', post);
+      final post = _signed(kp, content: 'after the refresh', at: 1700000007);
+      final liker = NostrCrypto.generateKeyPair();
+      final like = NostrEvent(
+        pubkey: liker.publicKeyHex,
+        createdAt: 1700000008,
+        kind: 7,
+        tags: [
+          ['e', post.id!],
+        ],
+        content: '+',
+      )..sign(liker.privateKeyHex);
+      fake.inject(reactSub, like);
+      fake.inject('anySub', post);
 
-    expect(hub.drainEvents(second).map((e) => e['content']),
+      expect(
+        hub.drainEvents(second).map((e) => e['content']),
         ['after the refresh'],
-        reason: 'unsubscribe left _discoFeedSub pointing at the deleted inbox, '
-            'so refreshing the feed killed it for the life of the process');
-    await hub.close();
-  });
+        reason:
+            'unsubscribe left _discoFeedSub pointing at the deleted inbox, '
+            'so refreshing the feed killed it for the life of the process',
+      );
+      await hub.close();
+    },
+  );
 }

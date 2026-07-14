@@ -124,6 +124,9 @@ class NostrRelayHub {
   /// Injectable so a test can run the hub with no public relays (and therefore
   /// no real sockets).
   final List<String> defaultRelays;
+  final Duration pollInterval;
+  final Duration firehoseOpeningDelay;
+  final Duration firehoseSettleDelay;
 
   NostrRelayHub({
     required this.store,
@@ -132,6 +135,9 @@ class NostrRelayHub {
     this.onStored,
     this.log,
     this.defaultRelays = kDefaultNostrRelays,
+    this.pollInterval = kNostrPollInterval,
+    this.firehoseOpeningDelay = const Duration(seconds: 12),
+    this.firehoseSettleDelay = const Duration(seconds: 20),
   });
 
   // ── Relay list ────────────────────────────────────────────────────────────
@@ -205,7 +211,7 @@ class NostrRelayHub {
       return [
         for (final e in list)
           if (e is Map)
-            NostrRelayEndpoint.fromJson(e.map((k, v) => MapEntry('$k', v)))
+            NostrRelayEndpoint.fromJson(e.map((k, v) => MapEntry('$k', v))),
       ];
     } catch (e) {
       log?.call('relay list load failed: $e');
@@ -217,10 +223,12 @@ class NostrRelayHub {
     final p = persistPath;
     if (p == null) return;
     try {
-      File(p).writeAsStringSync(jsonEncode({
-        'relays': [for (final e in _endpoints.values) e.toJson()],
-        'offered': _offered.toList(),
-      }));
+      File(p).writeAsStringSync(
+        jsonEncode({
+          'relays': [for (final e in _endpoints.values) e.toJson()],
+          'offered': _offered.toList(),
+        }),
+      );
     } catch (e) {
       log?.call('relay list save failed: $e');
     }
@@ -228,15 +236,15 @@ class NostrRelayHub {
 
   /// Relay list + live status for the UI panel.
   List<Map<String, dynamic>> relaysJson() => [
-        for (final e in _endpoints.values)
-          {
-            'uri': e.uri,
-            'scheme': e.transport.name,
-            'enabled': e.enabled,
-            'status':
-                (_clients[e.uri]?.status ?? NostrRelayStatus.disconnected).name,
-          }
-      ];
+    for (final e in _endpoints.values)
+      {
+        'uri': e.uri,
+        'scheme': e.transport.name,
+        'enabled': e.enabled,
+        'status':
+            (_clients[e.uri]?.status ?? NostrRelayStatus.disconnected).name,
+      },
+  ];
 
   /// Turn a relay on or off without forgetting it. Off means: no subscriptions,
   /// no publishes, no connection — but it stays in the list, so a relay that is
@@ -263,7 +271,8 @@ class NostrRelayHub {
   /// Add a relay by URI. Returns false if the scheme is unknown or duplicate.
   bool addRelay(String uri) {
     final u = uri.trim();
-    if (u.isEmpty || nostrTransportOf(u) == NostrTransport.unknown) return false;
+    if (u.isEmpty || nostrTransportOf(u) == NostrTransport.unknown)
+      return false;
     if (_endpoints.containsKey(u)) return false;
     _endpoints[u] = NostrRelayEndpoint(u);
     _save();
@@ -306,13 +315,14 @@ class NostrRelayHub {
     // new posts" from "read its cache back to me and went dead" — the two look
     // identical otherwise, and the watchdog believed the second was the first.
     c.onEose = (subId) {
-      if (subId == _fireSub) _fireEoseMs = DateTime.now().millisecondsSinceEpoch;
+      if (subId == _fireSub)
+        _fireEoseMs = DateTime.now().millisecondsSinceEpoch;
     };
     c.onStatus = (_) {};
     // A refused subscription is not an error anywhere else in the stack: the
     // socket stays up and the events simply never come. Name it.
-    c.onClosed =
-        (subId, message) => log?.call('relay $uri refused $subId: $message');
+    c.onClosed = (subId, message) =>
+        log?.call('relay $uri refused $subId: $message');
     _clients[uri] = c;
     // ignore: discarded_futures
     c.connect();
@@ -343,6 +353,7 @@ class NostrRelayHub {
     _subFilters.remove(subId);
     _inbox.remove(subId);
     _seen.remove(subId);
+    _fireBatchMeta.remove(subId);
     for (final c in _clients.values) {
       c.unsubscribe(subId);
     }
@@ -427,7 +438,9 @@ class NostrRelayHub {
     // Internal reactions subscription — tallied, never drained by the wapp.
     final react = 'discoR${_subSeq++}';
     _discoReactSub = react;
-    final rf = [const NostrFilter(kinds: [7], limit: 500)];
+    final rf = [
+      const NostrFilter(kinds: [7], limit: 500),
+    ];
     _subFilters[react] = rf;
     _inbox[react] = Queue<NostrEvent>();
     _seen[react] = <String>{};
@@ -500,16 +513,27 @@ class NostrRelayHub {
   }
 
   String subscribeFirehose({bool requireProfile = true}) =>
-      subscribeFirehoseWithId('fire${_subSeq++}', requireProfile: requireProfile);
+      subscribeFirehoseWithId(
+        'fire${_subSeq++}',
+        requireProfile: requireProfile,
+      );
 
   String subscribeFirehoseWithId(String subId, {bool requireProfile = true}) {
     _fireSubscribers.add(subId);
     _inbox[subId] = Queue<NostrEvent>();
     _seen[subId] = <String>{};
+    _fireBatchMeta[subId] = <String, Map<String, dynamic>>{};
     _fireFilter ??= FirehoseFilter(requireProfile: requireProfile);
 
-    if (_fireSub != null) return subId; // relay subscription already open
+    if (_fireSub != null) {
+      // The launcher and Social hand the same firehose to each other. A second
+      // subscriber used to miss the only opening timer and drain zero forever.
+      resumeNetwork();
+      _scheduleOpeningBatch(subId, _fireLifecycle);
+      return subId;
+    }
 
+    final lifecycle = ++_fireLifecycle;
     _openFirehoseReq();
     // Watchdog. A relay caps how many subscriptions one connection may hold and
     // silently drops the excess — and we hold a lot of them (profiles, stats,
@@ -547,10 +571,12 @@ class NostrRelayHub {
       ];
       _fireSilentRounds++;
       final eosed = _fireEoseMs > 0 && _fireEoseMs >= _fireLastEventMs;
-      log?.call('firehose: no new events for '
-          '${(now - _fireLastEventMs) ~/ 1000}s '
-          '(connected: ${live.isEmpty ? "NONE" : live.join(", ")}'
-          '${eosed ? ", backlog ended" : ""})');
+      log?.call(
+        'firehose: no new events for '
+        '${(now - _fireLastEventMs) ~/ 1000}s '
+        '(connected: ${live.isEmpty ? "NONE" : live.join(", ")}'
+        '${eosed ? ", backlog ended" : ""})',
+      );
 
       // Only a genuinely dead relay gets cycled, and only after a long silence —
       // never as a reflex. Cycling is a big hammer: it drops the subscriptions
@@ -558,8 +584,10 @@ class NostrRelayHub {
       // is not.
       if (_fireSilentRounds >= 6) {
         _fireSilentRounds = 0;
-        log?.call('firehose: ${_fireSilenceMs * 6 ~/ 1000}s without a single new '
-            'event — cycling sockets');
+        log?.call(
+          'firehose: ${_fireSilenceMs * 6 ~/ 1000}s without a single new '
+          'event — cycling sockets',
+        );
         for (final uri in live) {
           _clients[uri]?.reconnect();
         }
@@ -569,28 +597,29 @@ class NostrRelayHub {
     // Ask for the held authors' profiles in one small batch, slowly. This is a
     // background chore, not a hot path: the posts are already held, and a REQ
     // storm is what got us dropped by the relays in the first place.
-    _fireProfTimer ??=
-        Timer.periodic(const Duration(seconds: 10), (_) => _firehoseProfileFetch());
+    _fireProfTimer ??= Timer.periodic(
+      const Duration(seconds: 10),
+      (_) => _firehoseProfileFetch(),
+    );
 
     // Show what the relays would not name. A held post whose kind-0 never comes
     // is DELIVERED once its hold expires — with a short-npub identity, which the
     // UI renders perfectly well. It used to be destroyed in silence, and on a
     // network where the relays are stingy with kind-0 that meant an empty All
     // tab and a pending queue frozen at 42 for twenty minutes.
-    // The feed advances at a human rate: the best few, every few seconds.
-    _curateTimer ??= Timer.periodic(
-        const Duration(seconds: FirehoseCurator.tickSeconds), (_) {
-      final now = DateTime.now().millisecondsSinceEpoch;
-      final out = _curator.take(now);
-      if (out.isNotEmpty || _curator.pending > 0) {
-        log?.call('curator: emitted ${out.length}, ${_curator.pending} ranked, '
-            '${_fireSubscribers.length} subscriber(s)');
-      }
-      for (final e in out) {
-        curatorDelivered++;
-        _deliverFirehose(e);
-      }
+    // THE FEED IS A POLL, NOT A STREAM. Every 10 minutes, while somebody is
+    // actually looking (subscribers exist): re-ask the firehose REQ — the
+    // `since` watermark makes it one cheap window, and a fresh REQ reliably
+    // returns the newest posts where waiting for live push on a phone does not —
+    // give the relays ~20s to answer and the gate + curator to rank, then hand
+    // the feed the best of the batch, newest-first.
+    _curateTimer ??= Timer.periodic(pollInterval, (_) {
+      if (_fireSubscribers.isEmpty || _fireSub == null) return;
+      unawaited(_requestFirehoseBatch(n: 100, mode: 'automatic'));
     });
+    // The opening batch: the subscribe itself pulled the newest window; give it
+    // a moment to be gated and ranked, then fill the tab at once.
+    _scheduleOpeningBatch(subId, lifecycle);
 
     _fireSweepTimer ??= Timer.periodic(const Duration(seconds: 15), (_) {
       final f = _fireFilter;
@@ -602,8 +631,10 @@ class NostrRelayHub {
       if (ripe.isNotEmpty || f.pendingNow > 0) {
         final age =
             f.oldestHoldAgeMs(DateTime.now().millisecondsSinceEpoch) ~/ 1000;
-        log?.call('firehose sweep: ripe=${ripe.length} still-held=${f.pendingNow} '
-            'oldest=${age}s subscribers=${_fireSubscribers.length}');
+        log?.call(
+          'firehose sweep: ripe=${ripe.length} still-held=${f.pendingNow} '
+          'oldest=${age}s subscribers=${_fireSubscribers.length}',
+        );
       }
       for (final e in ripe) {
         fireReleased++;
@@ -611,7 +642,11 @@ class NostrRelayHub {
           eventsStored++;
           onStored?.call(e);
         }
-        _deliverFirehose(e);
+        _curator.offer(
+          e,
+          _signalsFor(e),
+          DateTime.now().millisecondsSinceEpoch,
+        );
       }
     });
     return subId;
@@ -629,6 +664,8 @@ class NostrRelayHub {
   // The newest created_at we have accepted. The next REQ asks for `since` this,
   // so a re-open costs one round trip instead of 200 stale events per relay.
   int _fireNewestSec = 0;
+  int _fireOldestSec = 0;
+  int? _fireBackfillUntilSec;
   int _fireEoseMs = 0;
 
   // What actually happened, per window: new events vs redeliveries. Without this
@@ -690,7 +727,9 @@ class NostrRelayHub {
     for (final p in batch) {
       _profileAsked[p] = (_profileAsked[p] ?? 0) + 1;
       if (_profileAsked[p]! >= _profileMaxAttempts) {
-        _profileWanted.remove(p); // asked enough; the hold TTL will show it anyway
+        _profileWanted.remove(
+          p,
+        ); // asked enough; the hold TTL will show it anyway
       }
     }
     if (_profileAsked.length > 4000) {
@@ -699,7 +738,9 @@ class NostrRelayHub {
     if (batch.isEmpty) return;
 
     final sub = 'fireP${_subSeq++}';
-    final f = [NostrFilter(kinds: const [0], authors: batch)];
+    final f = [
+      NostrFilter(kinds: const [0], authors: batch),
+    ];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};
@@ -709,7 +750,7 @@ class NostrRelayHub {
     }
   }
 
-  void _openFirehoseReq() {
+  void _openFirehoseReq({int? until}) {
     final sub = 'fireR${_subSeq++}';
     _fireSub = sub;
     _fireLastEventMs = DateTime.now().millisecondsSinceEpoch;
@@ -719,11 +760,11 @@ class NostrRelayHub {
     // most recent 200 events at us on every single re-open, forever — the
     // backlog that inflated the flood rule and kept the watchdog convinced the
     // feed was alive. A small overlap (60s) covers clock skew between relays.
-    final since = _fireNewestSec > 0 ? _fireNewestSec - 60 : null;
+    final since = until == null && _fireNewestSec > 0
+        ? _fireNewestSec - 60
+        : null;
     final f = [
-      since == null
-          ? const NostrFilter(kinds: [0, 1], limit: 200)
-          : NostrFilter(kinds: const [0, 1], limit: 200, since: since)
+      NostrFilter(kinds: const [0, 1], limit: 200, since: since, until: until),
     ];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
@@ -731,6 +772,19 @@ class NostrRelayHub {
     for (final e in _endpoints.values) {
       if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
     }
+  }
+
+  void _scheduleOpeningBatch(String subId, int lifecycle) {
+    Timer(firehoseOpeningDelay, () {
+      if (!_fireSubscribers.contains(subId) || lifecycle != _fireLifecycle) {
+        return;
+      }
+      // Relay sockets may still be connecting when the opening timer fires.
+      // Re-ask and allow the same settle window as scheduled/manual refresh;
+      // taking the buffer once and returning zero left this subscriber empty
+      // forever when connection setup completed a moment later.
+      unawaited(_requestFirehoseBatch(n: 100, mode: 'opening'));
+    });
   }
 
   /// Hand the feed whatever the curator is holding, now. The timer does this on
@@ -764,6 +818,7 @@ class NostrRelayHub {
   }
 
   void _teardownFirehose() {
+    _fireLifecycle++;
     _fireWatchdog?.cancel();
     _fireWatchdog = null;
     _fireProfTimer?.cancel();
@@ -772,6 +827,7 @@ class NostrRelayHub {
     _fireSweepTimer = null;
     _curateTimer?.cancel();
     _curateTimer = null;
+    _fireBatchInFlight = false;
     // The REQ stops; the KNOWLEDGE stays. Nulling the filter here threw away
     // every held post and every author we were still waiting on a name for —
     // on every page close — so re-opening Social always started from nothing and
@@ -824,7 +880,9 @@ class NostrRelayHub {
         return true; // a redelivery: not new, not news, not proof of anything
       }
       while (_fireSeenIds.length > _fireSeenMax) {
-        _fireSeenIds.remove(_fireSeenIds.first); // oldest out, never a wholesale clear
+        _fireSeenIds.remove(
+          _fireSeenIds.first,
+        ); // oldest out, never a wholesale clear
       }
     }
 
@@ -837,6 +895,10 @@ class NostrRelayHub {
     // The watermark the next re-open asks from, so a reconnect does not drag the
     // same backlog back across the network.
     if (event.createdAt > _fireNewestSec) _fireNewestSec = event.createdAt;
+    if (event.kind == NostrEventKind.textNote &&
+        (_fireOldestSec == 0 || event.createdAt < _fireOldestSec)) {
+      _fireOldestSec = event.createdAt;
+    }
 
     final filter = _fireFilter;
     if (filter == null) return true;
@@ -916,13 +978,25 @@ class NostrRelayHub {
     if (filter == null) return;
     for (final held in filter.release(event.pubkey, nowMs)) {
       fireReleased++;
-      _deliverFirehose(held);
+      if (store.put(held)) {
+        eventsStored++;
+        onStored?.call(held);
+      }
+      _curator.offer(held, _signalsFor(held), nowMs);
+      _authorAccepted[held.pubkey] = (_authorAccepted[held.pubkey] ?? 0) + 1;
     }
   }
 
   final FirehoseCurator _curator = FirehoseCurator();
   final Map<String, int> _authorAccepted = {};
   Timer? _curateTimer;
+  int _fireBatchSeq = 0;
+  bool _fireBatchInFlight = false;
+  int _fireLifecycle = 0;
+
+  // Per subscriber/event metadata is attached only when the event leaves the
+  // engine isolate. NostrEvent remains protocol-pure and signature-safe.
+  final Map<String, Map<String, Map<String, dynamic>>> _fireBatchMeta = {};
 
   /// What this device already knows about a candidate post. No network calls:
   /// every one of these is a cache we filled on the way here.
@@ -964,6 +1038,144 @@ class NostrRelayHub {
     for (final sub in _fireSubscribers) {
       _bufferForSub(sub, event);
     }
+  }
+
+  void _deliverFirehoseBatch(List<NostrEvent> events, {required String mode}) {
+    if (events.isEmpty) return;
+    final generation = ++_fireBatchSeq;
+    for (var index = 0; index < events.length; index++) {
+      final event = events[index];
+      final id = event.id;
+      if (id == null) continue;
+      for (final sub in _fireSubscribers) {
+        _fireBatchMeta[sub]?[id] = {
+          '_geogram_batch': generation,
+          '_geogram_batch_mode': mode,
+          '_geogram_batch_index': index,
+          '_geogram_batch_size': events.length,
+        };
+      }
+      curatorDelivered++;
+      _deliverFirehose(event);
+    }
+  }
+
+  Future<int> _requestFirehoseBatch({
+    required int n,
+    required String mode,
+  }) async {
+    if (_fireSubscribers.isEmpty || _fireSub == null) {
+      return 0;
+    }
+    if (_fireBatchInFlight) {
+      if (mode != 'manual') return 0;
+      for (var i = 0; i < 250 && _fireBatchInFlight; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      if (_fireBatchInFlight) return 0;
+      return _requestFirehoseBatch(n: n, mode: mode);
+    }
+    _fireBatchInFlight = true;
+    final lifecycle = _fireLifecycle;
+    int? requestedUntil;
+    try {
+      if (mode == 'manual') {
+        final until =
+            _fireBackfillUntilSec ??
+            (_fireOldestSec > 0
+                ? _fireOldestSec - 1
+                : DateTime.now().millisecondsSinceEpoch ~/ 1000);
+        requestedUntil = until;
+        _closeFirehoseReq();
+        _openFirehoseReq(until: until);
+      } else {
+        resumeNetwork();
+      }
+      await Future<void>.delayed(firehoseSettleDelay);
+      if (_fireSubscribers.isEmpty || lifecycle != _fireLifecycle) return 0;
+      if (mode == 'manual') {
+        _fireBackfillUntilSec = _fireOldestSec > 0 ? _fireOldestSec - 1 : null;
+        _closeFirehoseReq();
+        _openFirehoseReq();
+      }
+      final out = _curator.takeBurst(n);
+      if (mode == 'manual' && out.length < n && requestedUntil != null) {
+        final have = {for (final event in out) event.id};
+        final stored = store.query(
+          NostrFilter(
+            kinds: const [NostrEventKind.textNote],
+            until: requestedUntil,
+            limit: n * 3,
+          ),
+        );
+        for (final event in stored) {
+          if (out.length >= n) break;
+          if (event.id == null || !have.add(event.id)) continue;
+          out.add(event);
+        }
+        if (out.isNotEmpty) {
+          var oldest = out.first.createdAt;
+          for (final event in out.skip(1)) {
+            if (event.createdAt < oldest) oldest = event.createdAt;
+          }
+          _fireBackfillUntilSec = oldest - 1;
+        }
+      }
+      _deliverFirehoseBatch(out, mode: mode);
+      log?.call(
+        'curator: $mode batch handed over ${out.length}, '
+        '${_curator.pending} still ranked',
+      );
+      return out.length;
+    } finally {
+      _fireBatchInFlight = false;
+    }
+  }
+
+  /// One line per report: what each relay is ACTUALLY doing. Status alone lies —
+  /// a socket can sit "connected" for twenty minutes and deliver nothing.
+  String relayHealth() {
+    final parts = <String>[];
+    for (final e in _endpoints.values) {
+      if (!e.enabled) continue;
+      final c = _clients[e.uri];
+      if (c == null) continue;
+      final host = e.uri.replaceFirst('wss://', '');
+      parts.add('$host=${c.status.name.substring(0, 4)}/${c.drainFrames()}');
+    }
+    return parts.join(' ');
+  }
+
+  /// The user is LOOKING NOW (app resumed, or pull-to-refresh). Recover every
+  /// zombie socket immediately, and re-issue the firehose REQ once, bounded by
+  /// the `since` watermark — one cheap fetch of whatever was missed while
+  /// Android had the sockets frozen. This is not the churn loop that got the
+  /// subscription dropped: it runs on a user gesture, not a timer.
+  void resumeNetwork() {
+    for (final e in _endpoints.values) {
+      if (!e.enabled) continue;
+      final c = _clients[e.uri];
+      if (c is NostrWsClient) c.resume();
+    }
+    if (_fireSub != null) {
+      _closeFirehoseReq();
+      _openFirehoseReq();
+    }
+    log?.call('resume: sockets checked, firehose re-asked since watermark');
+  }
+
+  /// A refresh: hand the feed the best [n] of what is ranked, right now.
+  ///
+  /// The user pulled the timeline down. That is a request for MORE, immediately —
+  /// not for the next two posts on the ten-second timer.
+  Future<int> refreshBurst({int n = 100}) async {
+    // A tab change and a pull gesture can arrive in adjacent frames. Give the
+    // wapp's activity_refresh command a short window to reopen its firehose
+    // subscriber instead of completing with zero before that command runs.
+    for (var i = 0; i < 50 && _fireSubscribers.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    return _requestFirehoseBatch(n: n, mode: 'manual');
   }
 
   /// Firehose accounting — what arrived, what was kept/held, and a count per
@@ -1047,7 +1259,9 @@ class NostrRelayHub {
       batch.add(_discoToFetch.removeAt(0));
     }
     final sub = 'discoF${_subSeq++}';
-    final f = [NostrFilter(ids: batch, kinds: const [1])];
+    final f = [
+      NostrFilter(ids: batch, kinds: const [1]),
+    ];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};
@@ -1088,8 +1302,10 @@ class NostrRelayHub {
     }
     // Bound the tally map: forget the least-liked once it grows too large.
     if (_discoLikers.length > 8000) {
-      final weak =
-          _discoLikers.entries.where((e) => e.value.length < 2).map((e) => e.key).take(2000);
+      final weak = _discoLikers.entries
+          .where((e) => e.value.length < 2)
+          .map((e) => e.key)
+          .take(2000);
       for (final k in weak.toList()) {
         _discoLikers.remove(k);
       }
@@ -1102,7 +1318,7 @@ class NostrRelayHub {
   // NIP-25 says the reaction's CONTENT carries the verdict: "-" is a downvote,
   // anything else ("+", "🤙", an emoji) is a like. Tallying only "did someone
   // react" cannot tell an upvote from a downvote, so keep the two apart.
-  final Map<String, Set<String>> _statUp = {};   // eventId → upvoter pubkeys
+  final Map<String, Set<String>> _statUp = {}; // eventId → upvoter pubkeys
   final Map<String, Set<String>> _statDown = {}; // eventId → downvoter pubkeys
   final Map<String, Set<String>> _statReply = {}; // eventId → reply event ids
   final List<String> _statTracked = []; // rolling set of ids we count for
@@ -1304,7 +1520,9 @@ class NostrRelayHub {
     }
     final sub = 'prof${_subSeq++}';
     _profSub = sub;
-    final f = [NostrFilter(kinds: const [0], authors: authors)];
+    final f = [
+      NostrFilter(kinds: const [0], authors: authors),
+    ];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};
@@ -1315,12 +1533,23 @@ class NostrRelayHub {
 
   /// Stored kind-1 replies to [postId] (events that #e it), oldest first.
   List<NostrEvent> repliesTo(String postId) {
-    final evs = store.query(NostrFilter(kinds: const [1], tags: {'e': [postId]}));
-    final out = evs
-        .where((e) => e.tags
-            .any((t) => t.length >= 2 && t[0] == 'e' && t[1] == postId))
-        .toList()
-      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final evs = store.query(
+      NostrFilter(
+        kinds: const [1],
+        tags: {
+          'e': [postId],
+        },
+      ),
+    );
+    final out =
+        evs
+            .where(
+              (e) => e.tags.any(
+                (t) => t.length >= 2 && t[0] == 'e' && t[1] == postId,
+              ),
+            )
+            .toList()
+          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
     return out;
   }
 
@@ -1341,7 +1570,9 @@ class NostrRelayHub {
   void fetchEvent(String id) {
     if (id.length != 64) return;
     final sub = 'ev${_subSeq++}';
-    final f = [NostrFilter(ids: [id], limit: 1)];
+    final f = [
+      NostrFilter(ids: [id], limit: 1),
+    ];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};
@@ -1359,12 +1590,19 @@ class NostrRelayHub {
   List<NostrEvent> myNotifications({int limit = 100}) {
     final me = selfPubkey;
     if (me == null) return const [];
-    final evs = store.query(NostrFilter(
-      kinds: const [1, 6, 7],
-      tags: {'p': [me]},
-      limit: limit,
-    ));
-    final out = [for (final e in evs) if (e.pubkey != me) e];
+    final evs = store.query(
+      NostrFilter(
+        kinds: const [1, 6, 7],
+        tags: {
+          'p': [me],
+        },
+        limit: limit,
+      ),
+    );
+    final out = [
+      for (final e in evs)
+        if (e.pubkey != me) e,
+    ];
     out.sort((a, b) => b.createdAt.compareTo(a.createdAt));
     return out;
   }
@@ -1383,7 +1621,8 @@ class NostrRelayHub {
   // does per second, so a public firehose is SAMPLED instead of flooding the
   // main thread. A followed/web-of-trust feed is low-volume and never trips it.
   static const int _rateWindowMs = 250;
-  static const int _rateMaxPerWindow = 15; // ~60 events/s ceiling (main-thread SQLite)
+  static const int _rateMaxPerWindow =
+      15; // ~60 events/s ceiling (main-thread SQLite)
   int _rateWindowStart = 0;
   int _rateCount = 0;
   int rateDropped = 0;
@@ -1519,7 +1758,6 @@ class NostrRelayHub {
       onStored?.call(event);
     }
 
-
     // A liked-enough post (fetched by id) goes to EVERY discovery subscriber.
     if (_discoSubscribers.isNotEmpty &&
         event.kind == NostrEventKind.textNote &&
@@ -1549,7 +1787,14 @@ class NostrRelayHub {
     if (inbox == null) return const [];
     final out = <Map<String, dynamic>>[];
     while (inbox.isNotEmpty && out.length < max) {
-      out.add(inbox.removeFirst().toJson());
+      final event = inbox.removeFirst();
+      final json = event.toJson();
+      final id = event.id;
+      if (id != null) {
+        final meta = _fireBatchMeta[subId]?.remove(id);
+        if (meta != null) json.addAll(meta);
+      }
+      out.add(json);
     }
     return out;
   }

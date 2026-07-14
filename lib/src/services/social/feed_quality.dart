@@ -63,6 +63,10 @@ class FeedPending extends FeedVerdict {
 
 final RegExp _url = RegExp(r'https?://\S+', caseSensitive: false);
 final RegExp _hashtag = RegExp(r'(?:^|\s)#[^\s#]+');
+final RegExp _sensitiveHashtag = RegExp(
+  r'(?:^|\s)#(?:nsfw|porn|xxx)(?:\b|_)',
+  caseSensitive: false,
+);
 final RegExp _mention = RegExp(r'nostr:[a-z0-9]+', caseSensitive: false);
 final RegExp _whitespace = RegExp(r'\s+');
 
@@ -70,6 +74,9 @@ final RegExp _whitespace = RegExp(r'\s+');
 FeedVerdict contentVerdict(String content) {
   final text = content.trim();
   if (text.length < 2) return const FeedReject(FeedDrop.empty);
+  if (_sensitiveHashtag.hasMatch(text)) {
+    return const FeedReject(FeedDrop.hashtagStuffing);
+  }
 
   final tags = _hashtag.allMatches(text).length;
   final withoutTags = text.replaceAll(_hashtag, ' ');
@@ -87,7 +94,7 @@ FeedVerdict contentVerdict(String content) {
   // clause needs prose to be short too — "#nostr #bitcoin" under a real
   // paragraph is normal, and must survive.
   final words = prose.isEmpty ? 0 : prose.split(' ').length;
-  if (tags > 5 && words < tags) {
+  if (tags >= 3 && words < tags) {
     return const FeedReject(FeedDrop.hashtagStuffing);
   }
 
@@ -348,7 +355,10 @@ class FirehoseFilter {
     _ripe.clear();
     final emptyAuthors = <String>[];
     for (final e in _pending.entries) {
-      final ripe = [for (final h in e.value) if (h.atMs < cutoff) h.event];
+      final ripe = [
+        for (final h in e.value)
+          if (h.atMs < cutoff) h.event,
+      ];
       if (ripe.isNotEmpty) {
         e.value.removeWhere((h) => h.atMs < cutoff);
         _pendingCount -= ripe.length;
@@ -372,7 +382,6 @@ class FirehoseFilter {
     pendingNow = _pendingCount;
     return out;
   }
-
 
   /// Counters for the telemetry line, reset on read.
   Map<String, int> drainStats() {

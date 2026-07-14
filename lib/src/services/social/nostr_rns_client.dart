@@ -117,6 +117,11 @@ class NostrRnsClient implements NostrRelayClient {
   }
 
   @override
+  int drainFrames() => 0;
+  @override
+  void resume() {}
+
+  @override
   void reconnect() {} // no socket to cycle
 
   @override

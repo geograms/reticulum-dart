@@ -8,6 +8,7 @@
  */
 import 'dart:async';
 
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../util/nostr_event.dart';
@@ -62,7 +63,21 @@ class NostrWsClient implements NostrRelayClient {
     }
     _setStatus(NostrRelayStatus.connecting);
     try {
-      final ch = WebSocketChannel.connect(Uri.parse(uri));
+      // KEEPALIVE. Without it the phone's connection to a relay goes one-way:
+      // the opening burst arrives, and then nothing — for twenty minutes — while
+      // the socket still reports "connected" and no error is ever raised. A
+      // carrier NAT (or any middlebox) drops the state for a flow that has been
+      // idle inbound, and neither end notices until somebody tries to write.
+      //
+      // The laptop, on a normal network, streams the same subscription happily;
+      // the phone does not. A ping every 20 seconds keeps the flow alive, and it
+      // is also how we learn quickly when it is truly dead — a ping that gets no
+      // pong closes the socket, which reconnects and re-subscribes.
+      final ch = IOWebSocketChannel.connect(
+        Uri.parse(uri),
+        pingInterval: const Duration(seconds: 20),
+        connectTimeout: const Duration(seconds: 12),
+      );
       _ch = ch;
       // ready throws on a failed handshake (bad TLS / unreachable host).
       await ch.ready;
@@ -94,7 +109,10 @@ class NostrWsClient implements NostrRelayClient {
   // carrier NAT dropped the flow — and nothing else in the stack notices,
   // because there is no error to notice. Re-opening the SUBSCRIPTION (which the
   // firehose watchdog does) cannot help: the frames go into a dead socket.
-  static const int _idleMs = 90 * 1000;
+  // 45s, not 90. With a 20s keepalive ping a healthy socket is never quiet this
+  // long, so silence past this really is a dead flow — and every second spent
+  // waiting on a dead one is a second the feed does not move.
+  static const int _idleMs = 45 * 1000;
   Timer? _idle;
 
   void _touch() {
@@ -105,7 +123,19 @@ class NostrWsClient implements NostrRelayClient {
     });
   }
 
+  /// Frames received since the last report. "Connected" is a claim; this is
+  /// evidence — a socket that is up and silent is the failure that cost hours.
+  int framesIn = 0;
+  @override
+  int drainFrames() {
+    final n = framesIn;
+    framesIn = 0;
+    return n;
+  }
+
   void _onData(dynamic data) {
+    framesIn++;
+    _lastFrameMs = DateTime.now().millisecondsSinceEpoch;
     _touch();
     final raw = data is String ? data : data.toString();
     final msg = NostrWire.decode(raw);
@@ -170,6 +200,34 @@ class NostrWsClient implements NostrRelayClient {
       connect();
     }
   }
+
+  /// The app came back to the foreground (or the user pulled to refresh).
+  ///
+  /// Android freezes a backgrounded app's sockets (Doze): they sit "connected"
+  /// and deliver nothing, then error out all at once when the next keepalive
+  /// ping hits the dead flow. Waiting for backoff timers to notice costs the
+  /// user minutes of stale feed at exactly the moment they are looking at it.
+  /// So: an errored socket reconnects NOW, and a "connected" one that has heard
+  /// nothing for 30s is treated as the zombie it is and cycled.
+  @override
+  void resume() {
+    if (_closed) return;
+    if (_status == NostrRelayStatus.connected) {
+      final idleMs =
+          DateTime.now().millisecondsSinceEpoch - _lastFrameMs;
+      if (_lastFrameMs > 0 && idleMs > 30 * 1000) {
+        reconnect();
+      }
+      return;
+    }
+    // error / disconnected: skip the backoff — the user is watching.
+    _retry?.cancel();
+    _backoffMs = 1000;
+    _setStatus(NostrRelayStatus.disconnected);
+    connect();
+  }
+
+  int _lastFrameMs = 0;
 
   @override
   void reconnect() {

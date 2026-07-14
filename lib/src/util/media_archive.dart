@@ -40,6 +40,61 @@ void debugPrint(Object? message) {
 }
 
 /// Non-blob metadata of one archive entry (cheap to query for list views).
+/// What a cleanup sweep targets. Every option answers a question a person
+/// actually asks when the disk is full: "whose is this?", "is any of it even
+/// being used?", "how do I get a gigabyte back?".
+enum SweepKind {
+  /// Everything held for strangers. Never touches followed authors or our own.
+  strangers,
+
+  /// Anything accepted before a cut-off.
+  olderThan,
+
+  /// Stranger blobs nobody has ever fetched from us. Dead weight by definition.
+  neverServed,
+
+  /// Everything one depositor put here.
+  byOrigin,
+
+  /// Free up to N bytes from the STRANGER slice, oldest first. It never reaches
+  /// into a followed author's media, however short it falls of the target.
+  freeBytes,
+}
+
+class HostedSweep {
+  final SweepKind kind;
+  final int olderThanMs;
+  final int freeBytes;
+  final String originPub;
+
+  const HostedSweep.strangers()
+      : kind = SweepKind.strangers,
+        olderThanMs = 0,
+        freeBytes = 0,
+        originPub = '';
+
+  const HostedSweep.olderThan(this.olderThanMs)
+      : kind = SweepKind.olderThan,
+        freeBytes = 0,
+        originPub = '';
+
+  const HostedSweep.neverServed()
+      : kind = SweepKind.neverServed,
+        olderThanMs = 0,
+        freeBytes = 0,
+        originPub = '';
+
+  const HostedSweep.byOrigin(this.originPub)
+      : kind = SweepKind.byOrigin,
+        olderThanMs = 0,
+        freeBytes = 0;
+
+  const HostedSweep.freeBytes(this.freeBytes)
+      : kind = SweepKind.freeBytes,
+        olderThanMs = 0,
+        originPub = '';
+}
+
 class MediaMeta {
   final String sha256;       // unpadded base64url, 43 chars
   final String? sha1;        // unpadded base64url, 27 chars
@@ -418,6 +473,175 @@ class MediaArchive {
       return (strangerBytes: s, totalHostedBytes: t);
     } catch (_) {
       return (strangerBytes: 0, totalHostedBytes: 0);
+    }
+  }
+
+  /// Aggregate statistics about what this device is holding FOR OTHERS.
+  ///
+  /// Statistics, not a list: an archive is expected to hold hundreds of
+  /// thousands of blobs, and a user scrolling that list learns nothing and can
+  /// do nothing. What they need is where the space went and how to get it back.
+  /// All of it is one SQL pass, so it stays cheap at any size.
+  ({
+    int totalBytes,
+    int totalItems,
+    int strangerBytes,
+    int strangerItems,
+    int followedBytes,
+    int followedItems,
+    int pinnedBytes,
+    int pinnedItems,
+    int oldestMs,
+    int servedItems,
+  }) hostedStats() {
+    final db = _ensureDb();
+    const empty = (
+      totalBytes: 0,
+      totalItems: 0,
+      strangerBytes: 0,
+      strangerItems: 0,
+      followedBytes: 0,
+      followedItems: 0,
+      pinnedBytes: 0,
+      pinnedItems: 0,
+      oldestMs: 0,
+      servedItems: 0,
+    );
+    if (db == null) return empty;
+    try {
+      final r = db.select(
+        'SELECT '
+        ' COALESCE(SUM(size),0) tb, COUNT(*) ti,'
+        ' COALESCE(SUM(CASE WHEN tier=2 THEN size ELSE 0 END),0) sb,'
+        ' COALESCE(SUM(CASE WHEN tier=2 THEN 1 ELSE 0 END),0) si,'
+        ' COALESCE(SUM(CASE WHEN tier=1 THEN size ELSE 0 END),0) fb,'
+        ' COALESCE(SUM(CASE WHEN tier=1 THEN 1 ELSE 0 END),0) fi,'
+        ' COALESCE(SUM(CASE WHEN pinned=1 THEN size ELSE 0 END),0) pb,'
+        ' COALESCE(SUM(CASE WHEN pinned=1 THEN 1 ELSE 0 END),0) pi,'
+        ' COALESCE(MIN(received_at),0) oldest,'
+        ' COALESCE(SUM(CASE WHEN downloads>0 THEN 1 ELSE 0 END),0) served'
+        ' FROM media WHERE hosted=1',
+      ).first;
+      return (
+        totalBytes: (r['tb'] as int?) ?? 0,
+        totalItems: (r['ti'] as int?) ?? 0,
+        strangerBytes: (r['sb'] as int?) ?? 0,
+        strangerItems: (r['si'] as int?) ?? 0,
+        followedBytes: (r['fb'] as int?) ?? 0,
+        followedItems: (r['fi'] as int?) ?? 0,
+        pinnedBytes: (r['pb'] as int?) ?? 0,
+        pinnedItems: (r['pi'] as int?) ?? 0,
+        oldestMs: (r['oldest'] as int?) ?? 0,
+        servedItems: (r['served'] as int?) ?? 0,
+      );
+    } catch (_) {
+      return empty;
+    }
+  }
+
+  /// Who the space actually went to: the biggest depositors, largest first.
+  /// This is the row a person can act on — "npub X is using 4 GB of my disk" —
+  /// which a list of blobs never tells them.
+  List<({String originPub, int bytes, int items})> hostedByOrigin({
+    int limit = 10,
+  }) {
+    final db = _ensureDb();
+    if (db == null) return const [];
+    try {
+      final rows = db.select(
+        'SELECT COALESCE(origin_pub, ?) op, SUM(size) b, COUNT(*) n '
+        'FROM media WHERE hosted=1 GROUP BY op ORDER BY b DESC LIMIT ?',
+        ['', limit],
+      );
+      return [
+        for (final r in rows)
+          (
+            originPub: (r['op'] as String?) ?? '',
+            bytes: (r['b'] as int?) ?? 0,
+            items: (r['n'] as int?) ?? 0,
+          )
+      ];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// How much [sweep] would free, without freeing it. A cleanup tool that cannot
+  /// tell you what it is about to delete is not a tool, it is a gamble.
+  ({int bytes, int items}) previewSweep(HostedSweep sweep, {int? nowMs}) =>
+      _sweep(sweep, nowMs: nowMs, dryRun: true);
+
+  /// Free space. Never touches PINNED blobs (the user asked for those) and never
+  /// touches our own media (hosted=0) — only what we volunteered to hold for
+  /// other people.
+  ({int bytes, int items}) sweepHosted(HostedSweep sweep, {int? nowMs}) =>
+      _sweep(sweep, nowMs: nowMs, dryRun: false);
+
+  ({int bytes, int items}) _sweep(
+    HostedSweep sweep, {
+    int? nowMs,
+    required bool dryRun,
+  }) {
+    final db = _ensureDb();
+    if (db == null) return (bytes: 0, items: 0);
+    final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+
+    final where = StringBuffer('hosted=1 AND pinned=0');
+    final params = <Object?>[];
+    switch (sweep.kind) {
+      case SweepKind.strangers:
+        where.write(' AND tier=2');
+      case SweepKind.olderThan:
+        where.write(' AND received_at < ?');
+        params.add(now - sweep.olderThanMs);
+      case SweepKind.neverServed:
+        where.write(' AND downloads=0 AND tier=2');
+      case SweepKind.byOrigin:
+        where.write(' AND origin_pub = ?');
+        params.add(sweep.originPub);
+      case SweepKind.freeBytes:
+        break; // handled below: oldest first until enough is freed
+    }
+
+    try {
+      if (sweep.kind == SweepKind.freeBytes) {
+        // ONLY the stranger slice. "Free 1 GB" must never reach into the media
+        // of the people the owner follows: they did not ask to lose that, and a
+        // cleanup that quietly took it would be the eviction attack, performed
+        // by us, on request. If the strangers do not add up to the target, we
+        // free what there is and stop — an honest partial beats a destructive
+        // whole.
+        final rows = db.select(
+          'SELECT sha256, size FROM media WHERE hosted=1 AND pinned=0 '
+          'AND tier=2 ORDER BY received_at ASC',
+        );
+        var freed = 0;
+        var n = 0;
+        for (final r in rows) {
+          if (freed >= sweep.freeBytes) break;
+          freed += (r['size'] as int?) ?? 0;
+          n++;
+          if (!dryRun) delete(r['sha256'] as String);
+        }
+        return (bytes: freed, items: n);
+      }
+
+      final agg = db.select(
+        'SELECT COALESCE(SUM(size),0) b, COUNT(*) n FROM media WHERE $where',
+        params,
+      ).first;
+      final bytes = (agg['b'] as int?) ?? 0;
+      final items = (agg['n'] as int?) ?? 0;
+      if (!dryRun && items > 0) {
+        final rows =
+            db.select('SELECT sha256 FROM media WHERE $where', params);
+        for (final r in rows) {
+          delete(r['sha256'] as String);
+        }
+      }
+      return (bytes: bytes, items: items);
+    } catch (_) {
+      return (bytes: 0, items: 0);
     }
   }
 

@@ -70,6 +70,12 @@ class ServeQuota {
 
   int get strangerBytesServedToday => _strangerToday;
 
+  /// Lifetime totals — the daily buckets reset at midnight, which is exactly
+  /// what a 48-hour graph must NOT do. The host samples deltas of these into an
+  /// hourly ring.
+  int bytesServedTotal = 0;
+  int requestsServedTotal = 0;
+
   int get bytesServedToday => _globalToday;
   int get remainingToday =>
       (dailyBudgetBytes - _globalToday).clamp(0, dailyBudgetBytes);
@@ -108,6 +114,15 @@ class ServeQuota {
   void record(String requester, Uint8List sha, int bytes,
       {bool manifest = false}) {
     _rollDay();
+
+    // Lifetime totals FIRST, and outside the `enabled` gate: an always-on
+    // archiver runs with limiting off, and it is exactly the node whose owner
+    // wants to see what it gave away. record() is called once per file served
+    // (a chunked download is one call, not forty), so this counts requests, not
+    // packets.
+    bytesServedTotal += bytes;
+    requestsServedTotal++;
+
     if (!enabled) return;
     _globalToday += bytes;
     if (_levelOf(requester) == Requester.stranger) _strangerToday += bytes;

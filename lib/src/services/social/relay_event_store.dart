@@ -212,6 +212,21 @@ class RelayEventStore {
   /// 1 followed / 2 stranger) and [receivedAtMs] are recorded for the hosting
   /// quota/eviction; they default to stranger / now when not supplied (e.g. our
   /// own local publishes pass tier 0).
+  /// Distinct authors whose events we kept at [tier]. Tier 1 is "somebody the
+  /// user follows" — the mirror writes their posts at that tier — so this is a
+  /// RECONSTRUCTION of the follow set from what the device actually kept.
+  ///
+  /// It exists because the follow set can be lost (it was: a bad mirror emptied
+  /// the persisted file), and a list of names the user chose is worth rebuilding
+  /// from evidence rather than asking them to remember it.
+  List<String> authorsAtTier(int tier, {int limit = 1000}) {
+    final rows = _db.select(
+      'SELECT DISTINCT pubkey FROM events WHERE deleted=0 AND tier=? LIMIT ?',
+      [tier, limit],
+    );
+    return [for (final r in rows) (r['pubkey'] as String).toLowerCase()];
+  }
+
   bool put(NostrEvent e, {int tier = 2, int? receivedAtMs}) =>
       _put(e, tier: tier, receivedAtMs: receivedAtMs, verify: true);
 

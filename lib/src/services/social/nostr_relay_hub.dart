@@ -301,7 +301,12 @@ class NostrRelayHub {
     }
     if (c == null) return null;
     c.onEvent = _onEvent;
-    c.onEose = (_) {};
+    // EOSE = "that's my backlog". Recording it is what lets us tell "streaming me
+    // new posts" from "read its cache back to me and went dead" — the two look
+    // identical otherwise, and the watchdog believed the second was the first.
+    c.onEose = (subId) {
+      if (subId == _fireSub) _fireEoseMs = DateTime.now().millisecondsSinceEpoch;
+    };
     c.onStatus = (_) {};
     // A refused subscription is not an error anywhere else in the stack: the
     // socket stays up and the events simply never come. Name it.
@@ -511,14 +516,28 @@ class NostrRelayHub {
     // firehose was observed going quiet after its first burst for exactly this
     // reason: nobody had closed it, the relay had just stopped answering it.
     // There is no error to catch, so the only honest signal is silence.
+    // THE WATCHDOG DOES NOT CHURN THE SUBSCRIPTION.
+    //
+    // It used to CLOSE and re-REQ the firehose every 60 seconds of silence, and
+    // that is what killed it. The evidence is on the device: the discovery
+    // subscription (kind-7, opened once, never touched again) streams events
+    // continuously down the very same socket, while the firehose — the one we
+    // kept re-asking for — went silent after its first burst. A relay will drop a
+    // subscription that is torn down and re-issued on a loop, and no CLOSED frame
+    // is ever sent to tell you so.
+    //
+    // So: a live subscription is left ALONE. It is re-issued exactly once per
+    // connection, by the client, on reconnect. If the socket itself is dead the
+    // idle watchdog (nostr_ws_client) notices — the kind-7 traffic proves whether
+    // frames are flowing at all — and a reconnect replays every subscription we
+    // hold, firehose included.
+    //
+    // What stays here is the DIAGNOSIS: say out loud that the firehose is quiet,
+    // and whether the relay ended its backlog and then never pushed again.
     _fireWatchdog ??= Timer.periodic(const Duration(seconds: 30), (_) {
       if (_fireSub == null) return;
       final now = DateTime.now().millisecondsSinceEpoch;
       if (now - _fireLastEventMs < _fireSilenceMs) return;
-      // Say WHO is supposed to be answering. A bare "re-opening" every minute
-      // reads like a retry that is about to work; the truth was that no relay
-      // capable of serving a firehose was connected at all, and the feed had
-      // been sixteen hours stale for exactly that reason.
       final live = [
         for (final e in _endpoints.values)
           if (e.enabled &&
@@ -526,34 +545,90 @@ class NostrRelayHub {
             e.uri,
       ];
       _fireSilentRounds++;
-      log?.call('firehose: silent for ${_fireSilenceMs ~/ 1000}s — re-opening '
-          '(connected: ${live.isEmpty ? "NONE" : live.join(", ")})');
-      _closeFirehoseReq();
-      _openFirehoseReq();
+      final eosed = _fireEoseMs > 0 && _fireEoseMs >= _fireLastEventMs;
+      log?.call('firehose: no new events for '
+          '${(now - _fireLastEventMs) ~/ 1000}s '
+          '(connected: ${live.isEmpty ? "NONE" : live.join(", ")}'
+          '${eosed ? ", backlog ended" : ""})');
 
-      // Twice in a row means the REQ is not the problem. A relay that has
-      // quietly dropped this subscription — no CLOSED, no error, the socket
-      // still carrying our other subs — will keep ignoring it however many
-      // times we ask down the same connection. Only a new connection is
-      // answered, and reconnecting replays every subscription we hold.
-      if (_fireSilentRounds >= 2) {
+      // Only a genuinely dead relay gets cycled, and only after a long silence —
+      // never as a reflex. Cycling is a big hammer: it drops the subscriptions
+      // that ARE working (discovery, follows, profiles) along with the one that
+      // is not.
+      if (_fireSilentRounds >= 6) {
         _fireSilentRounds = 0;
+        log?.call('firehose: ${_fireSilenceMs * 6 ~/ 1000}s without a single new '
+            'event — cycling sockets');
         for (final uri in live) {
           _clients[uri]?.reconnect();
         }
       }
     });
+
     // Ask for the held authors' profiles in one small batch, slowly. This is a
     // background chore, not a hot path: the posts are already held, and a REQ
     // storm is what got us dropped by the relays in the first place.
     _fireProfTimer ??=
         Timer.periodic(const Duration(seconds: 10), (_) => _firehoseProfileFetch());
+
+    // Show what the relays would not name. A held post whose kind-0 never comes
+    // is DELIVERED once its hold expires — with a short-npub identity, which the
+    // UI renders perfectly well. It used to be destroyed in silence, and on a
+    // network where the relays are stingy with kind-0 that meant an empty All
+    // tab and a pending queue frozen at 42 for twenty minutes.
+    _fireSweepTimer ??= Timer.periodic(const Duration(seconds: 15), (_) {
+      final f = _fireFilter;
+      if (f == null) {
+        log?.call('firehose sweep: no filter');
+        return;
+      }
+      final ripe = f.sweepExpired(DateTime.now().millisecondsSinceEpoch);
+      if (ripe.isNotEmpty || f.pendingNow > 0) {
+        final age =
+            f.oldestHoldAgeMs(DateTime.now().millisecondsSinceEpoch) ~/ 1000;
+        log?.call('firehose sweep: ripe=${ripe.length} still-held=${f.pendingNow} '
+            'oldest=${age}s subscribers=${_fireSubscribers.length}');
+      }
+      for (final e in ripe) {
+        fireReleased++;
+        if (store.put(e)) {
+          eventsStored++;
+          onStored?.call(e);
+        }
+        _deliverFirehose(e);
+      }
+    });
     return subId;
   }
 
   Timer? _fireWatchdog;
   int _fireLastEventMs = 0;
   int _fireSilentRounds = 0;
+
+  // Every firehose event id we have already gated. Bounded, evicted oldest-first
+  // — NEVER cleared wholesale, or the next backlog looks new again.
+  final Set<String> _fireSeenIds = {};
+  static const int _fireSeenMax = 4000;
+
+  // The newest created_at we have accepted. The next REQ asks for `since` this,
+  // so a re-open costs one round trip instead of 200 stale events per relay.
+  int _fireNewestSec = 0;
+  int _fireEoseMs = 0;
+
+  // What actually happened, per window: new events vs redeliveries. Without this
+  // split, "seen=200 kept=0" is unreadable — is the gate eating it, or is the
+  // relay reading its cache back to us? Those have opposite fixes.
+  int fireNew = 0;
+  int fireDup = 0;
+  int fireReleased = 0;
+
+  // Authors we have ASKED about and are still waiting on: pubkey -> attempts.
+  // Asking once and forgetting (which is what the old code did — it removed the
+  // author from the queue the moment the REQ went out) means a relay that drops
+  // the REQ, or answers it after our one-shot sub was reaped, costs that author
+  // their name forever, and every post of theirs is held and then destroyed.
+  final Map<String, int> _profileAsked = {};
+  static const int _profileMaxAttempts = 3;
   static const int _fireSilenceMs = 60 * 1000;
 
   // Authors whose posts are held pending a profile. Fetched in ONE small REQ on
@@ -562,6 +637,7 @@ class NostrRelayHub {
   final Set<String> _profileWanted = {};
   final Map<String, int> _fireProfSubs = {}; // one-shot REQ subs → created ms
   Timer? _fireProfTimer;
+  Timer? _fireSweepTimer;
   static const int _fireProfBatch = 100;
   static const int _fireProfTtlMs = 30 * 1000;
 
@@ -586,10 +662,24 @@ class NostrRelayHub {
     final batch = <String>[];
     for (final p in _profileWanted) {
       if (_haveProfile.contains(p)) continue;
+      if ((_profileAsked[p] ?? 0) >= _profileMaxAttempts) continue;
       batch.add(p);
       if (batch.length >= _fireProfBatch) break;
     }
-    _profileWanted.removeAll(batch);
+    // An author stays in the queue until their kind-0 actually ARRIVES (see
+    // _releaseProfile) or we have asked _profileMaxAttempts times. Removing them
+    // the moment the REQ went out — which is what this did — meant a dropped or
+    // late-answered REQ cost that author their name permanently, and every post
+    // of theirs was held for three minutes and then thrown away.
+    for (final p in batch) {
+      _profileAsked[p] = (_profileAsked[p] ?? 0) + 1;
+      if (_profileAsked[p]! >= _profileMaxAttempts) {
+        _profileWanted.remove(p); // asked enough; the hold TTL will show it anyway
+      }
+    }
+    if (_profileAsked.length > 4000) {
+      _profileAsked.remove(_profileAsked.keys.first);
+    }
     if (batch.isEmpty) return;
 
     final sub = 'fireP${_subSeq++}';
@@ -608,13 +698,30 @@ class NostrRelayHub {
     _fireSub = sub;
     _fireLastEventMs = DateTime.now().millisecondsSinceEpoch;
     // kind-0 rides along with kind-1 on purpose — see above.
-    final f = [const NostrFilter(kinds: [0, 1], limit: 200)];
+    //
+    // `since` is what makes a re-open cheap. Without it every relay replayed its
+    // most recent 200 events at us on every single re-open, forever — the
+    // backlog that inflated the flood rule and kept the watchdog convinced the
+    // feed was alive. A small overlap (60s) covers clock skew between relays.
+    final since = _fireNewestSec > 0 ? _fireNewestSec - 60 : null;
+    final f = [
+      since == null
+          ? const NostrFilter(kinds: [0, 1], limit: 200)
+          : NostrFilter(kinds: const [0, 1], limit: 200, since: since)
+    ];
     _subFilters[sub] = f;
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};
     for (final e in _endpoints.values) {
       if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
     }
+  }
+
+  /// What the silence watchdog does, exposed so a test can prove a re-open asks
+  /// for what is NEW rather than dragging the same backlog back.
+  void debugReopenFirehose() {
+    _closeFirehoseReq();
+    _openFirehoseReq();
   }
 
   void _closeFirehoseReq() {
@@ -634,8 +741,13 @@ class NostrRelayHub {
     _fireWatchdog = null;
     _fireProfTimer?.cancel();
     _fireProfTimer = null;
-    _profileWanted.clear();
-    _fireFilter = null;
+    _fireSweepTimer?.cancel();
+    _fireSweepTimer = null;
+    // The REQ stops; the KNOWLEDGE stays. Nulling the filter here threw away
+    // every held post and every author we were still waiting on a name for —
+    // on every page close — so re-opening Social always started from nothing and
+    // replayed the whole cold-start stall. The gate's caches are bounded; they
+    // cost nothing to keep, and keeping them is what makes a re-open instant.
     _closeFirehoseReq();
   }
 
@@ -658,20 +770,52 @@ class NostrRelayHub {
 
   bool _onFirehose(NostrEvent event, int nowMs) {
     fireSeen++;
-    _fireLastEventMs = nowMs; // the watchdog's proof of life
+
+    // ── The SAME event is not news, however many times it is handed to us ──
+    //
+    // Every relay answers a REQ with its recent window, and the watchdog used to
+    // mint a fresh subscription id every 60 seconds — so the same 200 posts came
+    // back, from four relays, over and over. Nothing here deduped them: the
+    // firehose path returns before `_bufferForSub`/`_seen`, and the gate never
+    // looks at an event id. The consequences were all three of the symptoms:
+    //
+    //   * the flood rule counted DELIVERIES, so one honest author redelivered by
+    //     four relays looked like a spammer and their real posts were rejected —
+    //     adding a relay made the feed emptier;
+    //   * the watchdog treated that stale burst as proof of life, so it could
+    //     never escalate and the socket was never cycled;
+    //   * and the whole cycle repeated for twenty minutes while the log happily
+    //     reported four connected relays.
+    //
+    // An event id is a content hash. Seen once, seen forever.
+    final id = event.id;
+    if (id != null) {
+      if (!_fireSeenIds.add(id)) {
+        fireDup++;
+        return true; // a redelivery: not new, not news, not proof of anything
+      }
+      while (_fireSeenIds.length > _fireSeenMax) {
+        _fireSeenIds.remove(_fireSeenIds.first); // oldest out, never a wholesale clear
+      }
+    }
+
+    // Proof of life means a NEW event. Anything else is the relay reading its
+    // cache back to us.
+    _fireLastEventMs = nowMs;
     _fireSilentRounds = 0;
+    fireNew++;
+
+    // The watermark the next re-open asks from, so a reconnect does not drag the
+    // same backlog back across the network.
+    if (event.createdAt > _fireNewestSec) _fireNewestSec = event.createdAt;
+
     final filter = _fireFilter;
     if (filter == null) return true;
 
     // A profile: remember it, keep it (the UI needs the name and picture), and
     // release whatever of that author's posts was waiting on exactly this.
     if (event.kind == NostrEventKind.setMetadata) {
-      _haveProfile.add(event.pubkey);
-      _noProfile.remove(event.pubkey);
-      if (store.put(event)) eventsStored++;
-      for (final held in filter.release(event.pubkey, nowMs)) {
-        _deliverFirehose(held);
-      }
+      _releaseProfile(event, nowMs);
       return true;
     }
 
@@ -713,6 +857,25 @@ class NostrRelayHub {
     return true;
   }
 
+  /// A kind-0 arrived — from ANY subscription. Remember it, store it, and hand
+  /// back every post of that author's that was waiting to learn their name.
+  void _releaseProfile(NostrEvent event, int nowMs) {
+    _haveProfile.add(event.pubkey);
+    _noProfile.remove(event.pubkey);
+    _profileWanted.remove(event.pubkey);
+    _profileAsked.remove(event.pubkey); // answered: stop retrying
+    if (store.put(event)) {
+      eventsStored++;
+      onStored?.call(event);
+    }
+    final filter = _fireFilter;
+    if (filter == null) return;
+    for (final held in filter.release(event.pubkey, nowMs)) {
+      fireReleased++;
+      _deliverFirehose(held);
+    }
+  }
+
   void _deliverFirehose(NostrEvent event) {
     for (final id in _fireSubscribers) {
       _bufferForSub(id, event);
@@ -725,8 +888,24 @@ class NostrRelayHub {
     final f = _fireFilter;
     if (f == null) return const {};
     final seen = fireSeen;
+    final fresh = fireNew;
+    final dup = fireDup;
+    final released = fireReleased;
     fireSeen = 0;
-    return {'seen': seen, ...f.drainStats()};
+    fireNew = 0;
+    fireDup = 0;
+    fireReleased = 0;
+    // `new` vs `dup` is the line that would have saved a day: "seen=200 kept=0"
+    // is unreadable, but "seen=200 new=0 dup=200" says plainly that the relays
+    // are reading their cache back to us and nothing is actually arriving.
+    return {
+      'seen': seen,
+      'new': fresh,
+      'dup': dup,
+      'released': released,
+      'held': _fireFilter?.pendingNow ?? 0,
+      ...f.drainStats(),
+    };
   }
 
   // Live discoF fetch subs → created-at ms. These are one-shot id fetches; the
@@ -1218,6 +1397,23 @@ class NostrRelayHub {
       return;
     }
 
+    // A PROFILE IS NEVER SHED. It is the key that unlocks held posts.
+    //
+    // kind-0 answers arrive as a burst — one batch REQ of 100 authors, answered
+    // by every relay at once — which is precisely the shape the rate cap is built
+    // to throw away. So the cap was destroying the very events that release the
+    // firehose's pending queue: posts were held waiting for a name, the name was
+    // dropped on the floor 15-per-250ms, and three minutes later the post was
+    // discarded. `pending` climbed while `kept` stayed at zero, for hours.
+    //
+    // Handling it here — ahead of the cap — costs one cheap map insert per
+    // profile. The store write it triggers is bounded by how many authors we
+    // asked about, which we control.
+    if (event.kind == NostrEventKind.setMetadata) {
+      _releaseProfile(event, now);
+      return;
+    }
+
     // The generic path stores EVERYTHING it is handed, so it keeps the cap.
     if (now - _rateWindowStart >= _rateWindowMs) {
       _rateWindowStart = now;
@@ -1235,20 +1431,6 @@ class NostrRelayHub {
       onStored?.call(event);
     }
 
-    // A profile — from ANY subscription, not just the firehose. The kind-0 we
-    // are waiting on usually arrives on the profile-tracking subscription
-    // (trackProfile), so the release has to live here or the held posts would
-    // sit there while their author's profile sat in the store.
-    if (event.kind == NostrEventKind.setMetadata) {
-      _haveProfile.add(event.pubkey);
-      _noProfile.remove(event.pubkey);
-      final filter = _fireFilter;
-      if (filter != null) {
-        for (final held in filter.release(event.pubkey, now)) {
-          _deliverFirehose(held);
-        }
-      }
-    }
 
     // A liked-enough post (fetched by id) goes to EVERY discovery subscriber.
     if (_discoSubscribers.isNotEmpty &&

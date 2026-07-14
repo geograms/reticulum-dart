@@ -190,7 +190,21 @@ class NostrClient {
       case 'evstats':
         _eventStats = (msg['stats'] as Map).cast<String, int>();
       case 'fhstats':
-        firehoseStats = (msg['stats'] as Map).cast<String, int>();
+        // ACCUMULATE. The engine drains this every 400ms, so one snapshot is a
+        // 400ms window — and the log reads it once a minute. Treating a snapshot
+        // as a per-minute total is what made the telemetry say "seen=0" while
+        // events were arriving, and sent me hunting a network fault that was not
+        // there. Gauges (held/pending) take the latest value; counters add up.
+        final snap = (msg['stats'] as Map).cast<String, int>();
+        final acc = Map<String, int>.from(firehoseStats);
+        for (final e in snap.entries) {
+          if (e.key == 'held' || e.key == 'pending') {
+            acc[e.key] = e.value; // a gauge, not a counter
+          } else {
+            acc[e.key] = (acc[e.key] ?? 0) + e.value;
+          }
+        }
+        firehoseStats = acc;
       case 'events':
         final sub = msg['subId'] as String;
         final q = _subEvents.putIfAbsent(sub, () => []);
@@ -347,6 +361,18 @@ class NostrClient {
   /// Firehose accounting: kept / pending / expired, plus a count per drop
   /// reason. Empty until the first firehose subscription exists.
   Map<String, int> firehoseStats = const {};
+
+  /// Read AND reset the accumulated counters (gauges are left alone). Each log
+  /// line is then "what happened in the last minute", which is the only reading
+  /// that can be acted on.
+  Map<String, int> drainFirehoseStatsForLog() {
+    final out = Map<String, int>.from(firehoseStats);
+    firehoseStats = {
+      for (final e in firehoseStats.entries)
+        if (e.key == 'held' || e.key == 'pending') e.key: e.value,
+    };
+    return out;
+  }
 
   void unsubscribe(String subId) {
     _subEvents.remove(subId);

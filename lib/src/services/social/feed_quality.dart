@@ -173,8 +173,10 @@ class FirehoseFilter {
   final LinkedHashMap<String, ({String author, int atMs})> _seenText =
       LinkedHashMap();
 
-  // pubkey -> recent post times (ms), newest last
-  final LinkedHashMap<String, List<int>> _authorPosts = LinkedHashMap();
+  // pubkey -> recent posts (when, and WHICH event), newest last. Keyed by event
+  // id so a redelivery of the same post cannot look like a new one.
+  final LinkedHashMap<String, List<({int atMs, String id})>> _authorPosts =
+      LinkedHashMap();
 
   // pubkey -> posts waiting for that author's kind-0
   final Map<String, List<({NostrEvent event, int atMs})>> _pending = {};
@@ -207,7 +209,9 @@ class FirehoseFilter {
     final content = contentVerdict(event.content);
     if (content is FeedReject) return _reject(content.reason);
 
-    if (_isFlooding(event.pubkey, nowMs)) return _reject(FeedDrop.flooding);
+    if (_isFlooding(event.pubkey, nowMs, event.id)) {
+      return _reject(FeedDrop.flooding);
+    }
     if (_isDuplicate(event, nowMs)) return _reject(FeedDrop.duplicate);
 
     if (requireProfile && !hasProfile(event.pubkey)) {
@@ -223,11 +227,21 @@ class FirehoseFilter {
     return FeedReject(reason);
   }
 
-  bool _isFlooding(String pubkey, int nowMs) {
+  /// Is this author posting faster than a person can?
+  ///
+  /// Counts DISTINCT EVENTS, not deliveries. It used to count deliveries, and
+  /// that quietly made the feed emptier the more relays you added: the same
+  /// honest post, redelivered by four relays and again on every re-open, looked
+  /// like four or eight posts in a minute and tripped the flood rule — so the
+  /// author's genuinely new posts were rejected as spam. The event id is a
+  /// content hash, so "have I already counted this one" is exact.
+  bool _isFlooding(String pubkey, int nowMs, String? eventId) {
     final cutoff = nowMs - 60 * 1000;
-    final times = _authorPosts.remove(pubkey) ?? <int>[];
-    times.removeWhere((t) => t < cutoff);
-    times.add(nowMs);
+    final times = _authorPosts.remove(pubkey) ?? <({int atMs, String id})>[];
+    times.removeWhere((t) => t.atMs < cutoff);
+    final id = eventId ?? '';
+    final already = id.isNotEmpty && times.any((t) => t.id == id);
+    if (!already) times.add((atMs: nowMs, id: id));
     _authorPosts[pubkey] = times; // re-insert = most-recently-used
     while (_authorPosts.length > _maxAuthors) {
       _authorPosts.remove(_authorPosts.keys.first);
@@ -259,8 +273,37 @@ class FirehoseFilter {
     final list = _pending.putIfAbsent(event.pubkey, () => []);
     list.add((event: event, atMs: nowMs));
     _pendingCount++;
-    _expire(nowMs);
+
+    // The buffer stays BOUNDED — a firehose meets an endless supply of unknown
+    // authors, and an unbounded hold queue is a memory leak. But overflow is not
+    // destroyed: it goes out to be SHOWN (with a short-npub name) on the next
+    // sweep. Oldest holder first.
+    while (_pendingCount > maxPending && _pending.isNotEmpty) {
+      final k = _pending.keys.first;
+      final evicted = _pending.remove(k)!;
+      _pendingCount -= evicted.length;
+      expired += evicted.length;
+      _ripe.addAll([for (final h in evicted) h.event]);
+    }
     pendingNow = _pendingCount;
+    // TIME-expiry is not done here. It used to be — and only here — so a firehose
+    // that went quiet left the queue frozen forever, and every ripe post was
+    // destroyed rather than shown. The hub sweeps on a timer.
+  }
+
+  /// Posts evicted by the size cap, waiting for the next sweep to deliver them.
+  final List<NostrEvent> _ripe = [];
+
+  /// Age of the oldest thing still waiting for a name, in ms. If posts are held
+  /// but nothing ever ripens, this is the number that says why.
+  int oldestHoldAgeMs(int nowMs) {
+    var oldest = nowMs;
+    for (final list in _pending.values) {
+      for (final h in list) {
+        if (h.atMs < oldest) oldest = h.atMs;
+      }
+    }
+    return nowMs - oldest;
   }
 
   /// The author's kind-0 arrived — everything of theirs that was waiting is now
@@ -287,16 +330,30 @@ class FirehoseFilter {
   /// who wrote them — so they are counted separately from the drops.
   int expired = 0;
 
-  void _expire(int nowMs) {
+  /// Posts whose profile never arrived, handed back so they can be SHOWN.
+  ///
+  /// A name that never comes must not cost the user the post. This used to
+  /// silently destroy them: `requireProfile` meant "no kind-0, no post, ever",
+  /// and when the relays would not serve kind-0 — which is most of the time on a
+  /// bad network — the All tab was empty while `pending` climbed into the
+  /// hundreds. The post is the thing the user wanted; the name is a decoration,
+  /// and an unknown author renders perfectly well as a short npub.
+  ///
+  /// Call this on a TIMER as well as from [hold]: it used to run only when the
+  /// next post was held, so a firehose that went quiet froze the queue forever
+  /// (42 posts, stuck, for twenty minutes — exactly what the user saw).
+  List<NostrEvent> sweepExpired(int nowMs) {
     final cutoff = nowMs - pendingTtl.inMilliseconds;
+    final out = <NostrEvent>[..._ripe]; // whatever the size cap pushed out
+    _ripe.clear();
     final emptyAuthors = <String>[];
     for (final e in _pending.entries) {
-      final before = e.value.length;
-      e.value.removeWhere((h) => h.atMs < cutoff);
-      final gone = before - e.value.length;
-      if (gone > 0) {
-        _pendingCount -= gone;
-        expired += gone;
+      final ripe = [for (final h in e.value) if (h.atMs < cutoff) h.event];
+      if (ripe.isNotEmpty) {
+        e.value.removeWhere((h) => h.atMs < cutoff);
+        _pendingCount -= ripe.length;
+        expired += ripe.length;
+        out.addAll(ripe);
       }
       if (e.value.isEmpty) emptyAuthors.add(e.key);
     }
@@ -304,15 +361,18 @@ class FirehoseFilter {
       _pending.remove(k);
     }
     // Hard cap: a firehose of unknown authors must not grow memory without
-    // bound. Oldest holders go first.
+    // bound. Oldest holders go first — and they are still SHOWN, not binned.
     while (_pendingCount > maxPending && _pending.isNotEmpty) {
       final k = _pending.keys.first;
       final list = _pending.remove(k)!;
       _pendingCount -= list.length;
       expired += list.length;
+      out.addAll([for (final h in list) h.event]);
     }
     pendingNow = _pendingCount;
+    return out;
   }
+
 
   /// Counters for the telemetry line, reset on read.
   Map<String, int> drainStats() {

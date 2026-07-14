@@ -27,6 +27,8 @@ class NostrWsClient implements NostrRelayClient {
   @override
   NostrEoseCallback? onEose;
   @override
+  NostrClosedCallback? onClosed;
+  @override
   NostrStatusCallback? onStatus;
 
   WebSocketChannel? _ch;
@@ -66,6 +68,7 @@ class NostrWsClient implements NostrRelayClient {
       await ch.ready;
       _setStatus(NostrRelayStatus.connected);
       _backoffMs = 1000;
+      _touch(); // start the idle watchdog for this socket
       _sub = ch.stream.listen(
         _onData,
         onError: (Object e) => _onDown('stream error: $e'),
@@ -85,7 +88,25 @@ class NostrWsClient implements NostrRelayClient {
     }
   }
 
+  // A relay we hold open subscriptions on is never legitimately silent for
+  // minutes: even a quiet one answers a REQ with EOSE. Silence with the socket
+  // still "connected" is a half-open TCP — the phone changed network, or a
+  // carrier NAT dropped the flow — and nothing else in the stack notices,
+  // because there is no error to notice. Re-opening the SUBSCRIPTION (which the
+  // firehose watchdog does) cannot help: the frames go into a dead socket.
+  static const int _idleMs = 90 * 1000;
+  Timer? _idle;
+
+  void _touch() {
+    _idle?.cancel();
+    _idle = Timer(const Duration(milliseconds: _idleMs), () {
+      if (_closed || _status != NostrRelayStatus.connected) return;
+      _onDown('idle ${_idleMs ~/ 1000}s — socket is dead, reconnecting');
+    });
+  }
+
   void _onData(dynamic data) {
+    _touch();
     final raw = data is String ? data : data.toString();
     final msg = NostrWire.decode(raw);
     if (msg == null) return;
@@ -98,8 +119,13 @@ class NostrWsClient implements NostrRelayClient {
         onEose?.call(subId);
       case NostrNoticeMsg(:final message):
         log?.call('$uri notice: $message');
+      case NostrClosedMsg(:final subId, :final message):
+        // The relay REFUSED a subscription (rate-limited, too many filters,
+        // auth-required…). Swallowing this is how a feed dies in silence: the
+        // REQ is on the wire, no error is raised, and nothing ever arrives.
+        log?.call('$uri CLOSED $subId: $message');
+        onClosed?.call(subId, message);
       case NostrOkMsg():
-      case NostrClosedMsg():
       case NostrReqMsg():
       case NostrCloseMsg():
       case NostrPublishMsg():
@@ -109,6 +135,8 @@ class NostrWsClient implements NostrRelayClient {
 
   void _onDown(String why) {
     if (_closed) return;
+    _idle?.cancel();
+    _idle = null;
     _setStatus(NostrRelayStatus.error);
     _sub?.cancel();
     _sub = null;
@@ -135,6 +163,7 @@ class NostrWsClient implements NostrRelayClient {
   @override
   void subscribe(String subId, List<NostrFilter> filters) {
     _subs[subId] = filters;
+    log?.call('$uri: REQ $subId (${_subs.length} open)');
     if (_status == NostrRelayStatus.connected) {
       _send(NostrWire.req(subId, filters));
     } else {
@@ -162,6 +191,8 @@ class NostrWsClient implements NostrRelayClient {
   @override
   Future<void> close() async {
     _closed = true;
+    _idle?.cancel();
+    _idle = null;
     _retry?.cancel();
     await _sub?.cancel();
     try {

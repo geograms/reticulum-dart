@@ -119,33 +119,61 @@ class NostrRelayHub {
 
   int _subSeq = 0;
 
+  /// The relays this device is offered if it has never been offered them before.
+  /// Injectable so a test can run the hub with no public relays (and therefore
+  /// no real sockets).
+  final List<String> defaultRelays;
+
   NostrRelayHub({
     required this.store,
     this.persistPath,
     this.rnsClientFactory,
     this.onStored,
     this.log,
+    this.defaultRelays = kDefaultNostrRelays,
   });
 
   // ── Relay list ────────────────────────────────────────────────────────────
 
-  /// Load persisted relays, or seed the defaults on first run.
+  /// Load persisted relays, and offer any default this device has never been
+  /// offered before.
+  ///
+  /// Seeding the defaults ONLY on first run is how a device ends up stranded: the
+  /// persisted list shadows the constant forever, so a relay added to the
+  /// defaults later never reaches an existing install, and a list whose relays
+  /// have since died stays dead. A phone was found running on two relays — one
+  /// unreachable, one that answers no firehose — with a feed sixteen hours old.
+  ///
+  /// A default the user has REMOVED is not re-added: [_offered] remembers every
+  /// default this device has ever been given, so "never offered" and "offered
+  /// and thrown away" are different things. Disabled stays disabled too.
   Future<void> init() async {
     final loaded = _load();
-    if (loaded.isEmpty) {
-      for (final u in kDefaultNostrRelays) {
-        _endpoints[u] = NostrRelayEndpoint(u);
-      }
+    for (final e in loaded) {
+      _endpoints[e.uri] = e;
+    }
+    var added = 0;
+    for (final u in defaultRelays) {
+      if (_offered.contains(u)) continue; // offered before; user's call now
+      _offered.add(u);
+      if (_endpoints.containsKey(u)) continue;
+      _endpoints[u] = NostrRelayEndpoint(u);
+      added++;
+    }
+    if (added > 0 || loaded.isEmpty) {
+      log?.call('relays: added $added default(s), ${_endpoints.length} total');
       _save();
-    } else {
-      for (final e in loaded) {
-        _endpoints[e.uri] = e;
-      }
     }
     for (final e in _endpoints.values) {
       _ensureClient(e.uri);
     }
   }
+
+  /// Every default relay this device has ever been offered (persisted next to
+  /// the list itself). Without it, "the user removed this one" is
+  /// indistinguishable from "this one is new", and a merge would resurrect what
+  /// the user threw away on every single start.
+  final Set<String> _offered = {};
 
   List<NostrRelayEndpoint> _load() {
     final p = persistPath;
@@ -154,9 +182,27 @@ class NostrRelayHub {
       final f = File(p);
       if (!f.existsSync()) return const [];
       final j = jsonDecode(f.readAsStringSync());
-      if (j is! List) return const [];
+      // Two shapes: the original bare list, and the current object that also
+      // carries which defaults this device has already been offered. An old
+      // file simply has no memory of what it was offered — every relay in it
+      // counts as offered, so an upgrade adds the defaults it never had and
+      // resurrects nothing.
+      final List<dynamic> list;
+      if (j is List) {
+        list = j;
+        for (final e in list) {
+          if (e is Map && e['uri'] != null) _offered.add('${e['uri']}');
+        }
+      } else if (j is Map && j['relays'] is List) {
+        list = j['relays'] as List;
+        for (final u in (j['offered'] as List? ?? const [])) {
+          _offered.add('$u');
+        }
+      } else {
+        return const [];
+      }
       return [
-        for (final e in j)
+        for (final e in list)
           if (e is Map)
             NostrRelayEndpoint.fromJson(e.map((k, v) => MapEntry('$k', v)))
       ];
@@ -170,8 +216,10 @@ class NostrRelayHub {
     final p = persistPath;
     if (p == null) return;
     try {
-      File(p).writeAsStringSync(
-          jsonEncode([for (final e in _endpoints.values) e.toJson()]));
+      File(p).writeAsStringSync(jsonEncode({
+        'relays': [for (final e in _endpoints.values) e.toJson()],
+        'offered': _offered.toList(),
+      }));
     } catch (e) {
       log?.call('relay list save failed: $e');
     }
@@ -255,6 +303,10 @@ class NostrRelayHub {
     c.onEvent = _onEvent;
     c.onEose = (_) {};
     c.onStatus = (_) {};
+    // A refused subscription is not an error anywhere else in the stack: the
+    // socket stays up and the events simply never come. Name it.
+    c.onClosed =
+        (subId, message) => log?.call('relay $uri refused $subId: $message');
     _clients[uri] = c;
     // ignore: discarded_futures
     c.connect();
@@ -447,7 +499,18 @@ class NostrRelayHub {
       if (_fireSub == null) return;
       final now = DateTime.now().millisecondsSinceEpoch;
       if (now - _fireLastEventMs < _fireSilenceMs) return;
-      log?.call('firehose: silent for ${_fireSilenceMs ~/ 1000}s — re-opening');
+      // Say WHO is supposed to be answering. A bare "re-opening" every minute
+      // reads like a retry that is about to work; the truth was that no relay
+      // capable of serving a firehose was connected at all, and the feed had
+      // been sixteen hours stale for exactly that reason.
+      final live = [
+        for (final e in _endpoints.values)
+          if (e.enabled &&
+              _clients[e.uri]?.status == NostrRelayStatus.connected)
+            e.uri,
+      ];
+      log?.call('firehose: silent for ${_fireSilenceMs ~/ 1000}s — re-opening '
+          '(connected: ${live.isEmpty ? "NONE" : live.join(", ")})');
       _closeFirehoseReq();
       _openFirehoseReq();
     });
@@ -1107,22 +1170,33 @@ class NostrRelayHub {
     if (wasReaction) return;
 
     final now = DateTime.now().millisecondsSinceEpoch;
+
+    // The firehose has its own rules: the QUALITY GATE decides whether this is
+    // stored and shown at all, so it never reaches the generic path below.
+    //
+    // It runs BEFORE the rate cap, and that ordering is the whole point. The cap
+    // used to come first and it ate the All feed alive: relays answer a fresh
+    // kind-1 subscription with a burst (200 events each, times every relay), the
+    // cap is 15 per 250ms, so the burst was discarded WITHOUT the gate ever
+    // seeing it — `dropped=173, fireSeen=0, stored=0` while four relays were
+    // happily streaming. The cap exists to protect the STORE from a firehose of
+    // junk, and the gate already does that job better: it stores only what it
+    // would show. Everything it rejects costs one cheap in-memory verdict.
+    if (subId == _fireSub) {
+      _onFirehose(event, now);
+      return;
+    }
+
+    // The generic path stores EVERYTHING it is handed, so it keeps the cap.
     if (now - _rateWindowStart >= _rateWindowMs) {
       _rateWindowStart = now;
       _rateCount = 0;
     }
     if (_rateCount >= _rateMaxPerWindow) {
-      rateDropped++; // firehose overflow — dropped before any main-thread work
+      rateDropped++; // overflow — dropped before it can reach sqlite
       return;
     }
     _rateCount++;
-
-    // The firehose has its own rules: the quality gate decides whether this is
-    // stored and shown at all, so it never reaches the generic path below.
-    if (subId == _fireSub) {
-      _onFirehose(event, now);
-      return;
-    }
 
     // Merge into the unified store (dedup + replaceable/deletion handled there).
     if (store.put(event)) {
@@ -1155,8 +1229,16 @@ class NostrRelayHub {
       }
     }
     _bufferForSub(subId, event);
+    // Bound the seen-set by EVICTING the oldest, never by emptying it. Clearing
+    // it wholesale meant the next thing a relay re-sent (and relays re-send
+    // their recent window on every re-open) looked new again — the same post,
+    // buffered a second time, shown twice in the feed.
     final seen = _seen[subId];
-    if (seen != null && seen.length > _maxInbox * 4) seen.clear();
+    if (seen != null) {
+      while (seen.length > _maxInbox * 4) {
+        seen.remove(seen.first);
+      }
+    }
   }
 
   /// Pop up to [max] buffered events for a subscription (oldest first), as JSON.

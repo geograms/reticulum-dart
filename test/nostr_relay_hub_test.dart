@@ -52,6 +52,8 @@ class _FakeClient implements NostrRelayClient {
   @override
   NostrEoseCallback? onEose;
   @override
+  NostrClosedCallback? onClosed;
+  @override
   NostrStatusCallback? onStatus;
 
   final List<String> subscribed = [];
@@ -111,12 +113,14 @@ void main() {
     dir.deleteSync(recursive: true);
   });
 
+  // No public defaults: these tests must never open a real socket.
   NostrRelayHub _hub(_FakeClient fake, {void Function(NostrEvent)? onStored}) =>
       NostrRelayHub(
         store: store,
         persistPath: persist,
         rnsClientFactory: (uri) => fake,
         onStored: onStored,
+        defaultRelays: const [],
       );
 
   test('init loads persisted relays + builds a client per endpoint', () async {
@@ -211,6 +215,35 @@ void main() {
         ['a post nobody has liked yet'],
         reason: 'this is the whole point: discovery can only show posts old '
             'enough to have gathered likes, so it can never be the All tab');
+    await hub.close();
+  });
+
+  test('a relay burst bigger than the rate cap still reaches the feed',
+      () async {
+    // A relay answers a fresh kind-1 subscription with its recent window in one
+    // go — hundreds of events, instantly, from every relay at once. The generic
+    // rate cap (15 per 250ms) used to run FIRST and threw that burst away before
+    // the quality gate saw a single post: four live relays, and an All tab that
+    // had not moved in sixteen hours.
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = _hub(fake);
+    await hub.init();
+
+    final sub = hub.subscribeFirehose(requireProfile: false);
+    final relaySub = fake.subscribed.last;
+
+    // Distinct authors — a relay's burst is the whole network talking, and the
+    // gate (rightly) throttles ONE author shouting.
+    const burst = 40; // >> the 15-per-window cap
+    for (var i = 0; i < burst; i++) {
+      final author = NostrCrypto.generateKeyPair();
+      fake.inject(relaySub,
+          _signed(author, content: 'post number $i', at: 1700000000 + i));
+    }
+
+    expect(hub.drainEvents(sub, max: burst * 2), hasLength(burst),
+        reason: 'the gate decides what the feed shows, not a cap sized for '
+            'sqlite writes on a thread the hub no longer runs on');
     await hub.close();
   });
 

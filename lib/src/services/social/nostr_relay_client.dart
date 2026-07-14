@@ -20,6 +20,11 @@ typedef NostrEventCallback = void Function(String subId, NostrEvent event);
 typedef NostrEoseCallback = void Function(String subId);
 typedef NostrStatusCallback = void Function(NostrRelayStatus status);
 
+/// The relay REFUSED a subscription (NIP-01 `CLOSED`): rate-limited, too many
+/// filters, auth-required. Not an error on the socket — the socket is fine — so
+/// nothing else in the stack would ever notice.
+typedef NostrClosedCallback = void Function(String subId, String message);
+
 abstract class NostrRelayClient {
   /// The endpoint URI this client serves (wss://…, rns://…, local).
   String get uri;
@@ -30,6 +35,7 @@ abstract class NostrRelayClient {
   NostrEventCallback? onEvent;
   NostrEoseCallback? onEose;
   NostrStatusCallback? onStatus;
+  NostrClosedCallback? onClosed;
 
   /// Open / begin maintaining the connection. Idempotent.
   Future<void> connect();

@@ -39,6 +39,8 @@ class NostrRnsClient implements NostrRelayClient {
   @override
   NostrEoseCallback? onEose;
   @override
+  NostrClosedCallback? onClosed;
+  @override
   NostrStatusCallback? onStatus;
 
   NostrRelayStatus _status = NostrRelayStatus.disconnected;

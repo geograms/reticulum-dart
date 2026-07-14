@@ -25,6 +25,8 @@ class NostrLocalClient implements NostrRelayClient {
   @override
   NostrEoseCallback? onEose;
   @override
+  NostrClosedCallback? onClosed;
+  @override
   NostrStatusCallback? onStatus;
 
   @override

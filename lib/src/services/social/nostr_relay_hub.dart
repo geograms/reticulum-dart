@@ -474,8 +474,24 @@ class NostrRelayHub {
   /// is kept in the local store at tier `self` — see [_isMine].
   String? selfPubkey;
 
-  /// Authors the user muted (the wapp already maintains this list).
+  /// Authors the user muted.
+  ///
+  /// Matched on the **12-char author key** (the first 12 hex chars of the
+  /// pubkey) as well as the full key, because that is what the feed shows on a
+  /// post and therefore what the user is actually pointing at when they mute.
+  /// Case-insensitive: the host keys upper, the wire is lower.
+  ///
+  /// A muted author is rejected by the gate BEFORE the post is stored. Muting is
+  /// not a display filter — it is a refusal to carry.
   Set<String> mutedAuthors = {};
+
+  bool _isMuted(String pub) {
+    if (mutedAuthors.isEmpty) return false;
+    final up = pub.toUpperCase();
+    if (mutedAuthors.contains(up) || mutedAuthors.contains(pub)) return true;
+    if (up.length < 12) return false;
+    return mutedAuthors.contains(up.substring(0, 12));
+  }
 
   String subscribeFirehose({bool requireProfile = true}) =>
       subscribeFirehoseWithId('fire${_subSeq++}', requireProfile: requireProfile);
@@ -665,7 +681,7 @@ class NostrRelayHub {
       event,
       hasProfile: _hasProfile,
       trusted: trustedAuthors.contains,
-      muted: mutedAuthors.contains,
+      muted: _isMuted,
       nowMs: nowMs,
     );
     switch (verdict) {

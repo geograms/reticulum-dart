@@ -250,6 +250,31 @@ void main() {
     await hub.close();
   });
 
+  test('a muted author is refused by the gate — by the 12-char key the feed shows',
+      () async {
+    // The user mutes what they can see, and what they can see on a post is the
+    // first 12 hex chars of the author's key. The host keys it upper-case; the
+    // wire is lower-case. Both must hit.
+    final spammer = NostrCrypto.generateKeyPair();
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = _hub(fake);
+    await hub.init();
+    hub.mutedAuthors = {spammer.publicKeyHex.substring(0, 12).toUpperCase()};
+
+    final sub = hub.subscribeFirehose(requireProfile: false);
+    final relaySub = fake.subscribed.last;
+
+    fake.inject(relaySub, _signed(spammer, content: 'buy my coin, scumbag'));
+    fake.inject(relaySub, _signed(kp, content: 'a real post'));
+
+    expect(hub.drainEvents(sub).map((e) => e['content']), ['a real post'],
+        reason: 'a mute is a refusal to CARRY, not a place to hide a post '
+            'we stored anyway');
+    expect(store.query(NostrFilter(authors: [spammer.publicKeyHex])), isEmpty,
+        reason: 'the muted post must never reach the store');
+    await hub.close();
+  });
+
   test('the firehose drops spam before it is ever stored', () async {
     final fake = _FakeClient('rns://${'a' * 64}');
     final hub = _hub(fake);

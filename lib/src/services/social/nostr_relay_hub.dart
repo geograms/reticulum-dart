@@ -509,10 +509,23 @@ class NostrRelayHub {
               _clients[e.uri]?.status == NostrRelayStatus.connected)
             e.uri,
       ];
+      _fireSilentRounds++;
       log?.call('firehose: silent for ${_fireSilenceMs ~/ 1000}s — re-opening '
           '(connected: ${live.isEmpty ? "NONE" : live.join(", ")})');
       _closeFirehoseReq();
       _openFirehoseReq();
+
+      // Twice in a row means the REQ is not the problem. A relay that has
+      // quietly dropped this subscription — no CLOSED, no error, the socket
+      // still carrying our other subs — will keep ignoring it however many
+      // times we ask down the same connection. Only a new connection is
+      // answered, and reconnecting replays every subscription we hold.
+      if (_fireSilentRounds >= 2) {
+        _fireSilentRounds = 0;
+        for (final uri in live) {
+          _clients[uri]?.reconnect();
+        }
+      }
     });
     // Ask for the held authors' profiles in one small batch, slowly. This is a
     // background chore, not a hot path: the posts are already held, and a REQ
@@ -524,6 +537,7 @@ class NostrRelayHub {
 
   Timer? _fireWatchdog;
   int _fireLastEventMs = 0;
+  int _fireSilentRounds = 0;
   static const int _fireSilenceMs = 60 * 1000;
 
   // Authors whose posts are held pending a profile. Fetched in ONE small REQ on
@@ -629,6 +643,7 @@ class NostrRelayHub {
   bool _onFirehose(NostrEvent event, int nowMs) {
     fireSeen++;
     _fireLastEventMs = nowMs; // the watchdog's proof of life
+    _fireSilentRounds = 0;
     final filter = _fireFilter;
     if (filter == null) return true;
 

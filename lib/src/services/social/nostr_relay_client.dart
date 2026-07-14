@@ -44,6 +44,13 @@ abstract class NostrRelayClient {
   /// [onEose] fires once the stored backlog is delivered.
   void subscribe(String subId, List<NostrFilter> filters);
 
+  /// Drop the connection and build it again (subscriptions are replayed).
+  ///
+  /// For when a relay has silently stopped answering a subscription it never
+  /// closed: the socket is fine, the REQ is on the wire, and nothing arrives.
+  /// Re-sending the REQ down the same connection does not bring it back.
+  void reconnect() {}
+
   /// Cancel a subscription.
   void unsubscribe(String subId);
 

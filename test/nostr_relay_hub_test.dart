@@ -67,6 +67,9 @@ class _FakeClient implements NostrRelayClient {
   void subscribe(String subId, List<NostrFilter> filters) =>
       subscribed.add(subId);
   @override
+  void reconnect() {}
+
+  @override
   void unsubscribe(String subId) {}
   @override
   Future<bool> publish(NostrEvent event) async {

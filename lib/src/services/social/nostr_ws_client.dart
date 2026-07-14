@@ -172,6 +172,15 @@ class NostrWsClient implements NostrRelayClient {
   }
 
   @override
+  void reconnect() {
+    if (_closed || _status != NostrRelayStatus.connected) return;
+    try {
+      _ch?.sink.close();
+    } catch (_) {}
+    _onDown('cycling the socket — the relay stopped answering');
+  }
+
+  @override
   void unsubscribe(String subId) {
     _subs.remove(subId);
     _send(NostrWire.close(subId));

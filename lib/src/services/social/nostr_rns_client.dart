@@ -117,6 +117,9 @@ class NostrRnsClient implements NostrRelayClient {
   }
 
   @override
+  void reconnect() {} // no socket to cycle
+
+  @override
   void unsubscribe(String subId) {
     _subs.remove(subId);
     _sinceOf.remove(subId);

@@ -48,6 +48,9 @@ class NostrLocalClient implements NostrRelayClient {
   }
 
   @override
+  void reconnect() {} // no socket to cycle
+
+  @override
   void unsubscribe(String subId) {}
 
   @override

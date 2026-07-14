@@ -400,6 +400,21 @@ class RelayRoleManager {
   /// starting discovery. Set by the wiring layer; null/0 means "not advertised".
   int Function()? uptimeProvider;
 
+  /// The owner's explicit decision, which OVERRIDES the hardware inference.
+  ///
+  /// The capacity rule (charger + a real uplink ⇒ indexer) is a good default and
+  /// a bad only-option: the old phone in a drawer could never say "yes, use
+  /// this", and the metered home line could never say "no, don't". So:
+  ///
+  ///   'always' — serve as an indexer regardless of what the hardware says
+  ///   'off'    — never serve, whatever the charger says
+  ///   'auto'   — the hardware decides (the default)
+  ///
+  /// Without this, picking "Always" changed a preference and nothing else: the
+  /// announce still said leaf, peers still filed us as a leaf, and no indexer
+  /// ever synced with us.
+  String volunteer = 'auto';
+
   /// What this device is physically made of (power, uplink, radios, coverage).
   /// The host owns it: some of it is measured (powered fraction, throughput),
   /// and some only a human can know — nothing on Android reports that there is
@@ -429,6 +444,29 @@ class RelayRoleManager {
             interests ?? InterestSet(),
             pubkey: selfPubkey);
 
+  /// Fold the owner's decision into the hardware picture, so the rest of the
+  /// derivation (caps, wide, capacity class) stays in ONE place.
+  CapacityProfile _withVolunteer(CapacityProfile p) {
+    switch (volunteer) {
+      case 'always':
+        return CapacityProfile(
+          capacity: p.capacity,
+          servingAllowed: true,
+          unlimited: true, // the owner said so; that is the whole point
+          dailyBudgetBytes: p.dailyBudgetBytes,
+        );
+      case 'off':
+        return CapacityProfile(
+          capacity: p.capacity,
+          servingAllowed: false,
+          unlimited: false,
+          dailyBudgetBytes: 0,
+        );
+      default:
+        return p;
+    }
+  }
+
   RelayAnnouncement get current => _current;
   Uint8List announcementAppData() =>
       _current.encode(uptimeSeconds: uptimeProvider?.call() ?? 0);
@@ -436,7 +474,8 @@ class RelayRoleManager {
   /// Apply a new capacity profile; re-derive the role and fire [onChanged] if it
   /// (or its capabilities/capacity) changed.
   void applyCapacity(CapacityProfile profile) {
-    final next = RelayAnnouncement.forCapacity(profile, interests,
+    final effective = _withVolunteer(profile);
+    final next = RelayAnnouncement.forCapacity(effective, interests,
         pubkey: selfPubkey, node: _node);
     if (next.role != _current.role ||
         next.caps != _current.caps ||

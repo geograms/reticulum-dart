@@ -268,9 +268,14 @@ void main() {
 
       h.subscribeFirehose(requireProfile: false);
       final firstFilter = fake.filters.last.single;
-      expect(firstFilter.since, isNull, reason: 'cold start: take the backlog');
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      expect(
+        firstFilter.since,
+        inInclusiveRange(nowSec - 601, nowSec - 599),
+        reason: 'cold start must ask only for the current ten-minute edition',
+      );
 
-      fake.inject(fake.subscribed.last, _signed(author, at: 1700000500));
+      fake.inject(fake.subscribed.last, _signed(author, at: nowSec));
       h.debugReopenFirehose(); // what the watchdog does
 
       final second = fake.filters.last.single;
@@ -281,7 +286,7 @@ void main() {
             'a re-open must not drag the same backlog back across the '
             'network — that replay is what fed every other bug here',
       );
-      expect(second.since, lessThanOrEqualTo(1700000500));
+      expect(second.since, inInclusiveRange(nowSec - 60, nowSec));
       await h.close();
     },
   );

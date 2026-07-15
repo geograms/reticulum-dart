@@ -289,6 +289,33 @@ void main() {
     },
   );
 
+  test('automatic edition never bypasses the strict curator', () async {
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final hub = NostrRelayHub(
+      store: store,
+      persistPath: persist,
+      defaultRelays: const [],
+      rnsClientFactory: (_) => fake,
+      firehoseOpeningDelay: const Duration(days: 1),
+      firehoseSettleDelay: Duration.zero,
+    );
+    await hub.init();
+
+    final sub = hub.subscribeFirehose(requireProfile: false);
+    fake.inject(
+      fake.subscribed.last,
+      _signed(
+        kp,
+        content: 'Useful context with an unengaged link https://example.com',
+        at: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      ),
+    );
+
+    expect(await hub.resumeAndRefreshFirehose(), 0);
+    expect(hub.drainEvents(sub), isEmpty);
+    await hub.close();
+  });
+
   test('a relay burst bigger than the rate cap still reaches the feed', () async {
     // A relay answers a fresh kind-1 subscription with its recent window in one
     // go — hundreds of events, instantly, from every relay at once. The generic

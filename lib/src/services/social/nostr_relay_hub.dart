@@ -129,6 +129,11 @@ class NostrRelayHub {
   final Duration firehoseOpeningDelay;
   final Duration firehoseSettleDelay;
 
+  /// A short beat after firing the (re)connects and before the REQ, so a fast
+  /// handshake is ready. Kept separate from [firehoseSettleDelay] so a test can
+  /// zero it out; in production the settle window does the real waiting anyway.
+  final Duration firehoseConnectGrace;
+
   NostrRelayHub({
     required this.store,
     this.persistPath,
@@ -139,6 +144,7 @@ class NostrRelayHub {
     this.pollInterval = kNostrPollInterval,
     this.firehoseOpeningDelay = const Duration(seconds: 12),
     this.firehoseSettleDelay = const Duration(seconds: 20),
+    this.firehoseConnectGrace = const Duration(seconds: 2),
   });
 
   // ── Relay list ────────────────────────────────────────────────────────────
@@ -371,9 +377,22 @@ class NostrRelayHub {
       log?.call(
         'firehose: unsubscribe $subId, ${_fireSubscribers.length} remain',
       );
-      if (_fireSubscribers.isEmpty) _teardownFirehose();
+      if (_fireSubscribers.isEmpty) {
+        // GRACE, not instant teardown. A wapp rebuild unsubscribes then
+        // re-subscribes within a frame; tearing down in that gap cancels the
+        // in-flight edition and re-arms the deadline ten minutes out, so the
+        // feed froze under ordinary use. Only truly leaving (no resubscribe
+        // within the grace) tears the machinery down.
+        _fireTeardownTimer?.cancel();
+        _fireTeardownTimer = Timer(const Duration(seconds: 6), () {
+          _fireTeardownTimer = null;
+          if (_fireSubscribers.isEmpty) _teardownFirehose();
+        });
+      }
     }
   }
+
+  Timer? _fireTeardownTimer;
 
   void _teardownDiscovery() {
     _discoFeedSub = null;
@@ -523,6 +542,8 @@ class NostrRelayHub {
       );
 
   String subscribeFirehoseWithId(String subId, {bool requireProfile = true}) {
+    _fireTeardownTimer?.cancel(); // a rebuild resubscribing — keep the machinery
+    _fireTeardownTimer = null;
     _fireSubscribers.add(subId);
     _inbox[subId] = Queue<NostrEvent>();
     _seen[subId] = <String>{};
@@ -841,6 +862,51 @@ class NostrRelayHub {
     _openFirehoseReq();
   }
 
+  /// Assume every internet socket is already dead (off-grid: relays cut idle
+  /// clients, the network drops). Rebuild them fresh before a poll so we never
+  /// REQ into a half-open socket that reads "connected" and delivers nothing.
+  Future<void> _connectRelaysFresh() async {
+    // Force a genuinely fresh socket per poll — the whole point of poll-and-close.
+    //
+    // Two failure modes have to be dodged at once:
+    //  1. A relay that cut our long-lived socket leaves it HALF-OPEN, still
+    //     reporting `connected`. A plain connect() no-ops on that, the REQ goes
+    //     into a dead pipe, and the feed silently freezes at its last edition.
+    //     So we disconnect() first — unconditionally — to kill any zombie.
+    //  2. Awaiting the reconnect (Future.wait on reconnectFresh) froze the whole
+    //     engine isolate on this device: one relay whose handshake never
+    //     completed held every timer and message on the isolate behind it.
+    //
+    // The resolution: disconnect() is SYNCHRONOUS (cancel timers, close the
+    // sink, null the channel — it cannot block), and connect() is fired
+    // UNAWAITED. connect()'s own `await ch.ready.timeout(8s)` yields to the event
+    // loop, so a slow or dead handshake delays only that one socket, never the
+    // isolate. The settle window after this is the real wait.
+    for (final e in _endpoints.values) {
+      if (!e.enabled) continue;
+      final c = _clients[e.uri];
+      if (c is NostrWsClient) {
+        c.disconnect(); // sync: kills a half-open/zombie socket, status→down
+        unawaited(c.connect()); // async, self-bounded by ch.ready.timeout(8s)
+      }
+    }
+    // A short beat so a fast handshake is ready before the REQ; the settle
+    // window does the real waiting.
+    if (firehoseConnectGrace > Duration.zero) {
+      await Future<void>.delayed(firehoseConnectGrace);
+    }
+  }
+
+  /// Drop the internet sockets after a poll. The public relays cannot afford a
+  /// crowd of persistent clients — so we hold a connection only for the seconds
+  /// of a poll and let it go. Local + RNS transports keep running.
+  void _disconnectRelays() {
+    for (final e in _endpoints.values) {
+      final c = _clients[e.uri];
+      if (c is NostrWsClient) c.disconnect();
+    }
+  }
+
   void _closeFirehoseReq() {
     final sub = _fireSub;
     _fireSub = null;
@@ -854,6 +920,8 @@ class NostrRelayHub {
   }
 
   void _teardownFirehose() {
+    _fireTeardownTimer?.cancel();
+    _fireTeardownTimer = null;
     _fireLifecycle++;
     _fireWatchdog?.cancel();
     _fireWatchdog = null;
@@ -1112,7 +1180,8 @@ class NostrRelayHub {
     required int n,
     required String mode,
   }) async {
-    if (_fireSubscribers.isEmpty || _fireSub == null) {
+    if (_fireSubscribers.isEmpty) {
+      log?.call('curator: $mode request skipped; no consumer');
       return 0;
     }
     if (_fireBatchInFlight) {
@@ -1120,12 +1189,18 @@ class NostrRelayHub {
       return 0;
     }
     _fireBatchInFlight = true;
-    final lifecycle = _fireLifecycle;
+    _fireBatchStartedMs = DateTime.now().millisecondsSinceEpoch;
     int? requestedUntil;
     log?.call(
       'curator: $mode request started, subscribers=${_fireSubscribers.length}',
     );
     try {
+      // POLL, off-grid style: assume the sockets are dead, rebuild them, then
+      // ask. This is what makes the feed survive a relay dropping us and a
+      // network that comes and goes — every edition starts from nothing.
+      log?.call('curator: $mode step=connect');
+      await _connectRelaysFresh();
+      log?.call('curator: $mode step=connected');
       if (mode == 'manual') {
         final until =
             _fireBackfillUntilSec ??
@@ -1139,11 +1214,17 @@ class NostrRelayHub {
         _closeFirehoseReq();
         _openFirehoseReq();
       }
+      log?.call('curator: $mode step=settle');
       await Future<void>.delayed(firehoseSettleDelay);
-      if (_fireSubscribers.isEmpty || lifecycle != _fireLifecycle) {
-        log?.call('curator: $mode request cancelled; subscriber changed');
+      log?.call('curator: $mode step=settled');
+      if (_fireSubscribers.isEmpty) {
+        log?.call('curator: $mode request cancelled; no consumer');
         return 0;
       }
+      // NOTE: deliberately not aborting on a lifecycle bump. A wapp rebuild
+      // churns the subscriber id mid-edition; as long as a consumer is present
+      // the batch is still wanted, and aborting on churn is what made editions
+      // never finish.
       if (mode == 'manual') {
         _fireBackfillUntilSec = _fireOldestSec > 0 ? _fireOldestSec - 1 : null;
         _closeFirehoseReq();
@@ -1190,6 +1271,10 @@ class NostrRelayHub {
       return 0;
     } finally {
       _fireBatchInFlight = false;
+      _lastEditionMs = DateTime.now().millisecondsSinceEpoch;
+      // Got the data — let the sockets go. Holding them is what got us cut.
+      _closeFirehoseReq();
+      _disconnectRelays();
     }
   }
 
@@ -1213,24 +1298,59 @@ class NostrRelayHub {
   /// Android had the sockets frozen. This is not the churn loop that got the
   /// subscription dropped: it runs on a user gesture, not a timer.
   void resumeNetwork() {
-    for (final e in _endpoints.values) {
-      if (!e.enabled) continue;
-      final c = _clients[e.uri];
-      if (c is NostrWsClient) c.resume();
+    // Off-grid: sockets are assumed dead on resume. Rather than nurse the old
+    // ones, bring the deadline forward so the next tick runs a fresh poll — the
+    // edition reconnects everything from scratch anyway. Only if a consumer is
+    // present and the last poll is genuinely stale, so foregrounding twice in a
+    // row does not double-poll.
+    if (_fireSubscribers.isEmpty) {
+      log?.call('resume: no consumer');
+      return;
     }
-    log?.call('resume: sockets checked');
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastEditionMs > 60 * 1000) {
+      _nextAutomaticAtMs = now; // due now → next backgroundTick refreshes
+      log?.call('resume: last edition stale, refreshing');
+      backgroundTick(nowMs: now);
+    } else {
+      log?.call('resume: last edition fresh, keeping');
+    }
   }
+
+  int _lastEditionMs = 0;
 
   /// Native Android and isolate timers both call this. The deadline is advanced
   /// before starting work, so concurrent heartbeats cannot duplicate a batch;
   /// an empty or failed batch also cannot kill the next ten-minute edition.
+  int _bgTickN = 0;
+  int _fireBatchStartedMs = 0;
+  // Longer than a legitimate poll (fresh-connect + settle) but far shorter than
+  // a wedge. A batch still running past this is dead and gets abandoned.
+  static const int _fireBatchMaxMs = 90 * 1000;
   void backgroundTick({int? nowMs}) {
-    if (_fireSubscribers.isEmpty || _fireSub == null) return;
     final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
-    if (_nextAutomaticAtMs == 0) {
-      _nextAutomaticAtMs = now;
+    if ((_bgTickN++ % 30) == 0) {
+      // Heartbeat proof-of-life + the guard state, so a silent scheduler is
+      // never again a mystery. Throttled so it is not one line per 2s tick.
+      log?.call('curator: tick subs=${_fireSubscribers.length} '
+          'dueIn=${((_nextAutomaticAtMs - now) / 1000).round()}s '
+          'inFlight=$_fireBatchInFlight');
+    }
+    if (_fireSubscribers.isEmpty) return; // no consumer, nothing to deliver to
+    // A batch that never finished — the app was frozen mid-edition, a socket
+    // hung, the isolate stalled — must NOT wedge every future edition. If it has
+    // overstayed the hard cap, abandon it. Off-grid: assume anything in flight
+    // for too long is dead.
+    if (_fireBatchInFlight &&
+        now - _fireBatchStartedMs > _fireBatchMaxMs) {
+      log?.call('curator: abandoning a stuck batch '
+          '(${((now - _fireBatchStartedMs) / 1000).round()}s in flight)');
+      _fireBatchInFlight = false;
+      _closeFirehoseReq();
+      _disconnectRelays();
     }
     if (now < _nextAutomaticAtMs) return;
+    if (_fireBatchInFlight) return;
     if (_fireBatchInFlight) {
       log?.call('curator: deadline ignored; batch already in flight');
       return;
@@ -1898,8 +2018,31 @@ class NostrRelayHub {
   /// Pop up to [max] buffered events for a subscription (oldest first), as JSON.
   /// Empty when the inbox is drained — the wapp polls this each tick.
   List<Map<String, dynamic>> drainEvents(String subId, {int max = 50}) {
-    final inbox = _inbox[subId];
-    if (inbox == null) return const [];
+    var inbox = _inbox[subId];
+    if (inbox == null) {
+      // Self-heal a firehose subscription the caller is still draining.
+      //
+      // The wapp acquires its firehose subId ONCE and drains it every tick,
+      // forever; it only re-subscribes when its cached id is empty. But the hub
+      // tears the firehose down 6s after the last subscriber leaves (Social
+      // closed) and can churn its lifecycle, which deletes this inbox and drops
+      // the id from _fireSubscribers. The wapp never notices — it keeps draining
+      // a corpse, so the "All" feed freezes at its last edition while the
+      // launcher Hero stays fresh (the Hero re-acquires its subId every cycle
+      // with `??=`, which is the ONLY reason it self-heals and the wapp did not).
+      //
+      // So: draining a firehose id is itself the signal that a consumer wants it
+      // live. Resurrect it here — re-register the subscriber, recreate the inbox,
+      // re-arm the REQ and schedule a catch-up edition — and the wapp gets the
+      // Hero's self-healing for free, with no wapp rebuild. It costs one
+      // re-subscribe on the first drain after a teardown; every drain after finds
+      // the inbox and takes this branch never again.
+      if (subId.startsWith('fire')) {
+        subscribeFirehoseWithId(subId);
+        inbox = _inbox[subId];
+      }
+      if (inbox == null) return const [];
+    }
     final out = <Map<String, dynamic>>[];
     while (inbox.isNotEmpty && out.length < max) {
       final event = inbox.removeFirst();

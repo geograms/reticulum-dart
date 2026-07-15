@@ -66,8 +66,12 @@ class NostrWsClient implements NostrRelayClient {
       // repeatedly timed out on Android while ordinary TCP remained healthy.
       final ch = WebSocketChannel.connect(Uri.parse(uri));
       _ch = ch;
-      // ready throws on a failed handshake (bad TLS / unreachable host).
-      await ch.ready;
+      // ready throws on a failed handshake (bad TLS / unreachable host) — but on
+      // Android it can also HANG forever, no error, no completion. An unbounded
+      // await here is what froze the whole engine isolate: a poll waits for a
+      // socket that will never open, every timer and message on that isolate
+      // waits behind it, and the feed dies. Off-grid means bounding every wait.
+      await ch.ready.timeout(const Duration(seconds: 8));
       _setStatus(NostrRelayStatus.connected);
       _backoffMs = 1000;
       _touch(); // start the idle watchdog for this socket
@@ -86,6 +90,12 @@ class NostrWsClient implements NostrRelayClient {
       }
       _pendingPublish.clear();
     } catch (e) {
+      // Drop the half-open channel a hung/failed handshake left behind, or it
+      // leaks a socket per poll.
+      try {
+        _ch?.sink.close();
+      } catch (_) {}
+      _ch = null;
       _onDown('connect failed: $e');
     }
   }
@@ -219,6 +229,30 @@ class NostrWsClient implements NostrRelayClient {
   }
 
   int _lastFrameMs = 0;
+
+  @override
+  void disconnect() {
+    // Close the socket, keep it reconnectable: _closed stays false and _subs
+    // are kept so the next connect() replays them. The relay stops seeing a
+    // long-lived client to cut.
+    _idle?.cancel();
+    _idle = null;
+    _retry?.cancel();
+    _sub?.cancel();
+    _sub = null;
+    try {
+      _ch?.sink.close();
+    } catch (_) {}
+    _ch = null;
+    _setStatus(NostrRelayStatus.disconnected);
+  }
+
+  @override
+  Future<void> reconnectFresh() async {
+    if (_closed) return;
+    disconnect();
+    await connect();
+  }
 
   @override
   void reconnect() {

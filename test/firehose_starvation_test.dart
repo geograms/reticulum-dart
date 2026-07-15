@@ -72,6 +72,10 @@ class _FakeClient implements NostrRelayClient {
   @override
   void resume() {}
   @override
+  void disconnect() {}
+  @override
+  Future<void> reconnectFresh() async {}
+  @override
   void reconnect() => reconnects++;
   @override
   void unsubscribe(String subId) {}

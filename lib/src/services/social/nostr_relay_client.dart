@@ -51,6 +51,17 @@ abstract class NostrRelayClient {
   /// immediately instead of waiting out backoff. No-op for local transports.
   void resume() {}
 
+  /// Close the socket but stay RECONNECTABLE — the subscriptions are kept and
+  /// replayed on the next [connect]. This is the off-grid poll model: public
+  /// relays cut a long-lived connection, so we hold one only for the seconds of
+  /// a poll and drop it in between. No-op for local/RNS transports (no socket).
+  void disconnect() {}
+
+  /// Force a genuinely fresh socket: a relay that has silently dropped its half
+  /// leaves ours reading "connected" forever. Assume every socket is already
+  /// dead and rebuild it. No-op for local/RNS.
+  Future<void> reconnectFresh() async {}
+
   /// Drop the connection and build it again (subscriptions are replayed).
   ///
   /// For when a relay has silently stopped answering a subscription it never

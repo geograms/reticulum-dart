@@ -70,6 +70,10 @@ class _FakeClient implements NostrRelayClient {
   @override
   void resume() {}
   @override
+  void disconnect() {}
+  @override
+  Future<void> reconnectFresh() async {}
+  @override
   void reconnect() {}
 
   @override
@@ -328,6 +332,7 @@ void main() {
         pollInterval: const Duration(milliseconds: 100),
         firehoseOpeningDelay: const Duration(days: 1),
         firehoseSettleDelay: const Duration(milliseconds: 30),
+        firehoseConnectGrace: Duration.zero,
       );
       await hub.init();
       hub.subscribeFirehose(requireProfile: false);
@@ -335,11 +340,15 @@ void main() {
       final initialRequests = fake.subscribed.length;
       final firstDeadline = DateTime.now().millisecondsSinceEpoch + 1000;
       hub.backgroundTick(nowMs: firstDeadline);
-      hub.backgroundTick(nowMs: firstDeadline);
+      hub.backgroundTick(nowMs: firstDeadline); // overlap: ignored, in flight
+      // The edition reconnects the sockets fresh before it REQs (off-grid: never
+      // trust an existing socket), so the REQ lands a microtask later.
+      await Future<void>.delayed(const Duration(milliseconds: 5));
       expect(fake.subscribed.length, initialRequests + 1);
 
       await Future<void>.delayed(const Duration(milliseconds: 50));
       hub.backgroundTick(nowMs: firstDeadline + 101);
+      await Future<void>.delayed(const Duration(milliseconds: 5));
       expect(fake.subscribed.length, initialRequests + 2);
       await hub.close();
     },
@@ -362,6 +371,7 @@ void main() {
         pollInterval: const Duration(milliseconds: 100),
         firehoseOpeningDelay: const Duration(days: 1),
         firehoseSettleDelay: const Duration(milliseconds: 10),
+        firehoseConnectGrace: Duration.zero,
       );
       await hub.init();
 
@@ -376,6 +386,7 @@ void main() {
 
       final before = fake.subscribed.length;
       hub.backgroundTick(nowMs: due);
+      await Future<void>.delayed(const Duration(milliseconds: 5));
       expect(
         fake.subscribed.length,
         before + 1,
@@ -607,6 +618,45 @@ void main() {
         reason:
             'unsubscribe left _discoFeedSub pointing at the deleted inbox, '
             'so refreshing the feed killed it for the life of the process',
+      );
+      await hub.close();
+    },
+  );
+
+  test(
+    'a torn-down firehose subId self-heals on drain (the frozen All feed)',
+    () async {
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = _hub(fake);
+      await hub.init();
+
+      // The wapp acquires a firehose subId once and caches it forever.
+      final sub = hub.subscribeFirehose(requireProfile: false);
+
+      // The hub tears the firehose down (Social closed): the id is dropped from
+      // _fireSubscribers and its inbox deleted. The wapp does NOT know — it still
+      // holds the id and keeps draining it every tick.
+      hub.unsubscribe(sub);
+      expect(
+        hub.drainEvents(sub),
+        isEmpty,
+        reason: 'draining a torn-down id resurrects it, but has nothing yet',
+      );
+
+      // A fresh edition arrives after the wapp resumed draining. Before the fix
+      // this went into a deleted inbox and the All feed stayed frozen forever;
+      // now the drain above re-registered the id, so the post reaches it.
+      final relaySub = fake.subscribed.last;
+      fake.inject(relaySub, _signed(kp, content: 'post after self-heal'));
+      hub.debugCurateNow();
+
+      expect(
+        hub.drainEvents(sub).map((e) => e['content']),
+        ['post after self-heal'],
+        reason:
+            'the wapp only re-subscribes when its cached id is empty, so a '
+            'torn-down firehose id MUST resurrect on drain — otherwise the All '
+            'feed freezes while the Hero (which re-acquires each cycle) stays fresh',
       );
       await hub.close();
     },

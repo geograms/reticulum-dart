@@ -52,6 +52,10 @@ class NostrLocalClient implements NostrRelayClient {
   int drainFrames() => 0;
   @override
   void resume() {}
+  @override
+  void disconnect() {}
+  @override
+  Future<void> reconnectFresh() async {}
 
   @override
   void reconnect() {} // no socket to cycle

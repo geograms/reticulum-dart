@@ -1164,6 +1164,13 @@ class NostrRelayHub {
     log?.call('resume: sockets checked, firehose re-asked since watermark');
   }
 
+  /// Resume the relay sockets and replace the foreground firehose batch once
+  /// the relays have had time to answer. This is deliberately automatic, not
+  /// the pull-to-refresh backfill path: returning from Android background must
+  /// retain the current timeline until newer curated notes are ready.
+  Future<int> resumeAndRefreshFirehose({int n = 100}) =>
+      _requestFirehoseBatch(n: n, mode: 'automatic');
+
   /// A refresh: hand the feed the best [n] of what is ranked, right now.
   ///
   /// The user pulled the timeline down. That is a request for MORE, immediately —

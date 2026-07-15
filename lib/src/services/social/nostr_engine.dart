@@ -403,6 +403,20 @@ class NostrClient {
   /// the missed window.
   void resumeNetwork() => _send({'cmd': 'resume'});
 
+  Future<int> resumeAndRefreshFirehose({int n = 100}) {
+    final req = 'r${_refreshSeq++}';
+    final completer = Completer<int>();
+    _refreshWaiters[req] = completer;
+    _send({'cmd': 'resumeRefresh', 'req': req, 'n': n});
+    return completer.future.timeout(
+      const Duration(seconds: 25),
+      onTimeout: () {
+        _refreshWaiters.remove(req);
+        return 0;
+      },
+    );
+  }
+
   /// Firehose accounting: kept / pending / expired, plus a count per drop
   /// reason. Empty until the first firehose subscription exists.
   Map<String, int> firehoseStats = const {};
@@ -683,6 +697,19 @@ class _Engine {
           );
         case 'resume':
           _hub.resumeNetwork();
+        case 'resumeRefresh':
+          final req = '${c['req']}';
+          unawaited(
+            _hub.resumeAndRefreshFirehose(n: (c['n'] as int?) ?? 100).then((
+              count,
+            ) {
+              toMain.send({
+                'snap': 'refreshBurstDone',
+                'req': req,
+                'count': count,
+              });
+            }),
+          );
         case 'unsubscribe':
           _drainSubs.remove('${c['subId']}');
           _hub.unsubscribe('${c['subId']}');

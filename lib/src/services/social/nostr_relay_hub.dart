@@ -882,51 +882,6 @@ class NostrRelayHub {
     _openFirehoseReq();
   }
 
-  /// Assume every internet socket is already dead (off-grid: relays cut idle
-  /// clients, the network drops). Rebuild them fresh before a poll so we never
-  /// REQ into a half-open socket that reads "connected" and delivers nothing.
-  Future<void> _connectRelaysFresh() async {
-    // Force a genuinely fresh socket per poll — the whole point of poll-and-close.
-    //
-    // Two failure modes have to be dodged at once:
-    //  1. A relay that cut our long-lived socket leaves it HALF-OPEN, still
-    //     reporting `connected`. A plain connect() no-ops on that, the REQ goes
-    //     into a dead pipe, and the feed silently freezes at its last edition.
-    //     So we disconnect() first — unconditionally — to kill any zombie.
-    //  2. Awaiting the reconnect (Future.wait on reconnectFresh) froze the whole
-    //     engine isolate on this device: one relay whose handshake never
-    //     completed held every timer and message on the isolate behind it.
-    //
-    // The resolution: disconnect() is SYNCHRONOUS (cancel timers, close the
-    // sink, null the channel — it cannot block), and connect() is fired
-    // UNAWAITED. connect()'s own `await ch.ready.timeout(8s)` yields to the event
-    // loop, so a slow or dead handshake delays only that one socket, never the
-    // isolate. The settle window after this is the real wait.
-    for (final e in _endpoints.values) {
-      if (!e.enabled) continue;
-      final c = _clients[e.uri];
-      if (c is NostrWsClient) {
-        c.disconnect(); // sync: kills a half-open/zombie socket, status→down
-        unawaited(c.connect()); // async, self-bounded by ch.ready.timeout(8s)
-      }
-    }
-    // A short beat so a fast handshake is ready before the REQ; the settle
-    // window does the real waiting.
-    if (firehoseConnectGrace > Duration.zero) {
-      await Future<void>.delayed(firehoseConnectGrace);
-    }
-  }
-
-  /// Drop the internet sockets after a poll. The public relays cannot afford a
-  /// crowd of persistent clients — so we hold a connection only for the seconds
-  /// of a poll and let it go. Local + RNS transports keep running.
-  void _disconnectRelays() {
-    for (final e in _endpoints.values) {
-      final c = _clients[e.uri];
-      if (c is NostrWsClient) c.disconnect();
-    }
-  }
-
   void _closeFirehoseReq() {
     final sub = _fireSub;
     _fireSub = null;
@@ -1215,12 +1170,18 @@ class NostrRelayHub {
       'curator: $mode request started, subscribers=${_fireSubscribers.length}',
     );
     try {
-      // POLL, off-grid style: assume the sockets are dead, rebuild them, then
-      // ask. This is what makes the feed survive a relay dropping us and a
-      // network that comes and goes — every edition starts from nothing.
-      log?.call('curator: $mode step=connect');
-      await _connectRelaysFresh();
-      log?.call('curator: $mode step=connected');
+      // Re-ask on the EXISTING sockets — never reopen them here.
+      //
+      // On this device, opening a WebSocket inside the nostr-engine isolate
+      // freezes the whole isolate (the synchronous part of WebSocketChannel.connect
+      // blocks it; even fired unawaited it never yields). The device log caught it
+      // exactly: an edition logged `step=connect` and never reached the line after
+      // the reconnect, so every timer on the isolate stalled behind it and the feed
+      // died. The sockets opened at engine startup DO work and keep delivering
+      // (the same log shows seen=103), so an edition just closes and re-issues the
+      // REQ on them with a fresh `since` window; a relay that cut us is recovered
+      // by the client's own idle watchdog, not by reopening from here.
+      log?.call('curator: $mode step=reask');
       if (mode == 'manual') {
         final until =
             _fireBackfillUntilSec ??
@@ -1292,9 +1253,10 @@ class NostrRelayHub {
     } finally {
       _fireBatchInFlight = false;
       _lastEditionMs = DateTime.now().millisecondsSinceEpoch;
-      // Got the data — let the sockets go. Holding them is what got us cut.
+      // Close only the REQ, NOT the sockets. Disconnecting relays here re-opened
+      // them on the next edition, which freezes the engine isolate on this device
+      // (see step=reask above). The persistent sockets keep the feed alive.
       _closeFirehoseReq();
-      _disconnectRelays();
     }
   }
 
@@ -1366,8 +1328,7 @@ class NostrRelayHub {
       log?.call('curator: abandoning a stuck batch '
           '(${((now - _fireBatchStartedMs) / 1000).round()}s in flight)');
       _fireBatchInFlight = false;
-      _closeFirehoseReq();
-      _disconnectRelays();
+      _closeFirehoseReq(); // REQ only — reopening sockets freezes this isolate
     }
     if (now < _nextAutomaticAtMs) return;
     if (_fireBatchInFlight) return;

@@ -550,6 +550,21 @@ class NostrRelayHub {
     _fireBatchMeta[subId] = <String, Map<String, dynamic>>{};
     _fireFilter ??= FirehoseFilter(requireProfile: requireProfile);
 
+    // Ensure the always-on firehose machinery BEFORE the _fireSub early-out.
+    //
+    // The sweep, curate, profile-fetch and watchdog timers must run whenever ANY
+    // subscriber exists — not only for whoever happened to arm _fireSub. They
+    // used to be created only on the arming path, AFTER the `_fireSub != null`
+    // return below. That left a lethal state: teardown (last subscriber gone)
+    // cancels every timer but deliberately KEEPS _fireFilter with its held
+    // posts; a poll's `finally` also nulls _fireSub without touching the timers;
+    // so a subscriber arriving afterwards could take the early return and never
+    // recreate the sweep. The gate then sat with posts held pending-profile and
+    // NO sweep to release them — every consumer drained zero and the All feed
+    // froze while held=N stayed constant. All four are ??= idempotent, so
+    // calling this on every subscribe is free once armed.
+    _ensureFirehoseMachinery();
+
     if (_fireSub != null) {
       // The launcher and Social hand the same firehose to each other. A second
       // subscriber used to miss the only opening timer and drain zero forever.
@@ -559,6 +574,15 @@ class NostrRelayHub {
 
     final lifecycle = ++_fireLifecycle;
     _openFirehoseReq();
+    _scheduleOpeningBatch(subId, lifecycle);
+    return subId;
+  }
+
+  /// Create the firehose's always-on timers if they are not already running.
+  /// Idempotent (every timer is `??=`), so it is safe to call on every
+  /// subscribe. See [subscribeFirehoseWithId] for why this must not live behind
+  /// the `_fireSub` arming check.
+  void _ensureFirehoseMachinery() {
     // Watchdog. A relay caps how many subscriptions one connection may hold and
     // silently drops the excess — and we hold a lot of them (profiles, stats,
     // reactions, web-of-trust, search…), several of which churn their ids. The
@@ -659,9 +683,6 @@ class NostrRelayHub {
       const Duration(seconds: 30),
       (_) => backgroundTick(),
     );
-    // The opening batch: the subscribe itself pulled the newest window; give it
-    // a moment to be gated and ranked, then fill the tab at once.
-    _scheduleOpeningBatch(subId, lifecycle);
 
     _fireSweepTimer ??= Timer.periodic(const Duration(seconds: 15), (_) {
       final f = _fireFilter;
@@ -691,7 +712,6 @@ class NostrRelayHub {
         );
       }
     });
-    return subId;
   }
 
   Timer? _fireWatchdog;

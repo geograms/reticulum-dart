@@ -39,6 +39,13 @@ class NostrEventKind {
 
 /// NOSTR Event structure (NIP-01)
 class NostrEvent {
+  /// In-memory only (never serialized): this object's signature has already
+  /// been checked in this isolate. Verification is pure-Dart BigInt Schnorr —
+  /// ~100ms on a budget phone — so paying it twice for the same object is real
+  /// money. Set by the hub after a successful verify, and by origins whose
+  /// events were verified before they were stored (the local store replay).
+  bool preVerified = false;
+
   /// 32-byte lowercase hex event id
   String? id;
 

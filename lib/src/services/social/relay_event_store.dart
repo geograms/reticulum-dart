@@ -278,7 +278,10 @@ class RelayEventStore {
     final id = e.id;
     final sig = e.sig;
     if (id == null || sig == null || id.isEmpty || sig.isEmpty) return false;
-    if (verify && !e.verify()) return false; // recomputes id + checks Schnorr
+    // preVerified = this object already passed Schnorr in this isolate (the
+    // hub checks at keep-time). Paying ~100ms of BigInt twice per event is what
+    // pegged the engine isolate.
+    if (verify && !e.preVerified && !e.verify()) return false;
 
     // Duplicate?
     final dup = _db.select('SELECT 1 FROM events WHERE id = ? LIMIT 1', [id]);

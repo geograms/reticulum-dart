@@ -128,9 +128,15 @@ class NostrWsClient implements NostrRelayClient {
     if (msg == null) return;
     switch (msg) {
       case NostrEventMsg(:final subId, :final event):
-        // Verify inline — this client runs inside the NostrEngine background
-        // isolate, so Schnorr never touches the UI isolate.
-        if (event.verify()) onEvent?.call(subId, event);
+        // NO verify here. Verifying every delivery inline is what pegged the
+        // engine isolate at 100% of a core (pure-Dart BigInt Schnorr, ~100ms a
+        // signature on a budget phone): the kind-7 firehose alone is thousands
+        // of events, four relays redeliver each one, and ~80% get rejected by
+        // the content gate anyway. The HUB verifies exactly what it is about to
+        // keep, deliver or persist — after dedup, after the gate — which cuts
+        // the crypto by more than an order of magnitude and un-wedges every
+        // timer and socket that shares this isolate.
+        onEvent?.call(subId, event);
       case NostrEoseMsg(:final subId):
         onEose?.call(subId);
       case NostrNoticeMsg(:final message):

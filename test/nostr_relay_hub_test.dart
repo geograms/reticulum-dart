@@ -345,6 +345,47 @@ void main() {
     },
   );
 
+  test(
+    'tab-toggle churn cannot push the automatic deadline out of reach',
+    () async {
+      // Every All -> Following -> All toggle tears the firehose down and brings
+      // a new "first subscriber". Re-arming the deadline on each one meant a
+      // user merely USING the app kept the first automatic edition permanently
+      // ten minutes away. The schedule belongs to the wall clock: a re-subscribe
+      // inherits the pending deadline, and a due tick after churn still fires.
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = NostrRelayHub(
+        store: store,
+        persistPath: persist,
+        defaultRelays: const [],
+        rnsClientFactory: (_) => fake,
+        pollInterval: const Duration(milliseconds: 100),
+        firehoseOpeningDelay: const Duration(days: 1),
+        firehoseSettleDelay: const Duration(milliseconds: 10),
+      );
+      await hub.init();
+
+      final first = hub.subscribeFirehose(requireProfile: false);
+      final due = DateTime.now().millisecondsSinceEpoch + 150;
+
+      // Churn: close the tab, reopen it. Twice, for good measure.
+      hub.unsubscribe(first);
+      final second = hub.subscribeFirehose(requireProfile: false);
+      hub.unsubscribe(second);
+      hub.subscribeFirehose(requireProfile: false);
+
+      final before = fake.subscribed.length;
+      hub.backgroundTick(nowMs: due);
+      expect(
+        fake.subscribed.length,
+        before + 1,
+        reason: 'the deadline armed by the FIRST subscribe must still be '
+            'honoured — churn used to reset it to now+10min every time',
+      );
+      await hub.close();
+    },
+  );
+
   test('a relay burst bigger than the rate cap still reaches the feed', () async {
     // A relay answers a fresh kind-1 subscription with its recent window in one
     // go — hundreds of events, instantly, from every relay at once. The generic

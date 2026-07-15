@@ -619,12 +619,21 @@ class NostrRelayHub {
     // Network collection needs [firehoseSettleDelay] before a batch can be
     // handed over. Start each collection early enough that commits, rather
     // than requests, remain on the advertised [pollInterval] cadence.
-    _nextAutomaticAtMs =
-        DateTime.now().millisecondsSinceEpoch +
-        max(
-          0,
-          pollInterval.inMilliseconds - firehoseSettleDelay.inMilliseconds,
-        );
+    //
+    // ARM ONLY IF NOTHING IS ARMED. A new "first subscriber" appears on every
+    // tab toggle (All -> Following -> All) and page rebuild, and re-arming the
+    // deadline each time pushed the first automatic edition ten minutes into
+    // the future again and again — a user merely USING the app could keep the
+    // deadline permanently out of reach. The schedule belongs to the wall
+    // clock, not to the subscriber's lifecycle.
+    if (_nextAutomaticAtMs == 0) {
+      _nextAutomaticAtMs =
+          DateTime.now().millisecondsSinceEpoch +
+          max(
+            0,
+            pollInterval.inMilliseconds - firehoseSettleDelay.inMilliseconds,
+          );
+    }
     _curateTimer ??= Timer.periodic(
       const Duration(seconds: 30),
       (_) => backgroundTick(),
@@ -855,7 +864,9 @@ class NostrRelayHub {
     _curateTimer?.cancel();
     _curateTimer = null;
     _fireBatchInFlight = false;
-    _nextAutomaticAtMs = 0;
+    // The DEADLINE SURVIVES teardown. Closing Social only means nobody is
+    // looking right now; when the tab reopens (often seconds later) the next
+    // edition must still be where the clock left it, not ten minutes away.
     // The REQ stops; the KNOWLEDGE stays. Nulling the filter here threw away
     // every held post and every author we were still waiting on a name for —
     // on every page close — so re-opening Social always started from nothing and
@@ -952,6 +963,9 @@ class NostrRelayHub {
     );
     switch (verdict) {
       case FeedKeep():
+        // The gate said yes — NOW it is worth cryptography. Rejected events
+        // (most of the firehose) never reach a verify at all.
+        if (!_verify(event)) return true;
         // Store only what we would show. Persisting the whole public firehose
         // would be an INSERT per junk post on the engine isolate, forever.
         if (store.put(event)) {
@@ -986,6 +1000,7 @@ class NostrRelayHub {
         //
         // [_profileWanted] instead accumulates authors and asks for them in one
         // small batch on a slow timer (see [_firehoseProfileFetch]).
+        if (!_verify(event)) return true; // held posts are delivered later
         filter.hold(event, nowMs);
         if (_profileWanted.length < 2000) _profileWanted.add(event.pubkey);
       case FeedReject():
@@ -997,6 +1012,7 @@ class NostrRelayHub {
   /// A kind-0 arrived — from ANY subscription. Remember it, store it, and hand
   /// back every post of that author's that was waiting to learn their name.
   void _releaseProfile(NostrEvent event, int nowMs) {
+    if (!_verify(event)) return; // a forged profile names nobody
     _haveProfile.add(event.pubkey);
     _noProfile.remove(event.pubkey);
     _profileWanted.remove(event.pubkey);
@@ -1220,6 +1236,8 @@ class NostrRelayHub {
       return;
     }
     _nextAutomaticAtMs = now + pollInterval.inMilliseconds;
+    log?.call('curator: automatic deadline fired; next in '
+        '${pollInterval.inMinutes}m');
     unawaited(_requestFirehoseBatch(n: 100, mode: 'automatic'));
   }
 
@@ -1727,6 +1745,29 @@ class NostrRelayHub {
     return false;
   }
 
+  /// Signature check, paid once per event id — and ONLY for events we are
+  /// about to keep, deliver or persist. Verification is pure-Dart BigInt
+  /// Schnorr (~100ms on a budget phone). Verifying every delivery inline —
+  /// which is what the ws client used to do — pegged this isolate at 100% of a
+  /// core on the kind-7 firehose alone (profiler: 75% of samples in BigInt),
+  /// and everything sharing the isolate starved: the edition timers, the port
+  /// messages, the websocket handshakes. The content gate rejects most of the
+  /// firehose for free; only the survivors are worth cryptography.
+  final Set<String> _verifiedIds = <String>{};
+  static const int _verifiedMax = 8000;
+  bool _verify(NostrEvent e) {
+    final id = e.id;
+    if (id == null || id.isEmpty) return false;
+    if (e.preVerified || _verifiedIds.contains(id)) return true;
+    if (!e.verify()) return false;
+    e.preVerified = true;
+    _verifiedIds.add(id);
+    while (_verifiedIds.length > _verifiedMax) {
+      _verifiedIds.remove(_verifiedIds.first);
+    }
+    return true;
+  }
+
   void _onEvent(String subId, NostrEvent event) {
     eventsSeen++;
 
@@ -1739,7 +1780,7 @@ class NostrRelayHub {
     // notification list survived only as long as the process did, and opening
     // the post it was about went back to the network for something we had
     // already been given.
-    if (_isMine(event)) {
+    if (_isMine(event) && _verify(event)) {
       if (store.put(event, tier: 0)) {
         eventsStored++;
         onStored?.call(event);
@@ -1761,7 +1802,14 @@ class NostrRelayHub {
     // the whole set the persistence was ever for.
     if (event.kind == NostrEventKind.reaction) {
       final liked = _firstETag(event);
-      if (liked != null && _statReact.containsKey(liked)) {
+      // Persisted receipts are attributable, so they are verified — but only
+      // for TRACKED posts, which keeps the crypto bounded by what is on
+      // screen. The in-memory tallies below stay unverified on purpose: they
+      // are display hints on a bounded map, and the post itself is verified
+      // before it is ever shown.
+      if (liked != null &&
+          _statReact.containsKey(liked) &&
+          _verify(event)) {
         if (store.addReaction(liked, event.pubkey)) reactionsStored++;
       }
     }
@@ -1819,6 +1867,7 @@ class NostrRelayHub {
     _rateCount++;
 
     // Merge into the unified store (dedup + replaceable/deletion handled there).
+    if (!_verify(event)) return;
     if (store.put(event)) {
       eventsStored++;
       onStored?.call(event);

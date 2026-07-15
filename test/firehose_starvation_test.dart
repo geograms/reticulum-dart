@@ -221,6 +221,35 @@ void main() {
     },
   );
 
+  test('a FORGED event that passes the content gate is still refused', () async {
+    // Verification moved from "every delivery" to "what we keep" — for speed.
+    // The security property must survive the move: a good-looking post with a
+    // bad signature gets past the cheap gate and must die at the verify.
+    final fake = _FakeClient('rns://${'a' * 64}');
+    final h = hub(fake);
+    await h.init();
+
+    final sub = h.subscribeFirehose(requireProfile: false);
+    final relaySub = fake.subscribed.last;
+
+    final honest = NostrCrypto.generateKeyPair();
+    final forged = _signed(honest,
+        content: 'a perfectly plausible sentence someone might write');
+    // Corrupt the signature after signing: id stays right, Schnorr fails.
+    final bad = NostrEvent.fromJson({
+      ...forged.toJson(),
+      'sig': ('0' * 128),
+    });
+    fake.inject(relaySub, bad);
+    h.debugCurateNow();
+
+    expect(h.drainEvents(sub), isEmpty,
+        reason: 'forged events must never be delivered');
+    expect(store.byId, isNot(contains(bad.id)),
+        reason: 'forged events must never be stored');
+    await h.close();
+  });
+
   test('the kind-0 that releases held posts is never rate-shed', () async {
     // The profile answers arrive as a burst — 100 authors × every relay — which is
     // exactly the shape the generic rate cap throws away. It was shedding the very

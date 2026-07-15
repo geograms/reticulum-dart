@@ -41,6 +41,7 @@ class NostrLocalClient implements NostrRelayClient {
     // through its own put() path, so they don't need to be re-emitted here.
     for (final f in filters) {
       for (final e in store.query(f)) {
+        e.preVerified = true; // verified once, at insert; not again
         onEvent?.call(subId, e);
       }
     }

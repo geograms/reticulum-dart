@@ -71,6 +71,22 @@ class FollowSet {
     return changed;
   }
 
+  /// Replace the complete set with [keys], normalizing and persisting once.
+  /// Returns true when the resolved direct-follow set changed.
+  bool replaceAll(Iterable<String> keys) {
+    final next = <String>{};
+    for (final key in keys) {
+      final h = toHex(key);
+      if (h != null) next.add(h);
+    }
+    if (_hex.length == next.length && _hex.containsAll(next)) return false;
+    _hex
+      ..clear()
+      ..addAll(next);
+    _save();
+    return true;
+  }
+
   /// Bind a persistence path and load any saved follows.
   void load(String path) {
     _path = path;

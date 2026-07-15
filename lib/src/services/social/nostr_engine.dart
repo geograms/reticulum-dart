@@ -111,6 +111,8 @@ class NostrClient {
   final Map<String, List<Map<String, dynamic>>> _replies =
       {}; // postId → replies
   List<String> _myFollows = const []; // my kind-3 contact list (hex pubkeys)
+  bool _myFollowsLoaded = false;
+  int _myFollowsVersion = 0;
   static const int _subQueueMax = 800;
 
   /// Optional: notified (throttled) when caches change, so the UI can repaint.
@@ -258,6 +260,8 @@ class NostrClient {
             .cast<Map<String, dynamic>>();
       case 'myFollows':
         _myFollows = (msg['pubs'] as List).cast<String>();
+        _myFollowsLoaded = true;
+        _myFollowsVersion++;
       case 'verified':
         final c = _verifyWaiters.remove('${msg['req']}');
         c?.complete((msg['events'] as List).cast<Map<String, dynamic>>());
@@ -503,6 +507,11 @@ class NostrClient {
 
   /// My kind-3 contact list (hex pubkeys), fetched from the relays.
   List<String> myFollows() => _myFollows;
+
+  /// Whether a kind-3 event has been loaded. A loaded empty list is distinct
+  /// from startup, while the relay snapshot is still unknown.
+  bool get myFollowsLoaded => _myFollowsLoaded;
+  int get myFollowsVersion => _myFollowsVersion;
 
   // ── Replies ─────────────────────────────────────────────────────────────
   List<Map<String, dynamic>> replies(String postId) {
@@ -782,7 +791,6 @@ class _Engine {
         pubs.add(t[1].toLowerCase());
       }
     }
-    if (pubs.isEmpty) return;
     if (_myFollowsSent != null &&
         _myFollowsSent!.length == pubs.length &&
         _myFollowsSent!.containsAll(pubs)) {

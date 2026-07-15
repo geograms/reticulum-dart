@@ -316,6 +316,35 @@ void main() {
     await hub.close();
   });
 
+  test(
+    'automatic deadline ignores overlap and survives an empty batch',
+    () async {
+      final fake = _FakeClient('rns://${'a' * 64}');
+      final hub = NostrRelayHub(
+        store: store,
+        persistPath: persist,
+        defaultRelays: const [],
+        rnsClientFactory: (_) => fake,
+        pollInterval: const Duration(milliseconds: 100),
+        firehoseOpeningDelay: const Duration(days: 1),
+        firehoseSettleDelay: const Duration(milliseconds: 30),
+      );
+      await hub.init();
+      hub.subscribeFirehose(requireProfile: false);
+
+      final initialRequests = fake.subscribed.length;
+      final firstDeadline = DateTime.now().millisecondsSinceEpoch + 1000;
+      hub.backgroundTick(nowMs: firstDeadline);
+      hub.backgroundTick(nowMs: firstDeadline);
+      expect(fake.subscribed.length, initialRequests + 1);
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      hub.backgroundTick(nowMs: firstDeadline + 101);
+      expect(fake.subscribed.length, initialRequests + 2);
+      await hub.close();
+    },
+  );
+
   test('a relay burst bigger than the rate cap still reaches the feed', () async {
     // A relay answers a fresh kind-1 subscription with its recent window in one
     // go — hundreds of events, instantly, from every relay at once. The generic

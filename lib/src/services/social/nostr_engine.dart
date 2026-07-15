@@ -108,6 +108,7 @@ class NostrClient {
   final Map<String, Map<String, String>> _profiles = {}; // pub → profile
   final Map<String, Map<String, String>> _profByShort12 =
       {}; // pub[:12] → profile
+  final Set<String> _profileRequested = {};
   final Map<String, List<Map<String, dynamic>>> _replies =
       {}; // postId → replies
   List<String> _myFollows = const []; // my kind-3 contact list (hex pubkeys)
@@ -403,6 +404,11 @@ class NostrClient {
   /// the missed window.
   void resumeNetwork() => _send({'cmd': 'resume'});
 
+  /// Deadline heartbeat from Android's native foreground service. Work remains
+  /// in the engine isolate; the UI isolate only sends this small command.
+  void backgroundTick(int nowMs) =>
+      _send({'cmd': 'backgroundTick', 'nowMs': nowMs});
+
   Future<int> resumeAndRefreshFirehose({int n = 100}) {
     final req = 'r${_refreshSeq++}';
     final completer = Completer<int>();
@@ -502,7 +508,7 @@ class NostrClient {
 
   // ── Profiles ──────────────────────────────────────────────────────────────
   void trackProfile(String pub) {
-    if (pub.length != 64) return;
+    if (pub.length != 64 || !_profileRequested.add(pub)) return;
     _send({'cmd': 'trackProfile', 'pub': pub});
   }
 
@@ -697,6 +703,8 @@ class _Engine {
           );
         case 'resume':
           _hub.resumeNetwork();
+        case 'backgroundTick':
+          _hub.backgroundTick(nowMs: c['nowMs'] as int?);
         case 'resumeRefresh':
           final req = '${c['req']}';
           unawaited(

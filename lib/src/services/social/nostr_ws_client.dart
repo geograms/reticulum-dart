@@ -8,7 +8,6 @@
  */
 import 'dart:async';
 
-import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../util/nostr_event.dart';
@@ -63,21 +62,9 @@ class NostrWsClient implements NostrRelayClient {
     }
     _setStatus(NostrRelayStatus.connecting);
     try {
-      // KEEPALIVE. Without it the phone's connection to a relay goes one-way:
-      // the opening burst arrives, and then nothing — for twenty minutes — while
-      // the socket still reports "connected" and no error is ever raised. A
-      // carrier NAT (or any middlebox) drops the state for a flow that has been
-      // idle inbound, and neither end notices until somebody tries to write.
-      //
-      // The laptop, on a normal network, streams the same subscription happily;
-      // the phone does not. A ping every 20 seconds keeps the flow alive, and it
-      // is also how we learn quickly when it is truly dead — a ping that gets no
-      // pong closes the socket, which reconnects and re-subscribes.
-      final ch = IOWebSocketChannel.connect(
-        Uri.parse(uri),
-        pingInterval: const Duration(seconds: 20),
-        connectTimeout: const Duration(seconds: 12),
-      );
+      // Use the package's platform adapter. Direct IOWebSocketChannel handshakes
+      // repeatedly timed out on Android while ordinary TCP remained healthy.
+      final ch = WebSocketChannel.connect(Uri.parse(uri));
       _ch = ch;
       // ready throws on a failed handshake (bad TLS / unreachable host).
       await ch.ready;
@@ -109,9 +96,8 @@ class NostrWsClient implements NostrRelayClient {
   // carrier NAT dropped the flow — and nothing else in the stack notices,
   // because there is no error to notice. Re-opening the SUBSCRIPTION (which the
   // firehose watchdog does) cannot help: the frames go into a dead socket.
-  // 45s, not 90. With a 20s keepalive ping a healthy socket is never quiet this
-  // long, so silence past this really is a dead flow — and every second spent
-  // waiting on a dead one is a second the feed does not move.
+  // The public subscriptions normally receive frames continuously. Silence past
+  // this is treated as a dead flow so the feed does not remain frozen.
   static const int _idleMs = 45 * 1000;
   Timer? _idle;
 
@@ -213,8 +199,7 @@ class NostrWsClient implements NostrRelayClient {
   void resume() {
     if (_closed) return;
     if (_status == NostrRelayStatus.connected) {
-      final idleMs =
-          DateTime.now().millisecondsSinceEpoch - _lastFrameMs;
+      final idleMs = DateTime.now().millisecondsSinceEpoch - _lastFrameMs;
       if (_lastFrameMs > 0 && idleMs > 30 * 1000) {
         reconnect();
       }

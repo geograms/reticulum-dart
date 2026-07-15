@@ -111,11 +111,6 @@ class NostrRelayHub {
 
   final Map<String, NostrRelayEndpoint> _endpoints = {};
   final Map<String, NostrRelayClient> _clients = {};
-  // Public firehose traffic gets its own websocket per relay. Relays commonly
-  // cap subscriptions per connection; sharing with follows, profiles, stats and
-  // search caused the firehose REQ to be silently ignored while those feeds
-  // continued working.
-  final Map<String, NostrRelayClient> _fireClients = {};
 
   // Per-subscription: the active filters, a bounded inbox the wapp drains, and a
   // seen-id set so the same event from several relays is delivered once.
@@ -270,8 +265,6 @@ class NostrRelayHub {
       final c = _clients.remove(uri);
       // ignore: discarded_futures
       c?.close();
-      // ignore: discarded_futures
-      _fireClients.remove(uri)?.close();
     }
     return true;
   }
@@ -300,8 +293,6 @@ class NostrRelayHub {
     _save();
     // ignore: discarded_futures
     _clients.remove(uri)?.close();
-    // ignore: discarded_futures
-    _fireClients.remove(uri)?.close();
     return true;
   }
 
@@ -337,33 +328,6 @@ class NostrRelayHub {
     // ignore: discarded_futures
     c.connect();
     return c;
-  }
-
-  NostrRelayClient? _fireClient(String uri) {
-    if (nostrTransportOf(uri) != NostrTransport.websocket) {
-      return _clients[uri];
-    }
-    // One dedicated public socket is enough for a 100-note edition. Opening a
-    // second connection to every configured relay during Android startup made
-    // all five TLS handshakes time out together on lower-end phones. Primal is
-    // the default relay that consistently serves the full recent kind-1 window.
-    if (uri != 'wss://relay.primal.net') return null;
-    final existing = _fireClients[uri];
-    if (existing != null) return existing;
-    final client = NostrWsClient(uri, log: log)
-      ..onEvent = _onEvent
-      ..onEose = (subId) {
-        if (subId == _fireSub) {
-          _fireEoseMs = DateTime.now().millisecondsSinceEpoch;
-        }
-      }
-      ..onStatus = (_) {}
-      ..onClosed = (subId, message) =>
-          log?.call('firehose relay $uri refused $subId: $message');
-    _fireClients[uri] = client;
-    // ignore: discarded_futures
-    client.connect();
-    return client;
   }
 
   // ── Subscribe / publish ────────────────────────────────────────────────────
@@ -403,8 +367,11 @@ class NostrRelayHub {
     if (_discoSubscribers.remove(subId) && _discoSubscribers.isEmpty) {
       _teardownDiscovery();
     }
-    if (_fireSubscribers.remove(subId) && _fireSubscribers.isEmpty) {
-      _teardownFirehose();
+    if (_fireSubscribers.remove(subId)) {
+      log?.call(
+        'firehose: unsubscribe $subId, ${_fireSubscribers.length} remain',
+      );
+      if (_fireSubscribers.isEmpty) _teardownFirehose();
     }
   }
 
@@ -565,7 +532,6 @@ class NostrRelayHub {
     if (_fireSub != null) {
       // The launcher and Social hand the same firehose to each other. A second
       // subscriber used to miss the only opening timer and drain zero forever.
-      resumeNetwork();
       _scheduleOpeningBatch(subId, _fireLifecycle);
       return subId;
     }
@@ -603,7 +569,7 @@ class NostrRelayHub {
       final live = [
         for (final e in _endpoints.values)
           if (e.enabled &&
-              _fireClient(e.uri)?.status == NostrRelayStatus.connected)
+              _clients[e.uri]?.status == NostrRelayStatus.connected)
             e.uri,
       ];
       _fireSilentRounds++;
@@ -626,7 +592,7 @@ class NostrRelayHub {
           'event — cycling sockets',
         );
         for (final uri in live) {
-          _fireClients[uri]?.reconnect();
+          _clients[uri]?.reconnect();
         }
       }
     });
@@ -653,17 +619,16 @@ class NostrRelayHub {
     // Network collection needs [firehoseSettleDelay] before a batch can be
     // handed over. Start each collection early enough that commits, rather
     // than requests, remain on the advertised [pollInterval] cadence.
-    final firstRequestDelay = pollInterval > firehoseSettleDelay
-        ? pollInterval - firehoseSettleDelay
-        : pollInterval;
-    _curateTimer ??= Timer(firstRequestDelay, () {
-      if (_fireSubscribers.isEmpty || _fireSub == null) return;
-      unawaited(_requestFirehoseBatch(n: 100, mode: 'automatic'));
-      _curateTimer = Timer.periodic(pollInterval, (_) {
-        if (_fireSubscribers.isEmpty || _fireSub == null) return;
-        unawaited(_requestFirehoseBatch(n: 100, mode: 'automatic'));
-      });
-    });
+    _nextAutomaticAtMs =
+        DateTime.now().millisecondsSinceEpoch +
+        max(
+          0,
+          pollInterval.inMilliseconds - firehoseSettleDelay.inMilliseconds,
+        );
+    _curateTimer ??= Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => backgroundTick(),
+    );
     // The opening batch: the subscribe itself pulled the newest window; give it
     // a moment to be gated and ranked, then fill the tab at once.
     _scheduleOpeningBatch(subId, lifecycle);
@@ -754,7 +719,7 @@ class NostrRelayHub {
       _inbox.remove(sub);
       _seen.remove(sub);
       for (final e in _endpoints.values) {
-        _fireClient(e.uri)?.unsubscribe(sub);
+        _clients[e.uri]?.unsubscribe(sub);
       }
     }
 
@@ -793,7 +758,7 @@ class NostrRelayHub {
     _seen[sub] = <String>{};
     _fireProfSubs[sub] = nowMs;
     for (final e in _endpoints.values) {
-      if (e.enabled) _fireClient(e.uri)?.subscribe(sub, f);
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
     }
   }
 
@@ -814,11 +779,11 @@ class NostrRelayHub {
     // backlog and keep the isolate ranking stale notes while the UI waits. Keep
     // a one-minute watermark overlap, but never ask earlier than this edition.
     // Manual requests pass [until] and deliberately remain backward-looking.
+    final validNewest = _fireNewestSec <= nowSec + 60 ? _fireNewestSec : 0;
     final since = until == null
-        ? (_fireNewestSec > 0
-              ? max(_fireNewestSec - 60, recentFloor)
-              : recentFloor)
+        ? (validNewest > 0 ? max(validNewest - 60, recentFloor) : recentFloor)
         : null;
+    log?.call('firehose: REQ $sub since=$since until=$until');
     final f = [
       NostrFilter(kinds: const [0, 1], limit: 100, since: since, until: until),
     ];
@@ -826,15 +791,21 @@ class NostrRelayHub {
     _inbox[sub] = Queue<NostrEvent>();
     _seen[sub] = <String>{};
     for (final e in _endpoints.values) {
-      if (e.enabled) _fireClient(e.uri)?.subscribe(sub, f);
+      if (e.enabled) _clients[e.uri]?.subscribe(sub, f);
     }
   }
 
   void _scheduleOpeningBatch(String subId, int lifecycle) {
     Timer(firehoseOpeningDelay, () {
       if (!_fireSubscribers.contains(subId) || lifecycle != _fireLifecycle) {
+        log?.call(
+          'curator: opening timer cancelled for $subId '
+          '(present=${_fireSubscribers.contains(subId)}, '
+          'lifecycle=$lifecycle/$_fireLifecycle)',
+        );
         return;
       }
+      log?.call('curator: opening timer fired for $subId');
       // Relay sockets may still be connecting when the opening timer fires.
       // Re-ask and allow the same settle window as scheduled/manual refresh;
       // taking the buffer once and returning zero left this subscriber empty
@@ -869,7 +840,7 @@ class NostrRelayHub {
     _inbox.remove(sub);
     _seen.remove(sub);
     for (final e in _endpoints.values) {
-      _fireClient(e.uri)?.unsubscribe(sub);
+      _clients[e.uri]?.unsubscribe(sub);
     }
   }
 
@@ -883,20 +854,14 @@ class NostrRelayHub {
     _fireSweepTimer = null;
     _curateTimer?.cancel();
     _curateTimer = null;
-    _fireRetryTimer?.cancel();
-    _fireRetryTimer = null;
     _fireBatchInFlight = false;
+    _nextAutomaticAtMs = 0;
     // The REQ stops; the KNOWLEDGE stays. Nulling the filter here threw away
     // every held post and every author we were still waiting on a name for —
     // on every page close — so re-opening Social always started from nothing and
     // replayed the whole cold-start stall. The gate's caches are bounded; they
     // cost nothing to keep, and keeping them is what makes a re-open instant.
     _closeFirehoseReq();
-    for (final client in _fireClients.values) {
-      // ignore: discarded_futures
-      client.close();
-    }
-    _fireClients.clear();
   }
 
   bool _hasProfile(String pub) {
@@ -957,7 +922,10 @@ class NostrRelayHub {
 
     // The watermark the next re-open asks from, so a reconnect does not drag the
     // same backlog back across the network.
-    if (event.createdAt > _fireNewestSec) _fireNewestSec = event.createdAt;
+    final nowSec = nowMs ~/ 1000;
+    if (event.createdAt <= nowSec + 60 && event.createdAt > _fireNewestSec) {
+      _fireNewestSec = event.createdAt;
+    }
     if (event.kind == NostrEventKind.textNote &&
         (_fireOldestSec == 0 || event.createdAt < _fireOldestSec)) {
       _fireOldestSec = event.createdAt;
@@ -1053,7 +1021,7 @@ class NostrRelayHub {
   final FirehoseCurator _curator = FirehoseCurator();
   final Map<String, int> _authorAccepted = {};
   Timer? _curateTimer;
-  Timer? _fireRetryTimer;
+  int _nextAutomaticAtMs = 0;
   int _fireBatchSeq = 0;
   bool _fireBatchInFlight = false;
   int _fireLifecycle = 0;
@@ -1132,12 +1100,8 @@ class NostrRelayHub {
       return 0;
     }
     if (_fireBatchInFlight) {
-      if (mode != 'manual') return 0;
-      for (var i = 0; i < 250 && _fireBatchInFlight; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 100));
-      }
-      if (_fireBatchInFlight) return 0;
-      return _requestFirehoseBatch(n: n, mode: mode);
+      log?.call('curator: $mode request ignored; batch already in flight');
+      return 0;
     }
     _fireBatchInFlight = true;
     final lifecycle = _fireLifecycle;
@@ -1156,10 +1120,14 @@ class NostrRelayHub {
         _closeFirehoseReq();
         _openFirehoseReq(until: until);
       } else {
-        resumeNetwork();
+        _closeFirehoseReq();
+        _openFirehoseReq();
       }
       await Future<void>.delayed(firehoseSettleDelay);
-      if (_fireSubscribers.isEmpty || lifecycle != _fireLifecycle) return 0;
+      if (_fireSubscribers.isEmpty || lifecycle != _fireLifecycle) {
+        log?.call('curator: $mode request cancelled; subscriber changed');
+        return 0;
+      }
       if (mode == 'manual') {
         _fireBackfillUntilSec = _fireOldestSec > 0 ? _fireOldestSec - 1 : null;
         _closeFirehoseReq();
@@ -1189,17 +1157,6 @@ class NostrRelayHub {
         }
       }
       _deliverFirehoseBatch(out, mode: mode);
-      if (out.isEmpty && mode != 'manual') {
-        _fireRetryTimer ??= Timer(const Duration(minutes: 1), () {
-          _fireRetryTimer = null;
-          if (_fireSubscribers.isNotEmpty && _fireSub != null) {
-            unawaited(_requestFirehoseBatch(n: n, mode: 'automatic-retry'));
-          }
-        });
-      } else if (out.isNotEmpty) {
-        _fireRetryTimer?.cancel();
-        _fireRetryTimer = null;
-      }
       final newest = out.fold<int>(
         0,
         (value, event) => event.createdAt > value ? event.createdAt : value,
@@ -1244,14 +1201,26 @@ class NostrRelayHub {
       if (!e.enabled) continue;
       final c = _clients[e.uri];
       if (c is NostrWsClient) c.resume();
-      final fire = _fireClients[e.uri];
-      if (fire is NostrWsClient) fire.resume();
     }
-    if (_fireSub != null) {
-      _closeFirehoseReq();
-      _openFirehoseReq();
+    log?.call('resume: sockets checked');
+  }
+
+  /// Native Android and isolate timers both call this. The deadline is advanced
+  /// before starting work, so concurrent heartbeats cannot duplicate a batch;
+  /// an empty or failed batch also cannot kill the next ten-minute edition.
+  void backgroundTick({int? nowMs}) {
+    if (_fireSubscribers.isEmpty || _fireSub == null) return;
+    final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    if (_nextAutomaticAtMs == 0) {
+      _nextAutomaticAtMs = now;
     }
-    log?.call('resume: sockets checked, firehose re-asked since watermark');
+    if (now < _nextAutomaticAtMs) return;
+    if (_fireBatchInFlight) {
+      log?.call('curator: deadline ignored; batch already in flight');
+      return;
+    }
+    _nextAutomaticAtMs = now + pollInterval.inMilliseconds;
+    unawaited(_requestFirehoseBatch(n: 100, mode: 'automatic'));
   }
 
   /// Resume the relay sockets and replace the foreground firehose batch once
@@ -1939,9 +1908,5 @@ class NostrRelayHub {
       await c.close();
     }
     _clients.clear();
-    for (final c in _fireClients.values) {
-      await c.close();
-    }
-    _fireClients.clear();
   }
 }

@@ -72,6 +72,19 @@ class NostrWsClient implements NostrRelayClient {
       // socket that will never open, every timer and message on that isolate
       // waits behind it, and the feed dies. Off-grid means bounding every wait.
       await ch.ready.timeout(const Duration(seconds: 8));
+      // The handshake can complete AFTER close() ran — the poll opens a client,
+      // fires connect() unawaited, and closes it a few seconds later while a slow
+      // relay is still shaking hands. Without this guard, connect() would then
+      // resurrect the socket: a live stream listener + idle timer on a client
+      // everyone thinks is closed, leaked once per poll → the native heap climbs
+      // to OOM. If we were closed/disconnected while connecting, let the socket go.
+      if (_closed || _status != NostrRelayStatus.connecting) {
+        try {
+          ch.sink.close();
+        } catch (_) {}
+        if (identical(_ch, ch)) _ch = null;
+        return;
+      }
       _setStatus(NostrRelayStatus.connected);
       _backoffMs = 1000;
       _touch(); // start the idle watchdog for this socket

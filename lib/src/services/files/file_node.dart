@@ -211,8 +211,9 @@ class FileTransferNode {
   final void Function(Uint8List destHash)? requestPath;
 
   /// Called when we serve a file's manifest to another node (one download by a
-  /// peer), with the 32-byte file hash. Drives the per-file download metric.
-  final void Function(Uint8List fileHash)? onServed;
+  /// peer), with the 32-byte file hash and the requester key (the link id).
+  /// Drives the per-file download metric and per-folder unique-leecher count.
+  final void Function(Uint8List fileHash, String requesterId)? onServed;
 
   /// Store-and-forward hosting hooks (see FileServeSession). When both are set
   /// this node accepts blob deposits from peers; null = deposits declined.

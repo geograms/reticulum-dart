@@ -204,8 +204,9 @@ class FileServeSession {
   final ServeQuota? quota; // optional serving budget / anti-abuse guard
   final String requesterId; // best-effort requester key (the link id)
   /// Called once per download a peer starts (when we begin serving a file), with
-  /// the 32-byte file hash — drives the per-file download metric.
-  final void Function(Uint8List fileHash)? onServed;
+  /// the 32-byte file hash and the requester key (the link id) — drives the
+  /// per-file download metric and the per-folder unique-leecher count.
+  final void Function(Uint8List fileHash, String requesterId)? onServed;
 
   /// Store-and-forward deposit hooks (null = this node does not accept deposits).
   /// [linkIdHex] is the link the offer arrived on: the host maps it back to the
@@ -339,7 +340,7 @@ class FileServeSession {
       final bytes = source.read(fileHash);
       if (bytes == null) return [_notFound(fileHash)];
       if (!_allow(fileHash, bytes.length)) return [_notFound(fileHash)];
-      onServed?.call(Uint8List.fromList(fileHash));
+      onServed?.call(Uint8List.fromList(fileHash), requesterId);
       return _serveResource(bytes, fileHash);
     }
     if (op == kOpGetFileFrom && cmd.length >= 1 + 32 + 2) {
@@ -349,7 +350,7 @@ class FileServeSession {
       final bytes = source.read(fileHash);
       if (bytes == null) return [_notFound(fileHash)];
       if (!_allow(fileHash, bytes.length)) return [_notFound(fileHash)];
-      onServed?.call(Uint8List.fromList(fileHash));
+      onServed?.call(Uint8List.fromList(fileHash), requesterId);
       return _serveResource(bytes, fileHash, startSegment: startSeg);
     }
     if (op == kOpGetHave && cmd.length >= 1 + 32 + 4) {
@@ -370,7 +371,7 @@ class FileServeSession {
       final bytes = _readRange(fileHash, offset, length);
       if (bytes == null || bytes.isEmpty) return [_notFound(fileHash)];
       if (!_allow(fileHash, bytes.length)) return [_notFound(fileHash)];
-      onServed?.call(Uint8List.fromList(fileHash));
+      onServed?.call(Uint8List.fromList(fileHash), requesterId);
       // The range rides a Resource like any other payload. It is NOT the whole
       // file, so its sha256 is not the file id — the fetcher verifies it against
       // the signed piece hash instead.

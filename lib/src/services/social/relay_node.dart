@@ -117,6 +117,19 @@ class RelayNode {
   late final Uint8List relayDestHash =
       RnsDestination.hash(identity, kRelayApp, kRelayAspects);
 
+  /// The destination relay RPC links (REQ/EVENT/COUNT/SYNC) ride over. Defaults
+  /// to the dedicated geogram/relay dest, but the host can point it at a more
+  /// reliably-announced destination (e.g. the chat dest) so links route where
+  /// transport paths actually exist — public hubs rate-limit and drop the
+  /// dedicated geogram/relay announce, leaving peers with no path to it, so every
+  /// REQ/sync link handshake times out ("0 answered"). The relay IDENTITY and
+  /// [relayDestHash] are unaffected: they still classify the role and key the
+  /// pointer log locally, needing no path. Mirrors FileTransferNode.rpcApp.
+  final String rpcApp;
+  final List<String> rpcAspects;
+  late final Uint8List rpcDestHash =
+      RnsDestination.hash(identity, rpcApp, rpcAspects);
+
   final Map<String, _RelayLink> _in = {}; // responder links by link-id hex
   final Map<String, _Pending> _out = {}; // initiator requests by link-id hex
   int _subSeq = 0;
@@ -143,6 +156,10 @@ class RelayNode {
     this.admitEvent,
     this.selfPubHex,
     this.probeQuery,
+    // Default to the dedicated relay dest (back-compat); Aurora overrides these
+    // to the chat dest so links route where paths actually exist.
+    this.rpcApp = kRelayApp,
+    this.rpcAspects = kRelayAspects,
   });
 
   /// Feed an inbound packet; true if it belonged to the relay.
@@ -159,8 +176,12 @@ class RelayNode {
     // hub — evaluating _answersQueries per packet pegged the CPU and hung the
     // app.
     if (p.packetType == RnsPacketType.linkRequest &&
-        RnsCrypto.constantTimeEquals(p.destHash, relayDestHash) &&
+        (RnsCrypto.constantTimeEquals(p.destHash, relayDestHash) ||
+            RnsCrypto.constantTimeEquals(p.destHash, rpcDestHash)) &&
         _answersQueries) {
+      // Accept relay links on the dedicated relay dest AND on the configured RPC
+      // dest (the chat dest in Aurora). The dests are disjoint when overridden,
+      // and a peer that only has a path to our chat dest dials that one.
       await _accept(p);
       return true;
     }
@@ -342,7 +363,7 @@ class RelayNode {
   /// none (we may know the peer's identity without a cached route). Mirrors
   /// FileTransferNode._ensurePath / LxmfRouter.
   Future<Uint8List?> _ensurePath(RnsIdentity relay) =>
-      RnsLink.ensurePath(relay, kRelayApp, kRelayAspects,
+      RnsLink.ensurePath(relay, rpcApp, rpcAspects,
           nextHopFor: nextHopFor,
           nextHopForDest: nextHopForDest,
           hasPathForDest: hasPathForDest,
@@ -350,7 +371,7 @@ class RelayNode {
 
   Future<RelayFrame?> _request(RnsIdentity relay, Uint8List reqBytes,
       {required Duration timeout}) async {
-    final link = await RnsLink.initiator(relay, kRelayApp, kRelayAspects);
+    final link = await RnsLink.initiator(relay, rpcApp, rpcAspects);
     link.nextHop = await _ensurePath(relay);
     final reqPkt = link.buildRequest();
     final done = Completer<RelayFrame?>();

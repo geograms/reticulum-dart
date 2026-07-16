@@ -40,6 +40,11 @@ import 'spam.dart';
 const String kRelayApp = 'geogram';
 const List<String> kRelayAspects = ['relay'];
 
+/// 1-byte type tag for relay RPC frames when they share a destination with the
+/// DHT (the chat dest). DHT frames are tag 0x01 (file_node); relay is 0x02. Lets
+/// the host that owns the shared link demux frames to the right tenant.
+const int kRelayRpcTag = 0x02;
+
 // Max relay message we send as a single link packet (else an RNS Resource).
 const int _pktMax = 360;
 
@@ -130,6 +135,13 @@ class RelayNode {
   late final Uint8List rpcDestHash =
       RnsDestination.hash(identity, rpcApp, rpcAspects);
 
+  /// When the RPC dest is SHARED with another tenant (the DHT owns the chat dest
+  /// and accepts its links first), our link frames must carry a 1-byte type tag
+  /// so the host can demux them to us. Null = dedicated dest, no tag. Aurora sets
+  /// [kRelayRpcTag]. The tag rides only OUR outbound requests + their responses;
+  /// the local relay-dest path ([_serve]) stays untagged for back-compat.
+  final int? rpcTag;
+
   final Map<String, _RelayLink> _in = {}; // responder links by link-id hex
   final Map<String, _Pending> _out = {}; // initiator requests by link-id hex
   int _subSeq = 0;
@@ -160,6 +172,7 @@ class RelayNode {
     // to the chat dest so links route where paths actually exist.
     this.rpcApp = kRelayApp,
     this.rpcAspects = kRelayAspects,
+    this.rpcTag,
   });
 
   /// Feed an inbound packet; true if it belonged to the relay.
@@ -375,10 +388,17 @@ class RelayNode {
     link.nextHop = await _ensurePath(relay);
     final reqPkt = link.buildRequest();
     final done = Completer<RelayFrame?>();
+    final tag = rpcTag;
     final rl = _RelayLink(link, send, (msg) {
-      if (!done.isCompleted) done.complete(RelayProtocol.decode(msg));
+      // On a shared dest the host tags our responses; strip the tag (and drop
+      // frames tagged for another tenant) before decoding.
+      final body = tag == null ? msg : _untagRpc(msg, tag);
+      if (body != null && !done.isCompleted) {
+        done.complete(RelayProtocol.decode(body));
+      }
     });
-    final pending = _Pending(link, rl, reqBytes, done);
+    final outBytes = tag == null ? reqBytes : _tagRpc(reqBytes, tag);
+    final pending = _Pending(link, rl, outBytes, done);
     final id = _hex(link.linkId!);
     _out[id] = pending;
     send(reqPkt.pack());
@@ -386,6 +406,13 @@ class RelayNode {
     _out.remove(id);
     return r;
   }
+
+  static Uint8List _tagRpc(Uint8List body, int tag) =>
+      Uint8List.fromList([tag, ...body]);
+  static Uint8List? _untagRpc(Uint8List frame, int tag) =>
+      (frame.isNotEmpty && frame[0] == tag)
+          ? Uint8List.sublistView(frame, 1)
+          : null;
 
   Future<void> _onOut(_Pending e, RnsPacket p) async {
     if (e.link.status != RnsLinkStatus.active) {
@@ -486,38 +513,46 @@ class RelayNode {
     final f = RelayProtocol.decode(msg);
     final rl = _in[_hex(link.linkId!)];
     if (f == null || rl == null) return;
+    final resp = _answerFrame(f);
+    if (resp != null) rl.sendMessage(resp);
+  }
+
+  /// Answer a relay frame that arrived on a SHARED destination — the host that
+  /// owns the link (e.g. the DHT/files node on the chat dest) demuxed it to us by
+  /// its type tag. Stateless: returns the response bytes to send back (already
+  /// UNtagged; the caller re-tags), or null for no reply. Same semantics as the
+  /// link path ([_serve], [_answerFrame]).
+  Future<Uint8List?> answerRelayFrame(Uint8List body) async {
+    final f = RelayProtocol.decode(body);
+    if (f == null) return null;
+    return _answerFrame(f);
+  }
+
+  /// Compute the single response frame for a decoded relay request, running any
+  /// side effects (store, sync). Returns null for no reply. Shared by the
+  /// link-owned path ([_serve]) and the shared-dest demux ([answerRelayFrame]).
+  Uint8List? _answerFrame(RelayFrame f) {
     try {
       switch (f.op) {
         case RelayOp.event:
           // A leaf (serve=false) accepts query links so it can share its own
           // posts, but it does NOT store other people's events pushed at it.
-          if (!serve) {
-            rl.sendMessage(RelayProtocol.stored(false, 'not a host'));
-            break;
-          }
+          if (!serve) return RelayProtocol.stored(false, 'not a host');
           final ev = f.event;
-          if (ev == null) {
-            rl.sendMessage(RelayProtocol.stored(false, 'no event'));
-            break;
-          }
+          if (ev == null) return RelayProtocol.stored(false, 'no event');
           final verdict = spam?.check(ev);
           if (verdict != null && !verdict.accepted) {
-            rl.sendMessage(RelayProtocol.stored(false, verdict.reason));
-            break;
+            return RelayProtocol.stored(false, verdict.reason);
           }
           // Hosting tier + quota: classify the author, then run the admission
           // gate. self (0) is always admitted; strangers can be refused past
           // their monthly note / storage caps.
           final tier = tierOfPub?.call(ev.pubkey) ?? 2;
           final reject = admitEvent?.call(ev, tier);
-          if (reject != null) {
-            rl.sendMessage(RelayProtocol.stored(false, reject));
-            break;
-          }
+          if (reject != null) return RelayProtocol.stored(false, reject);
           final ok = store.put(ev, tier: tier);
           if (ok) onEvent?.call(ev);
-          rl.sendMessage(RelayProtocol.stored(ok, ok ? null : 'rejected'));
-          break;
+          return RelayProtocol.stored(ok, ok ? null : 'rejected');
         case RelayOp.req:
           // Full hosts answer the whole query; a leaf scopes it to its OWN
           // posts (cheap + safe) so a joiner can still pull what this device
@@ -526,8 +561,7 @@ class RelayNode {
           if (!serve) {
             final self = selfPubHex?.call();
             if (self == null) {
-              rl.sendMessage(RelayProtocol.result(f.subId ?? '', const [], true));
-              break;
+              return RelayProtocol.result(f.subId ?? '', const [], true);
             }
             // Scope to our own posts: keep the querier's kinds/tags/since/limit
             // but force authors to just us.
@@ -544,32 +578,25 @@ class RelayNode {
           reqsServed++;
           log?.call('relay: answered REQ -> ${events.length} event(s)'
               '${serve ? '' : ' (self-scoped)'}');
-          rl.sendMessage(RelayProtocol.result(f.subId ?? '', events, true));
-          break;
+          return RelayProtocol.result(f.subId ?? '', events, true);
         case RelayOp.count:
           reqsServed++;
-          final n = store.count(f.filter);
-          rl.sendMessage(RelayProtocol.countResult(f.subId ?? '', n));
-          break;
+          return RelayProtocol.countResult(f.subId ?? '', store.count(f.filter));
         case RelayOp.deposit:
           final dest = f.dest;
           final blob = f.blob;
           var ok = false;
           if (dest != null && blob != null && blob.isNotEmpty) {
             final msgId = _hex(crypto.sha256.convert(blob).bytes);
-            ok = store.sfDeposit(msgId: msgId, dest: dest, blob: blob);
-            // ok==false also means "already queued" — treat as accepted.
+            store.sfDeposit(msgId: msgId, dest: dest, blob: blob);
+            // false also means "already queued" — treat as accepted.
             ok = true;
           }
-          rl.sendMessage(RelayProtocol.stored(ok, ok ? null : 'rejected'));
-          break;
+          return RelayProtocol.stored(ok, ok ? null : 'rejected');
         case RelayOp.syncReq:
           // "What changed since (epoch, seq)?" — addresses, never content.
           final ps = pointerServer;
-          if (ps == null) {
-            rl.sendMessage(RelayProtocol.syncReset('', 0));
-            break;
-          }
+          if (ps == null) return RelayProtocol.syncReset('', 0);
           final answer = ps.answer(
             f.epoch ?? '',
             f.sinceSeq,
@@ -577,19 +604,15 @@ class RelayNode {
           );
           if (answer == null) {
             // Their cursor is not from this log, or is older than what we still
-            // hold. Say so — a partial answer would leave a hole in their map
-            // that nobody would ever notice.
-            rl.sendMessage(
-                RelayProtocol.syncReset(ps.log.epoch, ps.log.oldestSeq));
-            break;
+            // hold. Say so — a partial answer would leave a hole in their map.
+            return RelayProtocol.syncReset(ps.log.epoch, ps.log.oldestSeq);
           }
-          rl.sendMessage(RelayProtocol.syncRes(
+          return RelayProtocol.syncRes(
             epoch: ps.log.epoch,
             entries: answer.entries,
             nextSeq: answer.nextSeq,
             more: answer.more,
-          ));
-          break;
+          );
         case RelayOp.drop:
           // Recipient-authorized delete: verify the requester owns reqPub (a
           // BIP-340 sig over sha256 of the comma-joined ids), then drop only the
@@ -612,13 +635,13 @@ class RelayNode {
             }
             if (okSig) dropped = store.dropForRecipient(ids, reqPub);
           }
-          rl.sendMessage(RelayProtocol.dropResult(dropped));
-          break;
+          return RelayProtocol.dropResult(dropped);
         default:
-          break;
+          return null;
       }
     } catch (err) {
       log?.call('relay: serve error: $err');
+      return null;
     }
   }
 

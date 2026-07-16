@@ -124,6 +124,13 @@ class FileTransferNode {
   late final Uint8List rpcDestHash =
       RnsDestination.hash(identity, rpcApp, rpcAspects);
 
+  /// Another tenant sharing the RPC (chat) destination: a link frame tagged for
+  /// it (not [_kDhtFrame]) is handed here and the returned bytes are tagged back
+  /// and sent as the reply. Aurora wires this to the relay node so relay REQ/EVENT
+  /// /SYNC links ride the same reliably-pathed chat dest without a second dest.
+  /// The tag is [_kRelayFrame]; null = no other tenant (frame dropped as today).
+  Future<Uint8List?> Function(Uint8List relayBody)? onRelayFrame;
+
   /// Persists segment-aligned partial downloads so a fetch resumes after a drop
   /// or app restart (generic — every fetch consumer benefits). Null = no resume
   /// (today's in-memory, all-or-nothing behaviour).
@@ -244,6 +251,7 @@ class FileTransferNode {
     this.onDepositStore,
     this.rpcApp = kDhtApp,
     this.rpcAspects = kDhtAspects,
+    this.onRelayFrame,
     this.dhtK = 96,
     this.dhtAlpha = 12,
     this.stableAnchors,
@@ -1332,11 +1340,19 @@ class FileTransferNode {
       return;
     }
     if (p.context == RnsContext.none) {
-      // The RPC dest is shared with chat, so every link frame carries a 1-byte
-      // type tag: we only treat DHT-tagged frames as DHT. Anything else is some
-      // other (future) tenant of the chat dest and is ignored here — the tag
-      // reserves the namespace so a chat-over-links feature can't collide.
-      final body = _untagDht(link.decrypt(p));
+      // The RPC dest is shared, so every link frame carries a 1-byte type tag:
+      // 0x01 = DHT, 0x02 = relay. We handle DHT here and demux relay frames to
+      // the relay tenant ([onRelayFrame]); anything else is ignored.
+      final dec = link.decrypt(p);
+      final relayBody = _untagRelay(dec);
+      if (relayBody != null) {
+        final resp = await onRelayFrame?.call(relayBody);
+        if (resp != null) {
+          send(link.encrypt(_tagRelay(resp), context: RnsContext.none).pack());
+        }
+        return;
+      }
+      final body = _untagDht(dec);
       if (body == null) return;
       // Size the FIND reply to the link's negotiated MTU: a large-MTU (TCP/chat)
       // link carries far more contacts/records in one packet than the 500-MTU
@@ -1380,6 +1396,17 @@ class FileTransferNode {
       Uint8List.fromList([_kDhtFrame, ...body]);
   static Uint8List? _untagDht(Uint8List frame) =>
       (frame.isNotEmpty && frame[0] == _kDhtFrame)
+          ? Uint8List.sublistView(frame, 1)
+          : null;
+
+  // Relay tenant frames on the shared dest are tag 0x02 (== social
+  // relay_node.dart kRelayRpcTag; kept as a literal to avoid a files->social
+  // import). DHT is 0x01 above.
+  static const int _kRelayFrame = 0x02;
+  static Uint8List _tagRelay(Uint8List body) =>
+      Uint8List.fromList([_kRelayFrame, ...body]);
+  static Uint8List? _untagRelay(Uint8List frame) =>
+      (frame.isNotEmpty && frame[0] == _kRelayFrame)
           ? Uint8List.sublistView(frame, 1)
           : null;
 

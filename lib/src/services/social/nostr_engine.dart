@@ -549,27 +549,37 @@ class NostrClient {
 
   // ══ engine isolate ════════════════════════════════════════════════════════
   static Future<void> _engineMain(_EngineInit init) async {
-    // The sqlite3 loader override is per-isolate: re-apply the host's choice
-    // of native library here, BEFORE anything opens a database.
-    final lib = init.sqliteLibrary;
-    if (lib != null && lib.isNotEmpty) {
-      DynamicLibrary open() => DynamicLibrary.open(lib);
-      for (final os in sqlite_open.OperatingSystem.values) {
-        sqlite_open.open.overrideFor(os, open);
+    // Guard the whole isolate. An unhandled async error here is FATAL by
+    // default: the isolate dies and the feed goes quiet with nothing but a
+    // stack trace on stderr to say why. dart:io itself supplies such an error
+    // — closing a wss relay socket while a read event is already queued throws
+    // "SocketException: Reading from a closed socket" from a dart:io timer, in
+    // no stream we listen to, so no onError can catch it. Logged and survived.
+    runZonedGuarded(() {
+      // The sqlite3 loader override is per-isolate: re-apply the host's choice
+      // of native library here, BEFORE anything opens a database.
+      final lib = init.sqliteLibrary;
+      if (lib != null && lib.isNotEmpty) {
+        DynamicLibrary open() => DynamicLibrary.open(lib);
+        for (final os in sqlite_open.OperatingSystem.values) {
+          sqlite_open.open.overrideFor(os, open);
+        }
       }
-    }
-    // All store/relay setup runs on THIS (background) isolate.
-    final engine = _Engine(
-      init.toMain,
-      init.storePath,
-      init.persistPath,
-      init.selfPubHex,
-      dbKeyHex: init.dbKeyHex,
-    );
-    final rx = ReceivePort();
-    init.toMain.send(rx.sendPort);
-    rx.listen((dynamic m) {
-      if (m is Map) engine.handle(m.cast<String, dynamic>());
+      // All store/relay setup runs on THIS (background) isolate.
+      final engine = _Engine(
+        init.toMain,
+        init.storePath,
+        init.persistPath,
+        init.selfPubHex,
+        dbKeyHex: init.dbKeyHex,
+      );
+      final rx = ReceivePort();
+      init.toMain.send(rx.sendPort);
+      rx.listen((dynamic m) {
+        if (m is Map) engine.handle(m.cast<String, dynamic>());
+      });
+    }, (e, st) {
+      init.toMain.send({'log': 'nostr-engine: unhandled $e'});
     });
   }
 }

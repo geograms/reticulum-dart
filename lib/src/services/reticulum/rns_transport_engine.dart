@@ -289,7 +289,19 @@ class _ExtIface implements RnsInterface {
   void send(Uint8List packetRaw) => _toMain.send(['tx', label, packetRaw]);
 }
 
+// Guard the isolate: an unhandled async error is fatal by default, and a dead
+// transport isolate means routing stops with nothing but a stack trace on
+// stderr. dart:io raises exactly this class of error on its own — a socket
+// torn down while a read event is already queued throws from a dart:io timer,
+// outside any stream we listen to. Log it and keep routing.
 Future<void> _engineMain(SendPort toMain) async {
+  runZonedGuarded(
+    () => _engineBody(toMain),
+    (e, st) => toMain.send(['log', 'RNS/engine: unhandled $e']),
+  );
+}
+
+Future<void> _engineBody(SendPort toMain) async {
   final transport = RnsTransport(
     log: (m) => toMain.send(['log', 'RNS/engine: $m']),
   );

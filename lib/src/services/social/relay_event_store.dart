@@ -227,8 +227,17 @@ class RelayEventStore {
     return [for (final r in rows) (r['pubkey'] as String).toLowerCase()];
   }
 
-  bool put(NostrEvent e, {int tier = 2, int? receivedAtMs}) =>
-      _put(e, tier: tier, receivedAtMs: receivedAtMs, verify: true);
+  /// Fired after an event is durably stored (post-commit), from [put] and
+  /// [putAllVerified] alike. The one choke point every ingest path funnels
+  /// through — RelayNode inbound, relayPublish, hub batch merges, WS EVENTs —
+  /// so a live-push hook here reaches subscribers no matter the transport.
+  void Function(NostrEvent e)? onPut;
+
+  bool put(NostrEvent e, {int tier = 2, int? receivedAtMs}) {
+    final ok = _put(e, tier: tier, receivedAtMs: receivedAtMs, verify: true);
+    if (ok) onPut?.call(e);
+    return ok;
+  }
 
   /// Ingest a batch of events that a **trusted in-process producer has already
   /// verified** — one transaction, no Schnorr.
@@ -248,12 +257,16 @@ class RelayEventStore {
   int putAllVerified(List<NostrEvent> events, {int tier = 2, int? receivedAtMs}) {
     if (events.isEmpty) return 0;
     var stored = 0;
+    // Collect during the tx, notify after COMMIT — never run hook code while
+    // sqlite holds the outer transaction.
+    final storedEvents = <NostrEvent>[];
     _db.execute('BEGIN');
     _inTx = true;
     try {
       for (final e in events) {
         if (_put(e, tier: tier, receivedAtMs: receivedAtMs, verify: false)) {
           stored++;
+          storedEvents.add(e);
         }
       }
       _db.execute('COMMIT');
@@ -262,6 +275,9 @@ class RelayEventStore {
       rethrow;
     } finally {
       _inTx = false;
+    }
+    for (final e in storedEvents) {
+      onPut?.call(e);
     }
     return stored;
   }

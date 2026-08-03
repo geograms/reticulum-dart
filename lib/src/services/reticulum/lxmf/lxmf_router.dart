@@ -42,6 +42,7 @@ class _LxOut {
   final Completer<bool> done;
   RnsResourceSender? sender;
   bool sent = false;
+  bool localPath = false; // delivery dest rides a local iface (lan/wfd)
   _LxOut(this.link, this.packed, this.done);
 }
 
@@ -49,6 +50,18 @@ class LxmfRouter {
   final RnsIdentity identity;
   final void Function(Uint8List raw) send;
   final Uint8List? Function(RnsIdentity peer)? nextHopFor;
+
+  /// Per-DESTINATION next hop (the delivery dest's own path entry). This is
+  /// what every other node type here uses; the legacy per-identity lookup
+  /// above returns the next hop of an ARBITRARY destination of the peer —
+  /// whichever path entry happens to come first — which routed link requests
+  /// to a hub that never cross-forwards while a live LAN path sat unused.
+  /// When set, it takes precedence; [nextHopFor] remains as a fallback.
+  Uint8List? Function(Uint8List destHash)? nextHopForDest;
+
+  /// True when the delivery dest's path rides a local interface (lan/wfd) —
+  /// used to shorten the post-handshake grace before the body is sent.
+  bool Function(Uint8List destHash)? pathIsLocal;
   final RnsIdentity? Function(Uint8List destHash)? identityForDest;
   void Function(LxmfMessage message)? onMessage;
   final void Function(String msg)? log;
@@ -188,17 +201,39 @@ class LxmfRouter {
       log?.call('lxmf: no path/identity for destination — held for relay');
       return false;
     }
-    final link =
-        await RnsLink.initiator(rid, kLxmfApp, kLxmfDeliveryAspects);
-    link.nextHop = nextHopFor?.call(rid);
-    final reqPkt = link.buildRequest();
-    final entry = _LxOut(link, message.packed, Completer<bool>());
-    final id = _hex(link.linkId!);
-    _out[id] = entry;
-    send(reqPkt.pack());
-    final ok = await entry.done.future
-        .timeout(timeout, onTimeout: () => false);
-    _out.remove(id);
+
+    Future<bool> attempt(Uint8List? hop, Duration t) async {
+      final link =
+          await RnsLink.initiator(rid, kLxmfApp, kLxmfDeliveryAspects);
+      link.nextHop = hop;
+      final reqPkt = link.buildRequest();
+      final entry = _LxOut(link, message.packed, Completer<bool>())
+        ..localPath =
+            pathIsLocal?.call(message.destinationHash) ?? false;
+      final id = _hex(link.linkId!);
+      _out[id] = entry;
+      send(reqPkt.pack());
+      final ok = await entry.done.future.timeout(t, onTimeout: () => false);
+      _out.remove(id);
+      return ok;
+    }
+
+    // Route by the delivery dest's OWN path (per-dest), not by whichever of
+    // the peer's other destinations happens to sit first in the path table.
+    final hop = nextHopForDest != null
+        ? nextHopForDest!.call(message.destinationHash)
+        : nextHopFor?.call(rid);
+    var ok = await attempt(hop, timeout);
+    // A transported (HEADER_2) request travels on exactly one interface; when
+    // that route is dead — the classic case is a hub that never cross-forwards
+    // between its clients — the request dies silently. Fail over ONCE with no
+    // next hop: HEADER_1 fans out on every interface, and a co-located peer
+    // answers on the LAN regardless of what the path table believed.
+    if (!ok && hop != null) {
+      log?.call('lxmf: direct link timed out via transported route — '
+          'retrying as broadcast fan-out');
+      ok = await attempt(null, const Duration(seconds: 8));
+    }
     if (ok) _removeFromRelay(message); // direct delivery confirmed → drop held copy
     return ok;
   }
@@ -326,8 +361,11 @@ class LxmfRouter {
         // Give the peer a moment to activate the link and install its delivery
         // callbacks before sending the message — otherwise a fast responder (a
         // real LXMF/RNS node) may receive the message packet before the link is
-        // fully established and drop it.
-        Future.delayed(const Duration(milliseconds: 500), () => _sendBody(e));
+        // fully established and drop it. On a LAN the round trip is ~2ms, so
+        // 150ms is already 10x safe margin; the 500ms is for slow WAN paths.
+        Future.delayed(
+            Duration(milliseconds: e.localPath ? 150 : 500),
+            () => _sendBody(e));
       }
       return;
     }
@@ -428,6 +466,14 @@ class LxmfRouter {
   /// Open a link to [propDestHash] (a peer's propagation destination) and pull
   /// any messages it is holding for us, delivering+verifying each. Returns the
   /// number delivered. Auto-requests a path to the peer if we have none.
+  /// One pull per peer IDENTITY per window. The wapp pulls both a contact's
+  /// propagation dest and its open thread's delivery dest every 20s cycle —
+  /// two different hashes, one peer — which cost a full redundant link
+  /// handshake per cycle. Both resolve here to the same identity, so the
+  /// guard belongs here.
+  final Map<String, int> _lastPullByIdentity = {};
+  static const int _pullGuardMs = 15000;
+
   Future<int> pullFrom(Uint8List propDestHash,
       {Duration timeout = const Duration(seconds: 30)}) async {
     var rid = identityForDest?.call(propDestHash);
@@ -442,6 +488,14 @@ class LxmfRouter {
     if (rid == null) {
       log?.call('lxmf: no path to propagation node — cannot pull');
       return 0;
+    }
+    final ridHex = _hex(rid.hash);
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final last = _lastPullByIdentity[ridHex];
+    if (last != null && nowMs - last < _pullGuardMs) return 0;
+    _lastPullByIdentity[ridHex] = nowMs;
+    if (_lastPullByIdentity.length > 256) {
+      _lastPullByIdentity.remove(_lastPullByIdentity.keys.first);
     }
     final link =
         await RnsLink.initiator(rid, kLxmfApp, kLxmfPropagationAspects);

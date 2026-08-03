@@ -149,7 +149,11 @@ class RnsLanInterface implements RnsInterface {
     if (s == null) return;
     final cutoff = _nowMs() - _peerTtlMs;
     _peers.removeWhere((_, p) => p.lastMs < cutoff);
-    if (_isAnnounce(packetRaw)) {
+    // Path requests ride the discovery lane: they exist precisely to reach a
+    // peer we have NOT learned yet, so unicasting them to known peers only
+    // (the data rule below) made them a no-op for first contact — and between
+    // two Dart nodes nobody else answers them.
+    if (_isAnnounce(packetRaw) || RnsTransport.isPathRequest(packetRaw)) {
       // Discovery: broadcast (limited + every subnet-directed address) AND
       // unicast to every known peer. Wi-Fi drops broadcast heavily, so relying
       // on it alone left the LAN PATH intermittent — a peer's announce (the only

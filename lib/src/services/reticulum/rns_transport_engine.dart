@@ -41,6 +41,11 @@ class RnsTransportClient implements RnsInterfaceRegistry {
   /// Validated announce arrived (post-budget, post-crypto). hops = wire hops.
   void Function(RnsAnnounce ann, int hops, String via)? onAnnounce;
 
+  /// An inbound path request asked for a destination — forwarded from the
+  /// engine so the host can answer for its OWN destinations (between two Dart
+  /// nodes nobody else will). Rate-limited engine-side.
+  void Function(Uint8List destHash)? onPathRequest;
+
   /// Engine stats push (~2s): passive flag, announce rate, path count.
   void Function()? onStats;
 
@@ -131,6 +136,10 @@ class RnsTransportClient implements RnsInterfaceRegistry {
         while (_pathMirror.length > _mirrorCap) {
           _pathMirror.remove(_pathMirror.keys.first);
         }
+      case 'pathreq':
+        try {
+          onPathRequest?.call(msg[1] as Uint8List);
+        } catch (_) {}
       case 'stats':
         _passive = msg[1] as bool;
         _annRate = msg[2] as double;
@@ -305,6 +314,8 @@ Future<void> _engineBody(SendPort toMain) async {
   final transport = RnsTransport(
     log: (m) => toMain.send(['log', 'RNS/engine: $m']),
   );
+  transport.onPathRequest =
+      (wanted) => toMain.send(['pathreq', Uint8List.fromList(wanted)]);
   final ifaces = <String, _ExtIface>{};
   var lastSweepMs = 0;
 

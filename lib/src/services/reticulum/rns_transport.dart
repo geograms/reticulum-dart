@@ -479,6 +479,23 @@ class RnsTransport implements RnsInterfaceRegistry {
   // target is directly attached to answers on our direct link.
   static final Uint8List _pathRequestDest = RnsCrypto.truncatedHash(
       RnsDestination.nameHash('rnstransport', ['path', 'request']));
+
+  /// True when [raw] is a path-request packet (PLAIN/DATA to the well-known
+  /// path-request destination). Interfaces use this to treat path requests as
+  /// DISCOVERY (broadcast like an announce) rather than data.
+  static bool isPathRequest(Uint8List raw) {
+    if (raw.length < 18) return false;
+    if ((raw[0] & 0x03) != RnsPacketType.data) return false;
+    for (var i = 0; i < 16; i++) {
+      if (raw[2 + i] != _pathRequestDest[i]) return false;
+    }
+    return true;
+  }
+
+  /// Called (rate-limited) with the requested destination hash of an inbound
+  /// path request. The host answers by re-announcing when the dest is its own.
+  void Function(Uint8List destHash)? onPathRequest;
+  int _lastPathAnswerMs = 0;
   final Random _rng = Random.secure();
 
   /// Ask the network for a path to [destHash]. Best-effort, fire-and-forget;
@@ -576,17 +593,38 @@ class RnsTransport implements RnsInterfaceRegistry {
     }
   }
 
-  /// A duplicate announce arrived on interface [via]. If we already track this
-  /// destination and [via] is a data-capable interface strictly faster than the
-  /// path's current via, repoint the path onto it (a WiFi-Direct link winning
-  /// over the shared LAN it duplicates). No signature re-verify (identical
-  /// signed packet) and no rebroadcast.
+  /// A duplicate announce arrived on interface [via]. The dedup hash ignores
+  /// hops/header/transportId, so this is the normal fate of the second copy of
+  /// EVERY announce a co-located peer sends (LAN broadcast + hub rebroadcast
+  /// race). It must therefore carry the same path-learning weight as a fresh
+  /// announce — the old version repointed one destination and nothing else,
+  /// which let the hub-first race starve the identity pin: pin.misses grew on
+  /// every hub-first announce, hit the limit, and _demoteIdentityPaths rewrote
+  /// LIVE LAN paths onto the hub with a non-null nextHop. The next LXMF link
+  /// request then went out HEADER_2 on the hub uplink alone, and the hub does
+  /// not cross-forward between clients: a silent black hole, healed only by the
+  /// 90s LAN beacon — the exact 0.6s/30-60s flip-flop observed on device.
+  ///
+  /// No signature re-verify (identical signed packet) and no rebroadcast.
   void _maybeUpgradePath(RnsPacket p, String via) {
     if (p.packetType != RnsPacketType.announce) return;
     if (_isAnnounceOnly(via)) return; // can't carry data — never a path
     final key = _hex(p.destHash);
     final existing = _paths[key];
-    if (existing == null || existing.via == via) return;
+    if (existing == null) return;
+    final idHex = _hex(existing.identity.hash);
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+    // The peer IS still on the pinned interface — this copy proves it. Refresh
+    // the pin's liveness even when nothing needs repointing, so hub-first races
+    // stop accumulating misses toward a false demotion.
+    final pin = _identityFastVia[idHex];
+    if (pin != null && pin.label == via) {
+      pin.heardMs = nowMs;
+      pin.misses = 0;
+    }
+
+    if (existing.via == via) return;
     if (_isAnnounceOnly(existing.via)) return; // handled by the main path logic
     if (_speedRank(via) <= _speedRank(existing.via)) return;
     final nextHop =
@@ -602,8 +640,24 @@ class RnsTransport implements RnsInterfaceRegistry {
       hops: p.hops + 1,
       via: via,
       nextHop: nextHop,
-      updatedMs: DateTime.now().millisecondsSinceEpoch,
+      updatedMs: nowMs,
     );
+    // And the identity-level work a fresh announce would have done: pin the
+    // fast interface and pull every sibling destination of this peer onto it,
+    // so the NEXT link request (which follows its own dest's path) goes local.
+    if (pin == null || _speedRank(via) > _speedRank(pin.label)) {
+      _identityFastVia[idHex] = _FastVia(via, nowMs);
+      for (final e in _paths.values) {
+        if (_hex(e.identity.hash) == idHex &&
+            _speedRank(via) > _speedRank(e.via)) {
+          e.via = via;
+          e.nextHop = null;
+          e.hops = 1;
+          e.updatedMs = nowMs;
+        }
+      }
+    }
+    // (The isolate mirror learns these on its ≤2s sweep — well inside budget.)
   }
 
   /// The next-hop transport for reaching [identity]'s destinations. A peer
@@ -626,26 +680,60 @@ class RnsTransport implements RnsInterfaceRegistry {
     // Dedup by packet hash (RNS uses the same hashable-part scheme).
     final ph = _hex(p.packetHash());
     if (_seenPackets.contains(ph)) {
-      // A node sends the SAME announce packet on all of its interfaces. The
-      // first copy to arrive (often a slow shared LAN/hub) sets the path and
-      // caches the hash; without this, a later copy on a FASTER interface (a
-      // WiFi-Direct P2P link) would be dropped here and the path could never
-      // repoint to it. So a duplicate announce may still UPGRADE the path's via
-      // to a higher-rank, data-capable interface — no re-verify (same signed
-      // packet) and no rebroadcast.
+      // A node sends the SAME announce packet on all of its interfaces, and the
+      // announce hash deliberately excludes hops/headerType/transportId — so the
+      // origin's LAN broadcast and the hub's rebroadcast of it are ONE hash, and
+      // whichever lands first wins the full ingest. The second copy must still
+      // be able to do everything path learning needs (repoint the path, refresh
+      // the identity pin, upgrade siblings) or a hub-first race leaves the peer
+      // routed through a hub that never cross-forwards — the 30-60s message
+      // black hole observed live between two devices ON THE SAME LAN.
       _maybeUpgradePath(p, viaArg);
       return null;
     }
-    _seenPackets.add(ph);
-    if (_seenPackets.length > 8192) {
-      _seenPackets.remove(_seenPackets.first);
+    // NOTE the hash is remembered only once the packet is actually PROCESSED
+    // (forwarded, or validated as an announce). Remembering it up front poisoned
+    // the slot: when the first copy was shed by the flood budget or the verify
+    // ceiling, the sibling copy on the other interface was treated as "already
+    // seen" and the announce was lost on BOTH interfaces until the next cycle.
+    void remember() {
+      _seenPackets.add(ph);
+      if (_seenPackets.length > 8192) {
+        _seenPackets.remove(_seenPackets.first);
+      }
     }
 
-    // As a transport node, forward link/resource traffic that isn't for us —
-    // unless we've dropped to passive (leaf) mode to shed CPU load.
-    if (transportId != null && !_passive && _maybeForward(p, viaArg)) return null;
-
-    if (p.packetType != RnsPacketType.announce) return null;
+    if (p.packetType != RnsPacketType.announce) {
+      // Answer path requests aimed at one of OUR destinations: between two
+      // Dart nodes (no reference transport node in the middle) nobody else
+      // will, and without an answer a LAN peer that missed our periodic
+      // announce simply cannot open a link to us until the next one — up to 5
+      // minutes on battery. The host decides whether the dest is ours and
+      // re-announces; we only rate-limit and hand it up.
+      if (p.packetType == RnsPacketType.data &&
+          p.destType == RnsDestType.plain &&
+          _eq(p.destHash, _pathRequestDest) &&
+          p.data.length >= 16) {
+        remember();
+        final wanted = Uint8List.sublistView(p.data, 0, 16);
+        final cb = onPathRequest;
+        if (cb != null) {
+          final nowMs = DateTime.now().millisecondsSinceEpoch;
+          if (nowMs - _lastPathAnswerMs > 2000) {
+            _lastPathAnswerMs = nowMs;
+            cb(wanted);
+          }
+        }
+        return null;
+      }
+      remember();
+      // As a transport node, forward link/resource traffic that isn't for us —
+      // unless we've dropped to passive (leaf) mode to shed CPU load.
+      if (transportId != null && !_passive && _maybeForward(p, viaArg)) {
+        return null;
+      }
+      return null;
+    }
 
     // Sample the inbound announce rate (drives the passive-mode auto-switch).
     // Counted before the flood-shed below so it reflects true load, not what we
@@ -692,6 +780,7 @@ class RnsTransport implements RnsInterfaceRegistry {
 
     final ann = await validateAnnounce(p, trustIf: trusted);
     if (ann == null) return null;
+    remember(); // processed for real — only now may the sibling copy be a dup
 
     var pathHops = p.hops + 1; // hop just taken to reach us
     // If the announce arrived relayed (HEADER_2), the relayer's id is the next
@@ -784,11 +873,7 @@ class RnsTransport implements RnsInterfaceRegistry {
     } else {
       // Same capability class: prefer the faster medium first (a direct LAN
       // path beats the internet hub AND BLE for a co-located peer), then
-      // fewer/equal hops (equal = LRU refresh of the same-quality path). A via
-      // that recently FAILED a link handshake for this dest is penalized to
-      // rank 0 for a cooldown, so a silently one-way medium (asymmetric-LAN AP
-      // client isolation: announces heard but our packets never reach the peer)
-      // stops shadowing a working slower path (the hub) — link-failure fallback.
+      // fewer/equal hops (equal = LRU refresh of the same-quality path).
       final newRank = _speedRank(via);
       final oldRank = _speedRank(existing.via);
       if (newRank != oldRank) {

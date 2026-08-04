@@ -626,11 +626,28 @@ class RnsTransport implements RnsInterfaceRegistry {
 
     if (existing.via == via) return;
     if (_isAnnounceOnly(existing.via)) return; // handled by the main path logic
-    if (_speedRank(via) <= _speedRank(existing.via)) return;
+    // A peer we hear DIRECTLY (hops 0 — it is our own neighbour on this
+    // interface) beats one reached through somebody else, whatever the medium
+    // ranks. Speed decides between paths of equal directness; it must not
+    // decide between "arrives" and "does not". A phone with no internet, heard
+    // over Bluetooth right next to us, was addressed through an internet hub —
+    // because tcp outranks ble — and every message to it timed out while the
+    // device sat there announcing itself a metre away.
+    final direct = p.hops == 0;             // straight from the peer
+    final existingDirect = existing.hops <= 1;
+    // Never trade a neighbour we hear ourselves for a relayed copy of it, however
+    // fast the relay's medium: the relay may have no way to reach that peer at
+    // all (a Bluetooth-only phone, bridged onto the hubs by us).
+    if (!direct && existingDirect) return;
+    if (!(direct && !existingDirect) &&
+        _speedRank(via) <= _speedRank(existing.via)) {
+      return;
+    }
     final nextHop =
         p.headerType == RnsHeaderType.header2 ? p.transportId : null;
     log?.call('path ${key.substring(0, 8)} ${existing.via} -> $via '
-        '(rank ${_speedRank(existing.via)}->${_speedRank(via)}, upgrade)');
+        '(rank ${_speedRank(existing.via)}->${_speedRank(via)}, '
+        '${direct && !existingDirect ? "direct beats transported" : "upgrade"})');
     _paths.remove(key);
     _paths[key] = RnsPathEntry(
       destHash: existing.destHash,
@@ -645,7 +662,9 @@ class RnsTransport implements RnsInterfaceRegistry {
     // And the identity-level work a fresh announce would have done: pin the
     // fast interface and pull every sibling destination of this peer onto it,
     // so the NEXT link request (which follows its own dest's path) goes local.
-    if (pin == null || _speedRank(via) > _speedRank(pin.label)) {
+    if (pin == null ||
+        _speedRank(via) > _speedRank(pin.label) ||
+        (direct && !existingDirect)) {
       _identityFastVia[idHex] = _FastVia(via, nowMs);
       for (final e in _paths.values) {
         if (_hex(e.identity.hash) == idHex &&
@@ -874,9 +893,19 @@ class RnsTransport implements RnsInterfaceRegistry {
       // Same capability class: prefer the faster medium first (a direct LAN
       // path beats the internet hub AND BLE for a co-located peer), then
       // fewer/equal hops (equal = LRU refresh of the same-quality path).
+      // Directness first: a neighbour we hear ourselves (hops 0) outranks a
+      // peer reached through someone else, whatever medium each arrived on.
+      // Otherwise the faster medium, then fewer/equal hops (equal = LRU
+      // refresh of the same-quality path).
       final newRank = _speedRank(via);
       final oldRank = _speedRank(existing.via);
-      if (newRank != oldRank) {
+      // "Direct" = the peer itself put this on the wire and we heard it: one
+      // hop taken to reach us, nobody in between.
+      final newDirect = pathHops <= 1;
+      final oldDirect = existing.hops <= 1;
+      if (newDirect != oldDirect) {
+        replace = newDirect;
+      } else if (newRank != oldRank) {
         replace = newRank > oldRank;
       } else {
         replace = pathHops <= existing.hops;

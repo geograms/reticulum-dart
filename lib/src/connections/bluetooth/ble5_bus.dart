@@ -17,6 +17,10 @@ import 'package:flutter/services.dart';
 /// Manufacturer-data subtypes carried under company id 0xFFFF, marker 0x3E.
 class Ble5Subtype {
   static const int rns = 0x55; // Reticulum packet
+  // A Reticulum packet too big for one extended advert, split across several.
+  // Its own subtype so a chunk is never mistaken for a whole packet (and never
+  // lands in the APRS reassembler, which speaks a different framing).
+  static const int rnsChunk = 0x56; // Reticulum packet fragment
   static const int aprs = 0x41; // APRS broadcast parcel ('A')
   static const int presence = 0x47; // GATT presence beacon ('G'): callsign
   static const int mesh = 0x4D; // street-mesh route beacon ('M'), doc/mesh.md
@@ -105,6 +109,11 @@ class Ble5Bus {
   void Function(String address)? onGattServerConnected;
   void Function(String address)? onGattServerDisconnected;
 
+  /// The controller REFUSED to put our advert on air (status from
+  /// AdvertisingSetCallback). Queuing a frame says nothing about whether it was
+  /// aired, so without this a device stays mute while reporting that it beacons.
+  void Function(int status)? onAdvertFailed;
+
   /// Whether the device supports BLE 5 extended advertising.
   Future<bool> supported() async {
     final cached = _supported;
@@ -171,16 +180,47 @@ class Ble5Bus {
 
   /// Register/refresh a keyed broadcast frame. Re-calling with the same [key]
   /// refreshes its TTL (and replaces the data). The native rotation airs it.
-  Future<void> advertiseFrame(String key, int subtype, Uint8List data,
+  /// Register/refresh a frame on the shared advertising set. Returns whether
+  /// the native side ACCEPTED it — a frame over this controller's advert
+  /// ceiling is refused outright, and a caller that assumes success then
+  /// reports beacons it never sent.
+  Future<bool> advertiseFrame(String key, int subtype, Uint8List data,
       {Duration ttl = const Duration(seconds: 35)}) async {
     try {
-      await _method.invokeMethod('advertiseFrame', {
+      final ok = await _method.invokeMethod<bool>('advertiseFrame', {
         'key': key,
         'subtype': subtype,
         'data': data,
         'ttlMs': ttl.inMilliseconds,
       });
-    } catch (_) {}
+      if (ok == false) _advertFailures++;
+      return ok ?? false;
+    } catch (e) {
+      _advertFailures++;
+      _advertLastError = '$e';
+      return false;
+    }
+  }
+
+  int _advertFailures = 0;
+  String? _advertLastError;
+
+  /// Adverts the controller refused since start, and the last reason.
+  int get advertFailures => _advertFailures;
+  String? get advertLastError => _advertLastError;
+
+  /// What the RADIO reports it is doing — on-air state, attempts, refusals and
+  /// how long since it last heard ANY advert (ours or anyone's). "Heard
+  /// nothing" and "nobody is around" are indistinguishable without this, and
+  /// they have completely different causes.
+  Future<Map<String, dynamic>> radioStatus() async {
+    try {
+      final m = await _method.invokeMethod<Map<dynamic, dynamic>>('radioStatus');
+      if (m == null) return const {};
+      return m.map((k, v) => MapEntry(k.toString(), v));
+    } catch (_) {
+      return const {};
+    }
   }
 
   Future<void> removeFrame(String key) async {
@@ -220,6 +260,11 @@ class Ble5Bus {
           break;
         case 'server_disconnected':
           onGattServerDisconnected?.call(addr);
+          break;
+        case 'advertFailed':
+          _advertFailures++;
+          _advertLastError = 'startAdvertisingSet status=${event['status']}';
+          onAdvertFailed?.call((event['status'] as int?) ?? -1);
           break;
       }
     });

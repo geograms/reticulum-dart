@@ -30,6 +30,11 @@ import 'lxmf_msgpack.dart';
 // One link DATA packet's plaintext budget is ~400B after header + token overhead.
 const int _linkPacketMax = 360;
 
+/// Largest LXMF payload we will put in ONE connectionless packet. Beyond this
+/// the BLE fragmenter would be splitting a message across many adverts with no
+/// retransmit, which is what a link (or the propagation relay) is for.
+const int _oppMax = 700;
+
 class _LxIn {
   final RnsLink link;
   RnsResourceReceiver? rx;
@@ -68,6 +73,15 @@ class LxmfRouter {
   /// Pull a path to [destHash] (RNS path request). Used to resolve the source
   /// identity of an inbound message when we never heard the sender's announce.
   final void Function(Uint8List destHash)? requestPath;
+
+  /// Send ONE connectionless packet to [destHash] (RNS single-destination
+  /// DATA, no link, no handshake). Wired to the transport's sendDataTo.
+  ///
+  /// This is how a message crosses a Bluetooth advert channel. A link is three
+  /// packets that must complete a handshake; that channel airs roughly one
+  /// frame at a time, so the handshake mostly timed out and only 2 messages in
+  /// 5 arrived. One packet either lands or is retried — nothing to negotiate.
+  void Function(Uint8List destHash, Uint8List data)? sendDataTo;
 
   /// Predicate consulted when an inbound message's source identity can't be
   /// resolved (we never heard its announce, so the LXMF-layer signature can't be
@@ -148,6 +162,23 @@ class LxmfRouter {
 
   /// Feed an inbound packet; true if it was an LXMF link/delivery packet.
   Future<bool> handlePacket(RnsPacket p) async {
+    // A whole message in ONE packet, addressed straight at our delivery
+    // destination — the opportunistic path a Bluetooth neighbour uses instead
+    // of a link handshake (see send_). Encrypted to our identity, so only we
+    // can open it; a packet that is not ours to read simply fails to decrypt
+    // and falls through to the link handling below.
+    if (p.packetType == RnsPacketType.data &&
+        p.destType == RnsDestType.single &&
+        p.context == RnsContext.none &&
+        RnsCrypto.constantTimeEquals(p.destHash, deliveryDestHash)) {
+      try {
+        final plain = await identity.decrypt(p.data);
+        await _deliver(plain);
+        return true;
+      } catch (_) {
+        // Not a message for us after all (or a corrupted advert) — keep going.
+      }
+    }
     if (p.packetType == RnsPacketType.linkRequest &&
         RnsCrypto.constantTimeEquals(p.destHash, deliveryDestHash)) {
       await _accept(p);
@@ -216,6 +247,24 @@ class LxmfRouter {
       final ok = await entry.done.future.timeout(t, onTimeout: () => false);
       _out.remove(id);
       return ok;
+    }
+
+    // A message small enough to fit one packet, going to a peer we reach over a
+    // LOCAL interface (Bluetooth): send it as a single encrypted packet and
+    // skip the handshake entirely. Delivery is confirmed by the peer's own
+    // LXMF-layer behaviour (and the relay copy stays held until then), so a
+    // lost packet costs a retry, never a stuck link.
+    final local = pathIsLocal?.call(message.destinationHash) ?? false;
+    if (local && sendDataTo != null && message.packed.length <= _oppMax) {
+      try {
+        final ct = await rid.encrypt(message.packed);
+        sendDataTo!.call(message.destinationHash, ct);
+        log?.call('lxmf: ${message.packed.length}B sent as one packet '
+            '(local path — no link)');
+        return true;
+      } catch (e) {
+        log?.call('lxmf: single-packet send failed ($e) — falling back to a link');
+      }
     }
 
     // Route by the delivery dest's OWN path (per-dest), not by whichever of

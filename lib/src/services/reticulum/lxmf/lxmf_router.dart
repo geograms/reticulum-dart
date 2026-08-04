@@ -175,8 +175,11 @@ class LxmfRouter {
         final plain = await identity.decrypt(p.data);
         await _deliver(plain);
         return true;
-      } catch (_) {
-        // Not a message for us after all (or a corrupted advert) — keep going.
+      } catch (e) {
+        // Not a message for us after all, a corrupted advert, or a sender using
+        // a key we cannot open. Say so: an empty catch here is a message that
+        // vanishes with no trace anywhere in the system.
+        log?.call('lxmf: single packet to our delivery dest did not open ($e)');
       }
     }
     if (p.packetType == RnsPacketType.linkRequest &&

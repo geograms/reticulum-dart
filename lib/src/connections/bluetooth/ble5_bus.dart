@@ -185,13 +185,15 @@ class Ble5Bus {
   /// ceiling is refused outright, and a caller that assumes success then
   /// reports beacons it never sent.
   Future<bool> advertiseFrame(String key, int subtype, Uint8List data,
-      {Duration ttl = const Duration(seconds: 35)}) async {
+      {Duration ttl = const Duration(seconds: 35), bool prio = false}) async {
     try {
       final ok = await _method.invokeMethod<bool>('advertiseFrame', {
         'key': key,
         'subtype': subtype,
         'data': data,
         'ttlMs': ttl.inMilliseconds,
+        // Traffic (a link handshake, a message) is aired ahead of presence.
+        'prio': prio,
       });
       if (ok == false) _advertFailures++;
       return ok ?? false;

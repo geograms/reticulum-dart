@@ -132,7 +132,16 @@ class Ble5Bus {
       // bigger over GATT instead of assuming the optimistic [maxFrame].
       try {
         final n = await _method.invokeMethod<int>('maxPayload');
-        if (n != null && n > 30) _maxPayload = n < maxFrame ? n : maxFrame;
+        // Take what the controller says, even when it is small. The old guard
+        // (`n > 30`) DISCARDED a legacy-sized answer and kept the optimistic
+        // 450 — on exactly the device least able to honour it. Every frame
+        // between the real ceiling and 450 was then refused by the native
+        // admission check, aired nowhere, while the app went on believing it
+        // was broadcasting.
+        if (n != null && n >= 20) {
+          _maxPayload = n < maxFrame ? n : maxFrame;
+          onLog?.call('BLE5: controller carries ${_maxPayload}B per advert');
+        }
       } catch (_) {}
     }
     return ok;

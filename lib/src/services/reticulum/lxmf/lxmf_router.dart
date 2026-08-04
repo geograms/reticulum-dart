@@ -30,9 +30,13 @@ import 'lxmf_msgpack.dart';
 // One link DATA packet's plaintext budget is ~400B after header + token overhead.
 const int _linkPacketMax = 360;
 
-/// Largest LXMF payload we will put in ONE connectionless packet. Beyond this
-/// the BLE fragmenter would be splitting a message across many adverts with no
-/// retransmit, which is what a link (or the propagation relay) is for.
+/// Largest LXMF payload we will put in ONE connectionless packet, when the
+/// medium does not tell us its own limit.
+///
+/// The real bound is the interface's hardware MTU — 296 B on one of the test
+/// phones, 184 B on the other. Anything past it must NOT be split across
+/// adverts by hand: Reticulum already fragments over a link, with acknowledged
+/// Resources, and that is the mechanism to use.
 const int _oppMax = 700;
 
 class _LxIn {
@@ -82,6 +86,10 @@ class LxmfRouter {
   /// frame at a time, so the handshake mostly timed out and only 2 messages in
   /// 5 arrived. One packet either lands or is retried — nothing to negotiate.
   void Function(Uint8List destHash, Uint8List data)? sendDataTo;
+
+  /// Largest payload the interface toward [destHash] carries in one frame
+  /// (its hardware MTU, minus RNS overhead). Null → assume the default.
+  int Function(Uint8List destHash)? mtuForDest;
 
   /// Predicate consulted when an inbound message's source identity can't be
   /// resolved (we never heard its announce, so the LXMF-layer signature can't be
@@ -258,7 +266,9 @@ class LxmfRouter {
     // LXMF-layer behaviour (and the relay copy stays held until then), so a
     // lost packet costs a retry, never a stuck link.
     final local = pathIsLocal?.call(message.destinationHash) ?? false;
-    if (local && sendDataTo != null && message.packed.length <= _oppMax) {
+    // Bound by what the medium actually carries, not by a guess.
+    final oneFrame = mtuForDest?.call(message.destinationHash) ?? _oppMax;
+    if (local && sendDataTo != null && message.packed.length <= oneFrame) {
       try {
         final ct = await rid.encrypt(message.packed);
         sendDataTo!.call(message.destinationHash, ct);

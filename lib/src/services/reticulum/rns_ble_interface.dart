@@ -49,9 +49,19 @@ class RnsBleInterface implements RnsInterface {
   bool get announceOnly => false;
   @override
   int get speedRank => 1; // BLE: slowest data medium
-  // BLE can't carry large frames, so no MTU discovery — stay at protocol MTU.
+  /// What this radio can ACTUALLY carry in one frame.
+  ///
+  /// This used to claim the 500-byte protocol MTU, which is what `hardwareMtu`
+  /// exists to correct: RNS sizes links and resources to the medium, and a
+  /// medium that promises 500 while its controller allows ~296 makes the stack
+  /// build packets the radio then refuses. Telling the truth here is what lets
+  /// Reticulum do its own fragmenting (a Resource over a link) instead of the
+  /// transport inventing one.
   @override
-  int get hardwareMtu => kRnsMtu;
+  int get hardwareMtu {
+    final cap = radio.broadcastCap;
+    return (cap > 0 && cap < kRnsMtu) ? cap : kRnsMtu;
+  }
 
   final RnsBleRadio radio;
   @override

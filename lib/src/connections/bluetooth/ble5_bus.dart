@@ -330,6 +330,11 @@ class Ble5Bus {
   }
 
   Future<void> stopScan() async {
+    // Stopping is a DECISION, not a failure: the caller stops the scan to give
+    // the radio to a GATT session. Leaving _wantScan set meant this object's own
+    // silence watchdog re-registered the scan ~150 s later, on top of the very
+    // transfer the scan was stopped for — the same mistake, one layer down.
+    _wantScan = false;
     try {
       await _method.invokeMethod('stopScan');
     } catch (_) {}

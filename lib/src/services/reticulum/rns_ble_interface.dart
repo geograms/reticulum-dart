@@ -8,9 +8,15 @@
  * ONCE and reaches all N members, instead of N separate point-to-point sends
  * (the limitation of GATT-only designs like torlando-tech/ble-reticulum).
  *
- * This interface therefore broadcasts every outgoing packet that fits the
- * connectionless cap, and falls back to a point-to-point (GATT) send only for
- * packets too large to advertise. Reassembly + selective-repeat (NACK)
+ * So an ANNOUNCE always goes on the broadcast medium. Everything addressed,
+ * though, prefers a point-to-point link when the radio has one: an advert is
+ * fire-and-forget on a duty-cycled medium — unacknowledged, unretransmitted,
+ * heard only by a scanner that happens to be listening in the same window —
+ * which measured out as about half the messages between two phones vanishing
+ * without a trace. With no link, addressed packets still broadcast if they fit
+ * and fall back to point-to-point when they are too large to advertise.
+ *
+ * Reassembly + selective-repeat (NACK)
  * reliability for the chunked broadcast live in the underlying radio (Aurora's
  * BleService); RNS provides confidentiality/auth on top, so the BLE transport
  * itself needs no pairing.
@@ -34,6 +40,12 @@ abstract class RnsBleRadio {
   /// Air [frame] once on the broadcast medium; every device in range receives
   /// and reassembles it.
   void broadcast(Uint8List frame);
+
+  /// True when a point-to-point link (e.g. an open GATT connection) is up and
+  /// can carry traffic right now. Broadcast adverts are fire-and-forget on a
+  /// duty-cycled medium; a link is acknowledged and flow-controlled, so when
+  /// one exists it is the better route for anything addressed to that peer.
+  bool get hasLink => false;
 
   /// Send [frame] point-to-point (e.g. GATT) when it exceeds [broadcastCap].
   /// Returns false if no point-to-point path is currently available.
@@ -102,6 +114,22 @@ class RnsBleInterface implements RnsInterface {
   /// announces and group/PLAIN destinations), else fall back to point-to-point.
   @override
   void send(Uint8List packetRaw) {
+    // An ANNOUNCE is one-to-many by nature — every device in range wants it,
+    // including ones we hold no link to — so it always goes on the broadcast
+    // medium. Packet type lives in the low two bits of the header byte
+    // (0 data, 1 announce, 2 link request, 3 proof).
+    final isAnnounce =
+        packetRaw.isNotEmpty && (packetRaw[0] & 0x03) == 0x01;
+    // Everything else prefers the link when there is one. A BLE advert is
+    // fire-and-forget on a duty-cycled medium: the peer's scanner has to be
+    // listening in the same window, nothing is acknowledged, and nothing is
+    // retransmitted — which measured out as roughly half of the messages
+    // between two phones never arriving, silently. A GATT link is acked and
+    // flow-controlled, so an addressed packet takes it whenever it exists.
+    if (!isAnnounce && radio.hasLink && radio.unicast(packetRaw)) {
+      _unicasts++;
+      return;
+    }
     if (packetRaw.length <= radio.broadcastCap) {
       radio.broadcast(packetRaw);
       _broadcasts++;

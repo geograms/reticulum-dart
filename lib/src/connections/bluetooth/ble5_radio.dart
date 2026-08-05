@@ -31,6 +31,11 @@ class Ble5Radio implements RnsBleRadio {
   @override
   int get broadcastCap => Ble5Bus.instance.maxPayload;
 
+  /// The package radio is broadcast-only; Aurora's radio overrides this when a
+  /// native GATT link is up.
+  @override
+  bool get hasLink => false;
+
   @override
   void broadcast(Uint8List frame) {
     // Single 'rns' key: announces supersede each other (latest presence wins),

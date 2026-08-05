@@ -55,11 +55,18 @@ class NostrWsClient implements NostrRelayClient {
   @override
   Future<void> connect() async {
     if (_closed) return;
-    _retry?.cancel();
+    // A pending backoff timer WINS over an on-demand connect. Callers reach
+    // connect() through subscribe(), and a caller that subscribes on a short
+    // period (the Social poll does, once a second) would otherwise cancel the
+    // backoff every time and retry the same dead relay at its own cadence —
+    // which off-grid means five failing DNS lookups a second, a device log that
+    // holds twenty seconds of history, and a radio-idle phone that never sleeps.
+    if (_retry?.isActive ?? false) return;
     if (_status == NostrRelayStatus.connected ||
         _status == NostrRelayStatus.connecting) {
       return;
     }
+    _retry?.cancel();
     _setStatus(NostrRelayStatus.connecting);
     try {
       // Use the package's platform adapter. Direct IOWebSocketChannel handshakes

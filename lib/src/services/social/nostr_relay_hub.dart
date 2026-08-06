@@ -1681,8 +1681,32 @@ class NostrRelayHub {
     });
   }
 
+  /// Never re-subscribe more often than this. The 2s timer below is a batch
+  /// window, which is right when authors trickle in — but a firehose supplies a
+  /// new stranger every few hundred milliseconds, so the window closed and
+  /// reopened forever: a fresh kind-0 REQ across every relay every two seconds,
+  /// each one producing more inbound events. The first batch still goes out
+  /// promptly; only the repeats are paced.
+  static const Duration _profResubMinGap = Duration(seconds: 20);
+  DateTime? _lastProfResub;
+  Timer? _profResubPending;
+
   void _profResub() {
     if (_profTracked.isEmpty) return;
+    final now = DateTime.now();
+    final last = _lastProfResub;
+    if (last != null) {
+      final since = now.difference(last);
+      if (since < _profResubMinGap) {
+        // Do it when the gap is up, once, rather than dropping it.
+        _profResubPending ??= Timer(_profResubMinGap - since, () {
+          _profResubPending = null;
+          _profResub();
+        });
+        return;
+      }
+    }
+    _lastProfResub = now;
     // Re-subscribe kind-0 for ALL tracked authors. The persistent store already
     // avoids cross-session re-download (profileOf reads it); re-subscribing here
     // keeps retrying authors whose kind-0 hasn't arrived yet, which matters for
@@ -1691,7 +1715,14 @@ class NostrRelayHub {
     final have = <String>[];
     final missing = <String>[];
     for (final p in _profTracked) {
-      (profileOf(p) == null ? missing : have).add(p);
+      // _hasProfile, NOT profileOf: this walks every tracked author, and
+      // profileOf is a SQLite query each time. Under a public firehose a new
+      // author arrives constantly, so this pass ran every couple of seconds
+      // over the full 500-author window — ~250 queries/s, which pinned a core
+      // on a slow phone and ANR'd it. The cache answers the same question and
+      // is kept honest by _onEvent, which adds to _haveProfile the moment a
+      // kind-0 is stored.
+      (_hasProfile(p) ? have : missing).add(p);
     }
     final authors = [...missing, ...have];
     final prev = _profSub;
